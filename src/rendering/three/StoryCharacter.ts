@@ -43,6 +43,9 @@ export class StoryCharacter implements StoryCharacterItem {
   /** Expression currently owned by the model, distinct from controller bookkeeping. */
   activeExpressionName = "";
   activeExpressionFadeInSeconds: number | undefined;
+  /** Full-story animation resources proven ready for this controller. */
+  readonly warmedMotionNames = new Set<string>();
+  readonly warmedExpressionNames = new Set<string>();
   /** Mirrors AdvCharacterFieldRendererEntry.BlurIntensity. */
   blurIntensity = 0;
   /** Unity world-position z captured by RegisterCharacterEntry. */

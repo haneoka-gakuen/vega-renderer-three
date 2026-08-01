@@ -114,6 +114,12 @@ export interface ThreeStoryCharacterModel
   setEyeBlinkEnabled(enabled: boolean): void;
   resetExpressionParametersToDefault(): void;
   hasMotion(name: string): boolean;
+  /**
+   * Reports whether an expression key exists before lazy preparation starts.
+   * Older renderer adapters may omit this hook; the renderer then falls back
+   * to the entry's explicit expression catalogue.
+   */
+  hasExpression?(name: string): boolean;
   stopMotions(): void;
   drawableBounds(visibleOnly?: boolean): ThreeCharacterBounds | null;
   canvasBounds(): ThreeCharacterBounds;
@@ -121,6 +127,12 @@ export interface ThreeStoryCharacterModel
 
   playMotion(name: string, fadeInSeconds?: number): boolean;
   playExpression(name: string, fadeInSeconds?: number): boolean;
+  /**
+   * Resolve only a known animation's asynchronous dependencies. `true` means
+   * an immediate `play*` call performs no resource I/O. `false` never counts
+   * as warmed: it may mean unknown/unsupported, while a key known through the
+   * model catalogue is treated by the renderer as a preparation failure.
+   */
   prepareMotion(name: string): Promise<boolean>;
   prepareExpression(name: string): Promise<boolean>;
   isCurrentExpression(name: string): boolean;

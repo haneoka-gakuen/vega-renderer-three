@@ -404,6 +404,10 @@ export class StaticPortraitModel implements ThreeStoryCharacterModel {
     return false;
   }
 
+  hasExpression(_name: string): boolean {
+    return false;
+  }
+
   stopMotions(): void {
     // Static portraits have no motion channel.
   }

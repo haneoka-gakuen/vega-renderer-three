@@ -33,6 +33,7 @@ import {
   type StoryCharacterProvider,
   type RendererAwareStoryCharacterProvider,
   type StoryResourceResolver,
+  type StoryCharacterPreloadRequest,
   type StoryCharacterRendererModelContext,
   type StoryRendererEffectContribution,
   type StoryRendererExtensionContext,
@@ -202,6 +203,22 @@ interface PendingCharacterLoadController {
   readonly token: number;
   readonly controller: AbortController;
   readonly detach: () => void;
+}
+
+interface CharacterPreloadState {
+  readonly controller: AbortController;
+  readonly detach: () => void;
+  readonly promise: Promise<StoryCharacter | null>;
+  readonly commandIndex: number;
+}
+
+interface CharacterRenderPrimeState {
+  readonly item: StoryCharacter;
+  readonly contextGeneration: number;
+  readonly detach: () => void;
+  readonly resolve: () => void;
+  readonly reject: (error: unknown) => void;
+  fence: WebGLSync | null;
 }
 
 interface CharacterGraphicsRestoreFailure {
@@ -574,6 +591,19 @@ export class ThreeStoryScene implements StorySceneBackend {
   readonly characterItems = new Map<string, StoryCharacter>();
   private readonly characterControllerIdentities = new Map<string, string>();
   private readonly cachedCharacterControllers = new Map<string, StoryCharacter>();
+  private readonly characterPreloads = new Map<string, CharacterPreloadState>();
+  /** Controllers made ready ahead of, but not yet consumed by, their first In. */
+  private readonly speculativeCharacterControllers = new Map<
+    string,
+    StoryCharacter
+  >();
+  private readonly speculativeCharacterCommandIndices = new Map<string, number>();
+  private readonly discardedCharacterPreloadIdentities = new Set<string>();
+  private readonly characterPreloadCapacityWaiters = new Set<() => void>();
+  private readonly characterRenderPrimes = new Map<
+    StoryCharacter,
+    CharacterRenderPrimeState
+  >();
   private readonly sortedCharacterItems: StoryCharacter[] = [];
   private readonly characterRenderGroupPool: CharacterRenderGroup[] = [];
   private readonly stagedCharacterItems = new Map<string, StagedCharacterItem>();
@@ -903,6 +933,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (this.destroyed) return;
     this.contextLost = true;
     this.contextRestoreGeneration += 1;
+    this.discardAllSpeculativeCharacters("WebGL context lost");
     this.cancelContextRestoreRetry();
     this.cancelContextRestore();
     this.cancelAllCharacterModelRecoveries();
@@ -1116,6 +1147,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     await Promise.all(
       ownedItems.map(async (item) => {
         let replacement: ThreeStoryCharacterModel | null = null;
+        const expectedModel = item.model;
         // WebGL restores the context object, not its user-created textures,
         // programs, VAOs or provider-owned renderer objects.
         try {
@@ -1125,7 +1157,8 @@ export class ThreeStoryScene implements StorySceneBackend {
             this.destroyed ||
             signal.aborted ||
             generation !== this.contextRestoreGeneration ||
-            !this.ownsCharacterController(item)
+            !this.ownsCharacterController(item) ||
+            item.model !== expectedModel
           ) {
             this.disposeCharacterModelSafely(
               replacement,
@@ -1139,7 +1172,8 @@ export class ThreeStoryScene implements StorySceneBackend {
             this.destroyed ||
             signal.aborted ||
             generation !== this.contextRestoreGeneration ||
-            !this.ownsCharacterController(item)
+            !this.ownsCharacterController(item) ||
+            item.model !== expectedModel
           ) {
             this.disposeCharacterModelSafely(
               replacement,
@@ -1179,6 +1213,17 @@ export class ThreeStoryScene implements StorySceneBackend {
   ): Promise<void> {
     await this.configureModelMultiplyTexture(replacement, this.stageMultiplyTextureVersion);
     if (signal.aborted) throw sceneAbortError(`Character ${item.target} recovery was aborted`);
+    await Promise.all([
+      ...[...item.warmedMotionNames].map((name) =>
+        replacement.prepareMotion(name),
+      ),
+      ...[...item.warmedExpressionNames].map((name) =>
+        replacement.prepareExpression(name),
+      ),
+    ]);
+    if (signal.aborted) {
+      throw sceneAbortError(`Character ${item.target} recovery was aborted`);
+    }
     const desiredChannels = (): { motionName: string; expressionName: string } => {
       const presentation = this.characterPresentationHistory.get(item.target) || [];
       const latestMotion = [...presentation].reverse().find((event) => event.kind === "motion")?.name;
@@ -1375,6 +1420,166 @@ export class ThreeStoryScene implements StorySceneBackend {
     return true;
   }
 
+  async preloadCharacter(
+    request: StoryCharacterPreloadRequest,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const cmd = request.command;
+    const target = firstString(
+      cmd.targetName,
+      cmd.targets?.[0]?.target,
+      cmd.characterKey,
+    );
+    const entry = cmd.characterModel as StoryCharacterEntry | undefined;
+    if (!target || !entry) return false;
+    const identity = firstString(
+      record(cmd).controllerIdentity,
+      `${target}\u0000${Number(cmd.targetAssetIndex) || 0}`,
+    );
+    // CharacterIn synchronously registers its pending ownership before its
+    // first await. Do not start a competing speculative construction in the
+    // small interval between the loader pump and the command-owned load.
+    for (const pending of this.pendingCharacterPlacements.values()) {
+      if (pending.identity === identity) return false;
+    }
+    if (this.cachedCharacterControllers.has(identity)) return true;
+    let active = this.characterPreloads.get(identity);
+    if (active) {
+      return Boolean(await active.promise);
+    }
+    const speculativeLimit = Math.max(
+      1,
+      Math.floor(finite(this.runtime.characterPreloadInitialCount, 6)),
+      Math.floor(finite(this.runtime.characterPreloadCacheMax, 8)),
+    );
+    while (
+      this.speculativeCharacterControllers.size +
+        this.characterPreloads.size >=
+      speculativeLimit
+    ) {
+      await this.waitForCharacterPreloadCapacity(signal);
+      if (this.destroyed || signal?.aborted) return false;
+      for (const pending of this.pendingCharacterPlacements.values()) {
+        if (pending.identity === identity) return false;
+      }
+      if (this.cachedCharacterControllers.has(identity)) return true;
+      active = this.characterPreloads.get(identity);
+      if (active) return Boolean(await active.promise);
+    }
+
+    const controller = new AbortController();
+    const detachLifecycle = this.bindControllerToSignal(
+      controller,
+      this.lifecycleController.signal,
+    );
+    const detachCaller = this.bindControllerToSignal(controller, signal);
+    const detach = () => {
+      detachCaller();
+      detachLifecycle();
+    };
+    let state: CharacterPreloadState;
+    const promise = this.createPreloadedCharacter(
+      cmd,
+      target,
+      identity,
+      request.positionType,
+      request.motions,
+      request.expressions,
+      request.commandIndex,
+      controller.signal,
+    ).finally(() => {
+      detach();
+      if (this.characterPreloads.get(identity) === state) {
+        this.characterPreloads.delete(identity);
+        this.notifyCharacterPreloadCapacity();
+      }
+    });
+    state = {
+      controller,
+      detach,
+      promise,
+      commandIndex: Math.max(0, Math.floor(finite(request.commandIndex))),
+    };
+    this.characterPreloads.set(identity, state);
+    return Boolean(await promise);
+  }
+
+  advanceCharacterPreload(
+    commandIndex: number,
+    retainBehindCommands: number,
+  ): readonly string[] {
+    const cursor = Math.max(0, Math.floor(finite(commandIndex)));
+    const retainBehind = Math.max(
+      0,
+      Math.floor(finite(retainBehindCommands)),
+    );
+    const cutoff = Math.max(0, cursor - retainBehind);
+
+    for (const [identity, preload] of [...this.characterPreloads]) {
+      if (preload.commandIndex >= cutoff) continue;
+      this.characterPreloads.delete(identity);
+      this.discardedCharacterPreloadIdentities.add(identity);
+      preload.detach();
+      preload.controller.abort();
+    }
+    this.notifyCharacterPreloadCapacity();
+    for (const [identity, firstUse] of [
+      ...this.speculativeCharacterCommandIndices,
+    ]) {
+      if (firstUse >= cutoff) continue;
+      const item = this.speculativeCharacterControllers.get(identity);
+      if (item) {
+        this.discardSpeculativeCharacter(
+          identity,
+          item,
+          "character preload window advanced",
+        );
+      } else {
+        this.speculativeCharacterCommandIndices.delete(identity);
+      }
+    }
+
+    const discarded = [...this.discardedCharacterPreloadIdentities];
+    this.discardedCharacterPreloadIdentities.clear();
+    return discarded;
+  }
+
+  private waitForCharacterPreloadCapacity(
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (this.destroyed || signal?.aborted || this.lifecycleController.signal.aborted) {
+      return Promise.reject(
+        sceneAbortError("Character preload capacity wait was aborted"),
+      );
+    }
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        this.characterPreloadCapacityWaiters.delete(available);
+        signal?.removeEventListener("abort", aborted);
+        this.lifecycleController.signal.removeEventListener("abort", aborted);
+        if (error) reject(error);
+        else resolve();
+      };
+      const available = () => finish();
+      const aborted = () =>
+        finish(sceneAbortError("Character preload capacity wait was aborted"));
+      this.characterPreloadCapacityWaiters.add(available);
+      signal?.addEventListener("abort", aborted, { once: true });
+      this.lifecycleController.signal.addEventListener("abort", aborted, {
+        once: true,
+      });
+    });
+  }
+
+  private notifyCharacterPreloadCapacity(): void {
+    const waiters = [...this.characterPreloadCapacityWaiters];
+    this.characterPreloadCapacityWaiters.clear();
+    for (const available of waiters) available();
+  }
+
   async loadTexture(url: string, signal?: AbortSignal): Promise<Texture> {
     if (!url) throw new Error("Cannot load an empty ADV texture URL");
     this.textureCacheKeys.add(url);
@@ -1544,10 +1749,13 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   private update(deltaSeconds: number, timeSeconds = this.monotonicSeconds()): void {
-    this.pumpCharacterModelRecoveries(timeSeconds);
+    if (!this.contextRestoreController) {
+      this.pumpCharacterModelRecoveries(timeSeconds);
+    }
     this.runSceneUpdateSubsystem("rule transition", timeSeconds, () => this.ruleTransition.update(deltaSeconds));
     this.runSceneUpdateSubsystem("camera shake", timeSeconds, () => this.updatePersistentCameraShake(deltaSeconds));
     for (const item of this.characterItems.values()) {
+      if (this.contextRestoreController) break;
       if (timeSeconds < item.updateRetryAtSeconds) continue;
       try {
         if (!item.model.isOperational) {
@@ -1648,7 +1856,9 @@ export class ThreeStoryScene implements StorySceneBackend {
           right.sortingOrder - left.sortingOrder ||
           this.characterPriority(left.positionType) - this.characterPriority(right.positionType),
       );
-      const groupCount = this.characterRenderGroups(characters);
+      const groupCount = this.contextRestoreController
+        ? 0
+        : this.characterRenderGroups(characters);
       const beginOptions = this.postBeginOptions;
       beginOptions.captureStage = Boolean(capture);
       beginOptions.advBackEffects = this.effectLayer(this.commandAdvBackScene);
@@ -1709,6 +1919,7 @@ export class ThreeStoryScene implements StorySceneBackend {
         }
         this.pipeline.finishCharacterGroup(group.settings);
       }
+      if (!this.contextRestoreController) this.renderCharacterPrimes(timeSeconds);
       const finishOptions = this.postFinishOptions;
       finishOptions.timeSeconds = timeSeconds;
       finishOptions.foreground = this.stageEffects.layer(this.camera);
@@ -1728,6 +1939,106 @@ export class ThreeStoryScene implements StorySceneBackend {
         }
       }
       this.pipeline.abortFrame();
+    }
+  }
+
+  /**
+   * Submit one invisible draw for every newly prepared controller. Model
+   * construction alone does not prove renderer readiness: Cubism masks and
+   * shaders, Spine pipelines and portrait programs may all perform their last
+   * GPU work on the first draw. The isolated alpha-zero group compiles/uploads
+   * that work without changing the composed scene.
+   */
+  private renderCharacterPrimes(timeSeconds: number): void {
+    if (!this.pipeline || !this.renderer || !this.characterRenderPrimes.size)
+      return;
+    const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    const candidates: CharacterRenderPrimeState[] = [];
+    for (const state of [...this.characterRenderPrimes.values()]) {
+      if (
+        !this.isRenderableContextGenerationCurrent(state.contextGeneration)
+      ) {
+        this.settleCharacterRenderPrime(
+          state,
+          new Error("Graphics context changed before character first draw"),
+        );
+        continue;
+      }
+      if (state.fence) {
+        const status = gl.clientWaitSync(state.fence, 0, 0);
+        if (
+          status === gl.ALREADY_SIGNALED ||
+          status === gl.CONDITION_SATISFIED
+        ) {
+          this.settleCharacterRenderPrime(state);
+        } else if (status === gl.WAIT_FAILED) {
+          this.settleCharacterRenderPrime(
+            state,
+            new Error(
+              `Character ${state.item.target} renderer-ready fence failed`,
+            ),
+          );
+        }
+        continue;
+      }
+      candidates.push(state);
+    }
+    if (!candidates.length) return;
+
+    const settings = {
+      blur: 0,
+      alpha: 0,
+      brightness: 1,
+      radiusMax: 0,
+    };
+    const frame = this.pipeline.beginCharacterGroup(settings);
+    const completed: CharacterRenderPrimeState[] = [];
+    const failed: Array<{
+      readonly state: CharacterRenderPrimeState;
+      readonly error: unknown;
+    }> = [];
+    for (const state of candidates) {
+      try {
+        const { item } = state;
+        this.layoutCharacter(item);
+        item.node.updateWorldMatrix(true, false);
+        this.renderMvp
+          .copy(this.camera.projectionMatrix)
+          .multiply(this.camera.matrixWorldInverse)
+          .multiply(item.node.matrixWorld);
+        this.characterDrawState.objectToWorld = item.node.matrixWorld;
+        this.characterDrawState.timeSeconds = timeSeconds;
+        this.pipeline.prepareCharacterDraw(frame);
+        const drawSerial = item.model.drawSerial;
+        item.model.draw(
+          this.renderMvp,
+          frame.framebuffer,
+          frame.viewport,
+          WHITE_CHARACTER_COLOR,
+          this.characterDrawState,
+        );
+        if (item.model.drawSerial === drawSerial) {
+          throw new Error(
+            `Character ${item.target} did not submit its renderer-ready draw`,
+          );
+        }
+        const fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (fence) state.fence = fence;
+        else {
+          // WebGL2 permits a null fence on allocation failure. A one-time
+          // blocking fallback is preferable to falsely declaring readiness.
+          gl.finish();
+          completed.push(state);
+        }
+      } catch (error) {
+        failed.push({ state, error });
+      }
+    }
+    if (candidates.some((state) => state.fence)) gl.flush();
+    this.pipeline.finishCharacterGroup(settings);
+    for (const state of completed) this.settleCharacterRenderPrime(state);
+    for (const { state, error } of failed) {
+      this.settleCharacterRenderPrime(state, error);
     }
   }
 
@@ -1761,7 +2072,14 @@ export class ThreeStoryScene implements StorySceneBackend {
     // Logical controller state continues to advance during context restore or
     // a single-flight rebuild. prepareReplacementCharacterModel commits that
     // latest state immediately before installation.
-    if (this.destroyed || this.contextLost || this.characterModelRecoveryStates.has(item)) return fallback;
+    if (
+      this.destroyed ||
+      this.contextLost ||
+      this.contextRestoreController ||
+      this.characterModelRecoveryStates.has(item)
+    ) {
+      return fallback;
+    }
     try {
       return invoke(item.model);
     } catch (error) {
@@ -1778,7 +2096,14 @@ export class ThreeStoryScene implements StorySceneBackend {
     fallback: T,
     invoke: (model: ThreeStoryCharacterModel) => Promise<T>,
   ): Promise<T> {
-    if (this.destroyed || this.contextLost || this.characterModelRecoveryStates.has(item)) return fallback;
+    if (
+      this.destroyed ||
+      this.contextLost ||
+      this.contextRestoreController ||
+      this.characterModelRecoveryStates.has(item)
+    ) {
+      return fallback;
+    }
     try {
       return await invoke(item.model);
     } catch (error) {
@@ -1795,7 +2120,13 @@ export class ThreeStoryScene implements StorySceneBackend {
     timeSeconds = this.monotonicSeconds(),
     immediate = false,
   ): void {
-    if (this.destroyed || !this.ownsCharacterController(item)) return;
+    if (
+      this.destroyed ||
+      this.contextRestoreController ||
+      !this.ownsCharacterController(item)
+    ) {
+      return;
+    }
     let state = this.characterModelRecoveryStates.get(item);
     if (!state) {
       if (immediate) {
@@ -1815,13 +2146,18 @@ export class ThreeStoryScene implements StorySceneBackend {
     } else {
       if (immediate) state.retryAtSeconds = Math.min(state.retryAtSeconds, timeSeconds);
     }
-    if (!this.contextLost && !state.controller && state.retryAtSeconds <= timeSeconds) {
+    if (
+      !this.contextLost &&
+      !this.contextRestoreController &&
+      !state.controller &&
+      state.retryAtSeconds <= timeSeconds
+    ) {
       this.startCharacterModelRecovery(item, state);
     }
   }
 
   private pumpCharacterModelRecoveries(timeSeconds: number): void {
-    if (this.destroyed || this.contextLost) return;
+    if (this.destroyed || this.contextLost || this.contextRestoreController) return;
     for (const [item, state] of this.characterModelRecoveryStates) {
       if (!this.ownsCharacterController(item)) {
         this.cancelCharacterModelRecovery(item);
@@ -1835,6 +2171,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (
       this.destroyed ||
       this.contextLost ||
+      this.contextRestoreController ||
       state.controller ||
       this.characterModelRecoveryStates.get(item) !== state ||
       !this.ownsCharacterController(item)
@@ -2391,7 +2728,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.stagedCharacterItems.delete(target);
     const identity = this.pendingCharacterPlacements.get(target)?.identity;
     this.pendingCharacterPlacements.delete(target);
-    registerCharacterItem(this.characterItems, target, item, () => this.layoutCharacter(item));
+    this.registerVisibleCharacter(target, item);
     const resolvedIdentity =
       identity || firstString(item.characterKey, item.entry.url, record(item.entry.runtime).modelUrl, target);
     // CharacterIn captures the controller it started with, but a Costume can
@@ -2402,14 +2739,104 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (!selectedIdentity || selectedIdentity === resolvedIdentity) {
       this.characterControllerIdentities.set(target, resolvedIdentity);
     }
+    const existing = this.cachedCharacterControllers.get(resolvedIdentity);
+    if (
+      existing &&
+      existing !== item &&
+      this.speculativeCharacterControllers.get(resolvedIdentity) === existing
+    ) {
+      // A rolling preload may have started just after CharacterIn checked the
+      // single-flight map. The command-owned controller has already consumed
+      // the live pending presentation, so it wins; dispose the never-visible
+      // speculative duplicate before replacing the cache entry.
+      this.speculativeCharacterControllers.delete(resolvedIdentity);
+      this.speculativeCharacterCommandIndices.delete(resolvedIdentity);
+      this.cachedCharacterControllers.delete(resolvedIdentity);
+      this.releaseUnownedPreloadedCharacter(
+        existing,
+        "speculative character superseded by CharacterIn",
+      );
+    }
     this.cachedCharacterControllers.set(resolvedIdentity, item);
     this.completePendingCharacterLoadController(target, token);
     return true;
   }
 
+  /**
+   * Keep the currently visible controller alive until its replacement is
+   * renderer-ready. Replacing the map entry is the actual visibility switch;
+   * cached controllers remain owned by their TargetName+AssetIndex identity.
+   */
+  private registerVisibleCharacter(target: string, item: StoryCharacter): void {
+    const previous = this.characterItems.get(target);
+    if (previous && previous !== item) {
+      this.characterFadeCoordinator.cancel(previous.positionType);
+      this.characterItems.delete(target);
+    }
+    registerCharacterItem(this.characterItems, target, item, () =>
+      this.layoutCharacter(item),
+    );
+  }
+
   private cachedCharacterController(target: string): StoryCharacter | null {
     const identity = this.characterControllerIdentities.get(target);
-    return identity ? this.cachedCharacterControllers.get(identity) || null : null;
+    return this.cachedCharacterControllerByIdentity(identity);
+  }
+
+  private cachedCharacterControllerByIdentity(identity: string | undefined): StoryCharacter | null {
+    if (!identity) return null;
+    const item = this.cachedCharacterControllers.get(identity) || null;
+    // The first authored command that addresses a prepared controller makes
+    // it live. Stop counting it as speculative immediately so a concurrent
+    // CharacterIn cannot race pool bookkeeping.
+    if (item) {
+      this.speculativeCharacterControllers.delete(identity);
+      this.speculativeCharacterCommandIndices.delete(identity);
+      this.notifyCharacterPreloadCapacity();
+    }
+    return item;
+  }
+
+  private discardSpeculativeCharacter(
+    identity: string,
+    item: StoryCharacter,
+    reason: string,
+  ): void {
+    if (this.speculativeCharacterControllers.get(identity) !== item) return;
+    this.speculativeCharacterControllers.delete(identity);
+    this.speculativeCharacterCommandIndices.delete(identity);
+    if (this.cachedCharacterControllers.get(identity) === item) {
+      this.cachedCharacterControllers.delete(identity);
+    }
+    this.discardedCharacterPreloadIdentities.add(identity);
+    this.notifyCharacterPreloadCapacity();
+    this.cancelCharacterModelRecovery(item);
+    item.angleTweenController?.abort();
+    item.lookTweenController?.abort();
+    item.node.removeFromParent();
+    void this.releaseCharacterModelSafely(item, reason);
+  }
+
+  private releaseUnownedPreloadedCharacter(
+    item: StoryCharacter,
+    reason: string,
+  ): void {
+    this.cancelCharacterModelRecovery(item);
+    item.angleTweenController?.abort();
+    item.lookTweenController?.abort();
+    item.node.removeFromParent();
+    void this.releaseCharacterModelSafely(item, reason);
+  }
+
+  private discardAllSpeculativeCharacters(reason: string): void {
+    // In-flight builders already observe context generation and retry after
+    // restoration. Keep their promise alive so a blocking initial warmup does
+    // not turn a transient WebGL loss into a story-load failure.
+    for (const [identity, item] of [
+      ...this.speculativeCharacterControllers,
+    ]) {
+      this.discardSpeculativeCharacter(identity, item, reason);
+    }
   }
 
   private ownsCharacterController(item: StoryCharacter): boolean {
@@ -2664,6 +3091,279 @@ export class ThreeStoryScene implements StorySceneBackend {
     return model;
   }
 
+  private async createPreloadedCharacter(
+    cmd: AdvCommand,
+    target: string,
+    identity: string,
+    positionType: number,
+    motions: readonly string[],
+    expressions: readonly string[],
+    commandIndex: number,
+    signal: AbortSignal,
+  ): Promise<StoryCharacter | null> {
+    const entry = cmd.characterModel as StoryCharacterEntry | undefined;
+    if (!entry) return null;
+    // Vega has already scanned every authored In/Motion/Expression for this
+    // controller, including defaults only where playback actually invokes
+    // them. The renderer must not widen that exact set to the full catalogue.
+    const motionNames = new Set(motions.filter(Boolean));
+    const expressionNames = new Set(expressions.filter(Boolean));
+    const declaredMotionNames = new Set(
+      advCharacterMotions(entry)
+        .map((animation) => firstString(record(animation).name))
+        .filter(Boolean),
+    );
+    const declaredExpressionNames = new Set(
+      advCharacterExpressions(entry)
+        .map((animation) => firstString(record(animation).name))
+        .filter(Boolean),
+    );
+
+    while (!this.destroyed && !signal.aborted) {
+      if (!(await this.waitForRenderableContext(signal))) return null;
+      const contextGeneration = this.contextRestoreGeneration;
+      let model: ThreeStoryCharacterModel | null = null;
+      let item: StoryCharacter | null = null;
+      try {
+        model = await this.createCharacterModel(target, entry, signal);
+        if (!model) return null;
+        if (
+          this.destroyed ||
+          signal.aborted ||
+          !this.isRenderableContextGenerationCurrent(contextGeneration)
+        ) {
+          this.disposeCharacterModelSafely(
+            model,
+            "stale renderer-ready preload",
+            target,
+          );
+          if (!signal.aborted && !this.destroyed) continue;
+          return null;
+        }
+        item = new StoryCharacter(
+          target,
+          String(cmd.characterKey || ""),
+          entry,
+          model,
+          Number(positionType) || 5,
+        );
+        const normalizedEntry = this.normalizeCharacterModelEntry(entry);
+        const modelIdentity = firstString(
+          normalizedEntry.runtime?.model,
+          normalizedEntry.runtime?.moc,
+          normalizedEntry.runtime?.skeleton,
+          normalizedEntry.runtime?.skel,
+          normalizedEntry.runtime?.json,
+          normalizedEntry.runtime?.imageUrl,
+        );
+        item.lipSync.randomSeed.value = hashSeed(
+          `${cmd.characterKey || modelIdentity}:${target}`,
+        );
+        item.alpha = 0;
+        item.blurIntensity =
+          item.positionType === this.cameraState.focusPositionType
+            ? 0
+            : this.fieldRendererState.characterBlur;
+        this.layoutCharacter(item);
+        await this.configureModelMultiplyTexture(
+          model,
+          this.stageMultiplyTextureVersion,
+        );
+        const selectedMotions = [...motionNames].filter(
+          (name) => model!.hasMotion(name) || declaredMotionNames.has(name),
+        );
+        const selectedExpressions = [...expressionNames].filter((name) =>
+          typeof model!.hasExpression === "function"
+            ? model!.hasExpression(name)
+            : declaredExpressionNames.has(name),
+        );
+        const [preparedMotions, preparedExpressions] = await Promise.all([
+          Promise.all(
+            selectedMotions.map((name) => model!.prepareMotion(name)),
+          ),
+          Promise.all(
+            selectedExpressions.map((name) => model!.prepareExpression(name)),
+          ),
+        ]);
+        for (let index = 0; index < selectedMotions.length; index += 1) {
+          const name = selectedMotions[index]!;
+          if (!preparedMotions[index]) {
+            throw new Error(
+              `Character motion ${name} could not be prepared`,
+            );
+          }
+        }
+        for (let index = 0; index < selectedExpressions.length; index += 1) {
+          const name = selectedExpressions[index]!;
+          if (!preparedExpressions[index]) {
+            throw new Error(
+              `Character expression ${name} could not be prepared`,
+            );
+          }
+        }
+        const preparedMotionNames = new Set(selectedMotions);
+        const preparedExpressionNames = new Set(selectedExpressions);
+        for (const name of preparedMotionNames) item.warmedMotionNames.add(name);
+        for (const name of selectedExpressions) {
+          item.warmedExpressionNames.add(name);
+        }
+        const presentationFadeIn = finite(
+          entry.profile?.presentationFadeInSeconds,
+          finite(record(entry.runtime).presentationFadeInSeconds, 0),
+        );
+        const initialMotionName = firstString(
+          cmd.characterPresentation?.motionName,
+          cmd.motionName,
+          entry.profile?.defaultMotionName,
+          record(entry.runtime).defaultMotionName,
+        );
+        const initialExpressionName = firstString(
+          cmd.characterPresentation?.expressionName,
+          cmd.expressionName,
+          entry.profile?.defaultExpressionName,
+          record(entry.runtime).defaultExpressionName,
+        );
+        const defaultMotionName = entry.profile?.playDefaultMotionBeforePresentation
+          ? firstString(
+              entry.profile?.defaultMotionName,
+              record(entry.runtime).defaultMotionName,
+            )
+          : "";
+        if (
+          defaultMotionName &&
+          defaultMotionName !== initialMotionName &&
+          preparedMotionNames.has(defaultMotionName)
+        ) {
+          if (!model.playMotion(defaultMotionName, presentationFadeIn)) {
+            throw new Error(
+              `Prepared character motion ${defaultMotionName} could not start`,
+            );
+          }
+        }
+        if (
+          initialMotionName &&
+          preparedMotionNames.has(initialMotionName) &&
+          !model.playMotion(initialMotionName, presentationFadeIn)
+        ) {
+          throw new Error(
+            `Prepared character motion ${initialMotionName} could not start`,
+          );
+        }
+        if (
+          initialExpressionName &&
+          preparedExpressionNames.has(initialExpressionName) &&
+          !model.playExpression(initialExpressionName, presentationFadeIn)
+        ) {
+          throw new Error(
+            `Prepared character expression ${initialExpressionName} could not start`,
+          );
+        }
+        model.primeInitialFrame(this.characterParameterFrame(item));
+        await this.waitForCharacterFirstDraw(
+          item,
+          contextGeneration,
+          signal,
+        );
+        if (
+          this.destroyed ||
+          signal.aborted ||
+          !this.isRenderableContextGenerationCurrent(contextGeneration)
+        ) {
+          this.releaseUnownedPreloadedCharacter(
+            item,
+            "stale prepared character",
+          );
+          if (!signal.aborted && !this.destroyed) continue;
+          return null;
+        }
+        const existing = this.cachedCharacterControllers.get(identity);
+        if (existing) {
+          this.releaseUnownedPreloadedCharacter(
+            item,
+            "duplicate prepared character",
+          );
+          return existing;
+        }
+        this.cachedCharacterControllers.set(identity, item);
+        this.speculativeCharacterControllers.set(identity, item);
+        this.speculativeCharacterCommandIndices.set(
+          identity,
+          Math.max(0, Math.floor(finite(commandIndex))),
+        );
+        return item;
+      } catch (error) {
+        if (item) {
+          this.releaseUnownedPreloadedCharacter(
+            item,
+            "failed character preload",
+          );
+        } else if (model) {
+          this.disposeCharacterModelSafely(
+            model,
+            "failed character preload",
+            target,
+          );
+        }
+        if (
+          !signal.aborted &&
+          !this.destroyed &&
+          !this.isRenderableContextGenerationCurrent(contextGeneration)
+        ) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    return null;
+  }
+
+  private waitForCharacterFirstDraw(
+    item: StoryCharacter,
+    contextGeneration: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (signal.aborted) {
+      return Promise.reject(
+        sceneAbortError(`Character ${item.target} preload was aborted`),
+      );
+    }
+    return new Promise<void>((resolve, reject) => {
+      let state: CharacterRenderPrimeState;
+      const aborted = () =>
+        this.settleCharacterRenderPrime(
+          state,
+          sceneAbortError(`Character ${item.target} preload was aborted`),
+        );
+      signal.addEventListener("abort", aborted, { once: true });
+      state = {
+        item,
+        contextGeneration,
+        detach: () => signal.removeEventListener("abort", aborted),
+        resolve,
+        reject,
+        fence: null,
+      };
+      this.characterRenderPrimes.set(item, state);
+    });
+  }
+
+  private settleCharacterRenderPrime(
+    state: CharacterRenderPrimeState,
+    error?: unknown,
+  ): void {
+    if (this.characterRenderPrimes.get(state.item) !== state) return;
+    this.characterRenderPrimes.delete(state.item);
+    if (state.fence && this.renderer) {
+      (this.renderer.getContext() as WebGL2RenderingContext).deleteSync(
+        state.fence,
+      );
+      state.fence = null;
+    }
+    state.detach();
+    if (error === undefined) state.resolve();
+    else state.reject(error);
+  }
+
   private createRendererContext(
     renderer: WebGLRenderer,
     gl: WebGL2RenderingContext,
@@ -2804,18 +3504,43 @@ export class ThreeStoryScene implements StorySceneBackend {
         fadeInStartedAtSeconds: null,
       };
       this.pendingCharacterPlacements.set(target, pendingPlacement);
+      // The authored In transition begins when its command is issued, not
+      // after model creation finishes. A slow network/SDK preparation must not
+      // add a second full fade delay once the renderer-ready model arrives.
+      void this.markPendingCharacterFadeInStarted(target, pendingPlacement);
     }
-    const previous = this.characterItems.get(target);
-    if (previous) {
-      this.characterFadeCoordinator.cancel(previous.positionType);
-      this.characterItems.delete(target);
+    let cached = this.cachedCharacterControllerByIdentity(identity);
+    const activePreload = cached ? undefined : this.characterPreloads.get(identity);
+    if (activePreload) {
+      let detachAbort = () => {};
+      try {
+        await Promise.race([
+          activePreload.promise,
+          new Promise<void>((resolve) => {
+            const aborted = () => resolve();
+            token.signal.addEventListener("abort", aborted, { once: true });
+            detachAbort = () => token.signal.removeEventListener("abort", aborted);
+          }),
+        ]);
+      } catch (error) {
+        // A failed speculative preload is not a failed CharacterIn. The normal
+        // load path below remains the authoritative retry boundary.
+        if (!token.signal.aborted) {
+          console.warn(`Renderer-ready preload failed for character ${target}`, error);
+        }
+      } finally {
+        detachAbort();
+      }
+      if (!this.isCharacterLoadCurrent(target, token)) return;
+      cached = this.cachedCharacterControllerByIdentity(identity);
     }
-
-    const cached = this.cachedCharacterControllers.get(identity);
     if (cached) {
       const pending = this.pendingCharacterCommands.consume(target, token.target) || {};
       this.pendingCharacterPlacements.delete(target);
-      this.pendingCharacterWorldPositions.delete(target);
+      const pendingWorld = this.pendingCharacterWorldPositions.get(target);
+      if (pendingWorld?.token === token.target) {
+        this.pendingCharacterWorldPositions.delete(target);
+      }
       this.completePendingCharacterLoadController(target, token.target);
       cached.positionType = Number(positionType) || 5;
       if (initialWorldPosition) cached.worldPosition = { ...initialWorldPosition };
@@ -2832,24 +3557,16 @@ export class ThreeStoryScene implements StorySceneBackend {
       // entry that was removed by Out.
       cached.blurIntensity =
         cached.positionType === this.cameraState.focusPositionType ? 0 : this.fieldRendererState.characterBlur;
-      const presentation = this.resolveInitialCharacterPresentation(cached, pending);
-      const presentationFadeIn = this.defaultCharacterPresentationFadeIn(cached);
-      cached.currentMotionName = presentation.motionName;
-      cached.currentMotionFadeInSeconds = presentationFadeIn;
-      if (presentation.expressionName) {
-        cached.currentExpressionName = presentation.expressionName;
-        cached.currentExpressionFadeInSeconds = presentationFadeIn;
-        cached.activeExpressionName = presentation.expressionName;
-        cached.activeExpressionFadeInSeconds = presentationFadeIn;
-      }
       this.invokeCharacterModel(cached, "show cached controller", undefined, (model) => {
         model.setPaused(false);
         model.setMotionSpeed(this.playbackSpeedRate);
-        if (presentation.motionName) model.playMotion(presentation.motionName, presentationFadeIn);
-        if (presentation.expressionName) model.playExpression(presentation.expressionName, presentationFadeIn);
       });
       cached.alpha = duration > 0 ? 0 : 1;
-      registerCharacterItem(this.characterItems, target, cached, () => this.layoutCharacter(cached));
+      // A renderer-ready preload can still be in flight when no-wait
+      // Motion/Expression/Lip/Angle/Look/lighting commands arrive. Consume the
+      // complete pending presentation, not only the two animation names.
+      this.primeCharacterPresentation(cached, pending);
+      this.registerVisibleCharacter(target, cached);
       this.layoutCharacter(cached);
       this.characterControllerIdentities.set(target, identity);
       this.scene.updateMatrixWorld(true);
@@ -2858,14 +3575,55 @@ export class ThreeStoryScene implements StorySceneBackend {
       cached.sortingOrder = Number.isFinite(authoredRenderOrder)
         ? authoredRenderOrder
         : threeVector3ToUnity(this.renderWorldPosition, this.renderUnityPosition).z;
-      const layoutMove = transitionTo
-        ? this.moveCharacterToWorld(target, transitionTo, cached.positionType, duration, 6)
-        : Promise.resolve();
-      if (duration > 0) await Promise.all([this.fadeCharacterLifecycle(cached, 0, 1, duration), layoutMove]);
-      else await layoutMove;
+      const fadeStartedAt = pendingPlacement?.fadeInStartedAtSeconds;
+      const elapsed =
+        fadeStartedAt == null
+          ? 0
+          : Math.max(0, this.monotonicSeconds() - fadeStartedAt);
+      const startRaw = duration > 0 ? clamp(elapsed / duration) : 1;
+      const remainingDuration = duration * (1 - startRaw);
+      const layoutMove =
+        pendingWorld?.token === token.target
+          ? this.moveCharacterToWorld(
+              target,
+              pendingWorld.position,
+              pendingWorld.positionType,
+              0,
+              6,
+            )
+          : transitionTo
+            ? this.moveCharacterToWorld(
+                target,
+                transitionTo,
+                cached.positionType,
+                remainingDuration,
+                6,
+              )
+            : Promise.resolve();
+      const pendingAlphaOwnsFade =
+        this.characterAlphaOperations.get(target) !== alphaOperationAtStart;
+      if (duration > 0 && !pendingAlphaOwnsFade) {
+        if (startRaw >= 1) cached.alpha = 1;
+        await Promise.all([
+          startRaw >= 1
+            ? Promise.resolve(true)
+            : this.fadeCharacterLifecycle(
+                cached,
+                0,
+                1,
+                remainingDuration,
+                {
+                  delayFrames: fadeStartedAt == null ? undefined : 0,
+                  startRaw,
+                },
+              ),
+          layoutMove,
+        ]);
+      } else {
+        await layoutMove;
+      }
       return;
     }
-    if (pendingPlacement) void this.markPendingCharacterFadeInStarted(target, pendingPlacement);
     const item = await this.createCharacter(cmd, target, Number(positionType) || 5, token);
     if (!item) {
       if (this.isCharacterLoadCurrent(target, token)) {
@@ -2920,24 +3678,34 @@ export class ThreeStoryScene implements StorySceneBackend {
       : threeVector3ToUnity(this.renderWorldPosition, this.renderUnityPosition).z;
     const pendingWorld = this.pendingCharacterWorldPositions.get(target);
     if (pendingWorld?.token === token.target) this.pendingCharacterWorldPositions.delete(target);
+    const fadeStartedAt = pendingPlacement?.fadeInStartedAtSeconds;
+    const elapsed =
+      fadeStartedAt == null
+        ? 0
+        : Math.max(0, this.monotonicSeconds() - fadeStartedAt);
+    const startRaw = duration > 0 ? clamp(elapsed / duration) : 1;
+    const remainingDuration = duration * (1 - startRaw);
     const layoutMove =
       pendingWorld?.token === token.target
         ? this.moveCharacterToWorld(target, pendingWorld.position, pendingWorld.positionType, 0, 6)
         : transitionTo
-          ? this.moveCharacterToWorld(target, transitionTo, item.positionType, duration, 6)
+          ? this.moveCharacterToWorld(
+              target,
+              transitionTo,
+              item.positionType,
+              remainingDuration,
+              6,
+            )
           : Promise.resolve();
     const pendingAlphaOwnsFade = this.characterAlphaOperations.get(target) !== alphaOperationAtStart;
     if (duration > 0 && !pendingAlphaOwnsFade) {
       // A newer Out/replacement owns cleanup after it cancels this position's
       // fade. The obsolete In continuation must never release mid-fade.
-      const fadeStartedAt = pendingPlacement?.fadeInStartedAtSeconds;
-      const elapsed = fadeStartedAt == null ? 0 : Math.max(0, this.monotonicSeconds() - fadeStartedAt);
-      const startRaw = clamp(elapsed / duration);
       if (startRaw >= 1) item.alpha = 1;
       await Promise.all([
         startRaw >= 1
           ? Promise.resolve(true)
-          : this.fadeCharacterLifecycle(item, 0, 1, duration * (1 - startRaw), {
+          : this.fadeCharacterLifecycle(item, 0, 1, remainingDuration, {
               delayFrames: fadeStartedAt == null ? undefined : 0,
               startRaw,
             }),
@@ -3278,6 +4046,19 @@ export class ThreeStoryScene implements StorySceneBackend {
   clearCharacters(): void {
     this.cancelAllCharacterModelRecoveries();
     this.cancelAllCharacterOwnedTweens();
+    for (const [identity, preload] of this.characterPreloads) {
+      this.discardedCharacterPreloadIdentities.add(identity);
+      preload.detach();
+      preload.controller.abort();
+    }
+    this.characterPreloads.clear();
+    this.notifyCharacterPreloadCapacity();
+    for (const prime of [...this.characterRenderPrimes.values()]) {
+      this.settleCharacterRenderPrime(
+        prime,
+        sceneAbortError(`Character ${prime.item.target} preload was cleared`),
+      );
+    }
     this.characterLoadTokens.clear();
     this.characterAlphaOperations.clear();
     for (const pending of this.pendingCharacterLoadControllers.values()) {
@@ -3294,6 +4075,9 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.pendingLookWaitControllers.clear();
     this.characterPresentationHistory.clear();
     for (const target of [...this.stagedCharacterItems.keys()]) this.releaseStagedCharacter(target);
+    for (const identity of this.cachedCharacterControllers.keys()) {
+      this.discardedCharacterPreloadIdentities.add(identity);
+    }
     const controllers = new Set<StoryCharacter>([
       ...this.cachedCharacterControllers.values(),
       ...this.characterItems.values(),
@@ -3307,6 +4091,9 @@ export class ThreeStoryScene implements StorySceneBackend {
     }
     this.characterItems.clear();
     this.cachedCharacterControllers.clear();
+    this.speculativeCharacterControllers.clear();
+    this.speculativeCharacterCommandIndices.clear();
+    this.notifyCharacterPreloadCapacity();
     this.characterControllerIdentities.clear();
     this.sortedCharacterItems.length = 0;
     for (const group of this.characterRenderGroupPool) group.items.length = 0;
@@ -3314,7 +4101,7 @@ export class ThreeStoryScene implements StorySceneBackend {
 
   playMotionForTarget(target: string, motionName = "", motionFadeIn = -1, expectedIdentity?: string): void {
     const item = expectedIdentity
-      ? this.cachedCharacterControllers.get(expectedIdentity)
+      ? this.cachedCharacterControllerByIdentity(expectedIdentity)
       : this.cachedCharacterController(target);
     const placement = this.pendingCharacterPlacements.get(target);
     if (item) {
@@ -3363,7 +4150,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     expectedIdentity?: string,
   ): void {
     const item = expectedIdentity
-      ? this.cachedCharacterControllers.get(expectedIdentity)
+      ? this.cachedCharacterControllerByIdentity(expectedIdentity)
       : this.cachedCharacterController(target);
     const placement = this.pendingCharacterPlacements.get(target);
     const entry = item?.entry || placement?.entry;
@@ -3513,7 +4300,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       this.characterLoadTokens.get(target) === pending.token &&
       (!expectedIdentity || pending.identity === expectedIdentity),
     );
-    const selectedController = identity ? this.cachedCharacterControllers.get(identity) : null;
+    const selectedController = this.cachedCharacterControllerByIdentity(identity || undefined);
     return Boolean(
       pendingShowing ||
       (selectedController &&
@@ -4608,8 +5395,11 @@ export class ThreeStoryScene implements StorySceneBackend {
     }
     if (this.state.video.visible || this.overlay?.videoElement) return { safe: false, reason: "video-active" };
     const visibleControllers = new Set(this.characterItems.values());
-    for (const controller of this.cachedCharacterControllers.values()) {
+    for (const [identity, controller] of this.cachedCharacterControllers) {
       if (!visibleControllers.has(controller)) {
+        if (this.speculativeCharacterControllers.get(identity) === controller) {
+          continue;
+        }
         // Hidden cached controllers carry native angle/look/motion state. Until
         // snapshots serialize that cache, force seek to deterministic replay.
         return { safe: false, reason: `hidden-character-controller:${controller.target}` };
