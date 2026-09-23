@@ -4,9 +4,14 @@ export function videoAbortError(message: string): Error {
   return error;
 }
 
-export function waitForVideo(video: HTMLVideoElement, event: string, signal?: AbortSignal): Promise<void> {
+export function waitForVideo(
+  video: HTMLVideoElement,
+  event: string,
+  signal?: AbortSignal,
+  minimumReadyState: number = HTMLMediaElement.HAVE_CURRENT_DATA,
+): Promise<void> {
   if (signal?.aborted) return Promise.reject(videoAbortError("Video load was cancelled"));
-  if (video.readyState >= 2) return Promise.resolve();
+  if (video.readyState >= minimumReadyState) return Promise.resolve();
   return new Promise((resolve, reject) => {
     const onReady = (): void => finish();
     const onError = (): void => finish(new Error(video.error?.message || "Video failed to load"));

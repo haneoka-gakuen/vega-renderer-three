@@ -1,5 +1,18 @@
+import { ScreenSpriteRenderer } from "./ScreenSpriteRenderer";
 import {
   AdaptiveRenderQuality,
+  DEFAULT_SCENE_GEOMETRY,
+  STORY_SCREEN_FILTER_PROVIDER,
+  StoryScreenEffects,
+  STORY_FRAME_LAYOUT_PROVIDER,
+  STORY_STILL_PRESENTATION_PROVIDER,
+  resolveStoryPlaneLayout,
+  scenePlaneSize,
+  scenePointFromPixels,
+  type SceneCoordinateReference,
+  type StoryPlaneLayout,
+  isStoryScreenSpriteEffect,
+  type StoryScreenEffectDefinition,
   AdvCamera,
   AdvQualityConfig,
   createAdvDotweenShakePath,
@@ -8,6 +21,8 @@ import {
   isRendererAwareCharacterProvider,
   sampleAdvDotweenShake,
   registerCharacterItem,
+  iterateAdvCommands,
+  normalizeStoryResourceDeclarations,
   UNITY_CHARACTER_FADE_DELAY_FRAMES,
   UnityCharacterFadeCoordinator,
   advCharacterExpressions,
@@ -28,6 +43,7 @@ import {
   type AdvRuleTransitionEntry,
   type AdvRuntimeConfig,
   type AdvStillEntry,
+  type AdvStory,
   type AdvStorySceneSeekSnapshot as PortableAdvStorySceneSeekSnapshot,
   type AdvVideoEntry,
   type StoryCharacterProvider,
@@ -37,9 +53,14 @@ import {
   type StoryCharacterRendererModelContext,
   type StoryRendererEffectContribution,
   type StoryRendererExtensionContext,
+  type StoryRendererResourcePreparationContext,
+  type StoryResourceDeclaration,
+  type StoryScreenFilterController,
+  type StoryScreenFilterProvider,
   type VegaDisposable,
   type StorySceneBackend,
   type StorySceneBackendContext,
+  type StoryScenePreviewOptions,
   type VegaVoiceAnalysisSource,
 } from "@haneoka/vega/renderer-kit";
 import {
@@ -56,10 +77,12 @@ import {
   Object3D,
   PerspectiveCamera,
   PlaneGeometry,
+  Quaternion,
   Scene,
   Texture,
   Vector3,
   WebGLRenderer,
+  type WebGLRenderTarget,
 } from "three";
 import {
   isThreeStoryCharacterModel,
@@ -70,11 +93,8 @@ import {
 } from "../ThreeCharacterModel";
 import { StaticPortraitModel } from "../portrait/StaticPortraitModel";
 import { loadRendererImage } from "../ImageResource";
-import { THREE_POST_TEXTURE_RESOLVER } from "../PostTextureResolver";
-import {
-  evaluateAdvHarmonicMotion,
-  type AdvHarmonicMotionData,
-} from "../CharacterHarmonicMotion";
+import { THREE_POST_TEXTURE_RESOLVER, storyPostTextureRequests } from "../PostTextureResolver";
+import { evaluateAdvHarmonicMotion, type AdvHarmonicMotionData } from "../CharacterHarmonicMotion";
 import {
   DEFAULT_UNITY_CHARACTER_LIGHTING,
   UNITY_CHARACTER_REFERENCE_FLAT_WHITE_SH,
@@ -87,6 +107,8 @@ import { AdvPostPipeline, type AdvSceneLayer } from "./AdvPostPipeline";
 import type { AdvColorGradingPipelineMode } from "../post/AdvUrpPostProcessor";
 import { advVolumeProfileKey, type AdvVolumeLayer, type UnityVolumeProfile } from "../post/AdvVolumeStack";
 import { StoryCharacter } from "./StoryCharacter";
+import { sceneTransformMatrix } from "./SceneTransform";
+import { ScreenFilterRunner, type ScreenFilterBounds } from "./ScreenFilterRunner";
 import { UnityParticleEffectController } from "../particles/UnityParticleEffect";
 import type { UnityEffectRuntimeDefinition } from "../particles/UnityParticleTypes";
 import { resolveAdvEffectRoute, type AdvEffectRoute } from "../particles/AdvEffectRoute";
@@ -96,20 +118,10 @@ import { sampleVoiceMotionSyncInput, voiceRmsMouthOpening } from "./VoiceMotionS
 import { SharedTextureResourceCache, type SharedTextureLease } from "./SharedTextureResourceCache";
 import { StoryDomOverlay } from "./StoryDomOverlay";
 import { UnityTargetFrameClock } from "./UnityTargetFrameClock";
-import {
-  computeAdvCharacterHeadWorldPosition,
-  computeAdvLookTarget,
-} from "./AdvLookTarget";
-import {
-  createUnityAdvViewport,
-  unityAdvOrientedTargetAspect,
-} from "./UnityAdvViewport";
+import { computeAdvCharacterHeadWorldPosition, computeAdvLookTarget } from "./AdvLookTarget";
+import { createUnityAdvViewport, unityAdvOrientedTargetAspect } from "./UnityAdvViewport";
 import { detectAdvFieldTargetFormat } from "./AdvFieldTargetFormat";
-import {
-  threeVector3ToUnity,
-  unityEulerDegrees,
-  unityVector3,
-} from "./UnityTransform";
+import { threeVector3ToUnity, unityEulerDegrees, unityVector3 } from "./UnityTransform";
 import {
   PendingCharacterCommands,
   type PendingCharacterAlphaEvent,
@@ -123,10 +135,7 @@ import {
   type PendingCharacterPresentation,
   type PendingCharacterRimLightEvent,
 } from "./PendingCharacterCommands";
-import {
-  advanceAdvHoldOpenPseudoLipSync,
-  advanceAdvPseudoLipSync,
-} from "../CharacterLipSyncMath";
+import { advanceAdvHoldOpenPseudoLipSync, advanceAdvPseudoLipSync } from "../CharacterLipSyncMath";
 import type {
   FieldRendererState,
   StoryCharacterEntry,
@@ -244,11 +253,7 @@ interface SceneUpdateFailureState {
   retryAtSeconds: number;
 }
 
-async function loadPngTexture(
-  url: string,
-  resources?: StoryResourceResolver,
-  signal?: AbortSignal,
-): Promise<Texture> {
+async function loadPngTexture(url: string, resources?: StoryResourceResolver, signal?: AbortSignal): Promise<Texture> {
   const image = await loadRendererImage(url, resources, signal);
   const texture = new Texture(image);
   // PlayerSettings.m_ActiveColorSpace=Gamma. Unity therefore samples
@@ -290,8 +295,8 @@ const CHARACTER_FRAME_FAILURE_REBUILD_THRESHOLD = 4;
 const CHARACTER_MODEL_RECOVERY_MAX_DELAY_SECONDS = 30;
 const CHARACTER_MODEL_RECOVERY_PREPARE_MAX_PASSES = 3;
 const ZERO_VEC3: Readonly<Vec3> = { x: 0, y: 0, z: 0 };
-const BACKGROUND_FIELD_POSITION: Readonly<Vec3> = { x: 0, y: 0, z: 16 };
-const CHARACTER_FIELD_POSITION: Readonly<Vec3> = { x: 0, y: -0.45, z: 5.5 };
+const BACKGROUND_FIELD_POSITION: Readonly<Vec3> = DEFAULT_SCENE_GEOMETRY.backgroundFieldPosition;
+const CHARACTER_FIELD_POSITION: Readonly<Vec3> = DEFAULT_SCENE_GEOMETRY.characterFieldPosition;
 const CHARACTER_BASE_POSITION: Readonly<Vec3> = { x: 0, y: -0.41, z: 0 };
 const WHITE_CHARACTER_COLOR = [1, 1, 1, 1] as const;
 
@@ -308,15 +313,15 @@ interface CharacterRenderGroup {
     alpha: number;
     brightness: number;
     radiusMax: number;
+    filterTarget?: string;
+    filter?: (target: WebGLRenderTarget) => void;
   };
   readonly items: StoryCharacter[];
 }
 
 export interface ThreeStorySceneOptions {
   /** Stable provider route. */
-  readonly rendererId?:
-    | typeof VEGA_THREE_RENDERER_ID
-    | typeof LEGACY_HANEOKA_THREE_RENDERER_ID;
+  readonly rendererId?: typeof VEGA_THREE_RENDERER_ID | typeof LEGACY_HANEOKA_THREE_RENDERER_ID;
   readonly profile?: "vega" | "unity-adv";
   readonly staticPortraitFallback?: boolean;
   /** LDR is the default; HDR bakes tone mapping into a logarithmic scene LUT. */
@@ -324,8 +329,7 @@ export interface ThreeStorySceneOptions {
 }
 
 export const VEGA_THREE_RENDERER_ID = "vega-three-webgl2" as const;
-export const LEGACY_HANEOKA_THREE_RENDERER_ID =
-  "haneoka-three-webgl2" as const;
+export const LEGACY_HANEOKA_THREE_RENDERER_ID = "haneoka-three-webgl2" as const;
 
 export interface ThreeRendererEffectTarget {
   readonly key: string;
@@ -339,9 +343,7 @@ export interface ThreeRendererEffectTarget {
 export interface ThreeRendererContext {
   readonly gl: WebGL2RenderingContext;
   readonly threeRenderer: WebGLRenderer;
-  readonly rendererId:
-    | typeof VEGA_THREE_RENDERER_ID
-    | typeof LEGACY_HANEOKA_THREE_RENDERER_ID;
+  readonly rendererId: typeof VEGA_THREE_RENDERER_ID | typeof LEGACY_HANEOKA_THREE_RENDERER_ID;
   readonly rendererAliases: readonly [typeof LEGACY_HANEOKA_THREE_RENDERER_ID];
   readonly profile: "vega" | "unity-adv";
   readonly runtime: AdvRuntimeConfig;
@@ -356,15 +358,9 @@ export interface ThreeRendererContext {
   readonly effectTarget?: ThreeRendererEffectTarget;
 }
 
-type ThreeRendererId =
-  | typeof VEGA_THREE_RENDERER_ID
-  | typeof LEGACY_HANEOKA_THREE_RENDERER_ID;
+type ThreeRendererId = typeof VEGA_THREE_RENDERER_ID | typeof LEGACY_HANEOKA_THREE_RENDERER_ID;
 
-type ThreeCharacterProvider = StoryCharacterProvider<
-  ThreeRendererId,
-  ThreeRendererContext,
-  ThreeStoryCharacterModel
->;
+type ThreeCharacterProvider = StoryCharacterProvider<ThreeRendererId, ThreeRendererContext, ThreeStoryCharacterModel>;
 
 type ThreeRendererAwareCharacterProvider = RendererAwareStoryCharacterProvider<
   ThreeRendererId,
@@ -374,10 +370,7 @@ type ThreeRendererAwareCharacterProvider = RendererAwareStoryCharacterProvider<
   readonly supportsRenderer?: (renderer: ThreeRendererId) => boolean;
 };
 
-type ThreeCharacterProviderContext = StoryCharacterRendererModelContext<
-  ThreeRendererId,
-  ThreeRendererContext
->;
+type ThreeCharacterProviderContext = StoryCharacterRendererModelContext<ThreeRendererId, ThreeRendererContext>;
 
 function finite(value: unknown, fallback = 0): number {
   const result = Number(value);
@@ -392,6 +385,31 @@ function sceneAbortError(message: string): Error {
   const error = new Error(message);
   error.name = "AbortError";
   return error;
+}
+
+function waitForScenePromise<Value>(
+  pending: Promise<Value>,
+  signal: AbortSignal | undefined,
+  message: string,
+): Promise<Value> {
+  if (!signal) return pending;
+  if (signal.aborted) return Promise.reject(sceneAbortError(message));
+  return new Promise<Value>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", aborted);
+      callback();
+    };
+    const aborted = (): void => finish(() => reject(sceneAbortError(message)));
+    signal.addEventListener("abort", aborted, { once: true });
+    if (signal.aborted) aborted();
+    pending.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error)),
+    );
+  });
 }
 
 function isVegaDisposable(value: unknown): value is VegaDisposable {
@@ -500,6 +518,28 @@ function nextFrame(): Promise<void> {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
+function nextPreloadPoll(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    let frame = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      if (frame) cancelAnimationFrame(frame);
+      if (timer) clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    signal.addEventListener("abort", finish, { once: true });
+    if (globalThis.document?.visibilityState !== "hidden") {
+      frame = requestAnimationFrame(finish);
+    }
+    timer = setTimeout(finish, 16);
+  });
+}
+
 function colorComponents(value: unknown): { r: number; g: number; b: number; a: number } {
   if (typeof value === "number" && Number.isFinite(value)) {
     const packed = Math.trunc(value) >>> 0;
@@ -573,9 +613,7 @@ function stageSpriteTint(value: unknown, target: MutableColor4 = { r: 1, g: 1, b
  */
 export class ThreeStoryScene implements StorySceneBackend {
   readonly backend: string;
-  readonly rendererId:
-    | typeof VEGA_THREE_RENDERER_ID
-    | typeof LEGACY_HANEOKA_THREE_RENDERER_ID;
+  readonly rendererId: typeof VEGA_THREE_RENDERER_ID | typeof LEGACY_HANEOKA_THREE_RENDERER_ID;
   readonly profile: "vega" | "unity-adv";
   runtime: AdvRuntimeConfig;
   state: AdvPlayerState;
@@ -588,22 +626,203 @@ export class ThreeStoryScene implements StorySceneBackend {
   private readonly backgroundCaptureField = new Object3D();
   readonly characterField = new Object3D();
   readonly foregroundField = new Object3D();
+  readonly screenTransformChannels: readonly string[];
+  private readonly sceneTransforms = new Map<
+    string,
+    { current: Record<string, number>; planned: Record<string, number> }
+  >();
+  private readonly screenFilterProvider: StoryScreenFilterProvider | undefined;
+  private screenFilterRunner: ScreenFilterRunner | undefined;
+  private readonly screenFilters = new Map<
+    string,
+    {
+      controller: StoryScreenFilterController;
+      values: Readonly<Record<string, number>>;
+      render: (target: WebGLRenderTarget) => void;
+    }
+  >();
+  private readonly filterBoundsMatrix = new Matrix4();
+  private readonly filterBoundsPoint = new Vector3();
+  private readonly filterBackground = (target: WebGLRenderTarget) => this.renderScreenFilter("bg-main", target);
+  private readonly filterStage = (target: WebGLRenderTarget) => this.renderScreenFilter("stage-main", target);
+  private readonly sceneTargetMatrix = new Matrix4();
+  private readonly sceneParentMatrix = new Matrix4();
+  private readonly sceneParentInverse = new Matrix4();
+  private readonly scenePivot = new Vector3();
+  private readonly sceneReferenceRotation = new Quaternion();
+  private readonly spritePlaneMatrix = new Matrix4();
+  private readonly spriteProjection = new Matrix4();
+  private readonly sceneReferenceCache = new WeakMap<object, SceneCoordinateReference>();
+  private readonly placementCache = new WeakMap<
+    StoryCharacter,
+    { stage: object; positions: Map<number, { position: Vec3; origin: Vec3; scale: number }> }
+  >();
+
+  private coordinateReference(): SceneCoordinateReference {
+    const stage = this.runtime.stage;
+    let reference = this.sceneReferenceCache.get(stage);
+    if (!reference) {
+      const rotation = vec3(stage.initialCameraRotation, ZERO_VEC3);
+      reference = {
+        width: Math.max(1, finite(record(stage).screenReferenceWidth, 2560)),
+        height: Math.max(1, finite(record(stage).screenReferenceHeight, 1440)),
+        fov: finite(stage.fov, 39.6),
+        position: vec3(stage.initialCameraPosition, ZERO_VEC3),
+        rotation: { x: -rotation.x, y: rotation.y, z: rotation.z },
+      };
+      this.sceneReferenceCache.set(stage, reference);
+    }
+    return reference;
+  }
+
+  private coordinateDepth(target: string): number {
+    const reference = this.coordinateReference();
+    const field =
+      target === "bg-main"
+        ? (this.runtime.stage.backgroundFieldPosition ?? BACKGROUND_FIELD_POSITION)
+        : (this.runtime.stage.characterFieldPosition ?? CHARACTER_FIELD_POSITION);
+    return Math.max(0.001, field.z - reference.position.z);
+  }
+
+  readSceneTransform(target: string): { current: Record<string, number>; planned: Record<string, number> } | undefined {
+    return this.sceneTransforms.get(target);
+  }
+
+  clearSceneTransform(target: string): void {
+    this.sceneTransforms.delete(target);
+    this.screenFilter(target);
+  }
+
+  clearScreenTransform(target: string): void {
+    this.clearSceneTransform(target);
+  }
+
+  writeSceneTransform(
+    target: string,
+    value: { current: Readonly<Record<string, number>>; planned: Readonly<Record<string, number>> },
+  ): void {
+    this.sceneTransforms.set(target, { current: { ...value.current }, planned: { ...value.planned } });
+    this.screenFilter(target);
+  }
+
+  readScreenTransform(
+    target: string,
+  ): { current: Record<string, number>; planned: Record<string, number> } | undefined {
+    const value = this.readSceneTransform(target);
+    if (!value) return undefined;
+    const reference = this.coordinateReference(),
+      unit = scenePlaneSize(reference, this.coordinateDepth(target)).height / reference.height;
+    const convert = (v: Readonly<Record<string, number>>) => ({
+      ...v,
+      x: (v.x ?? 0) / unit,
+      y: -(v.y ?? 0) / unit,
+      rotation: -(v.rotation ?? 0),
+    });
+    return { current: convert(value.current), planned: convert(value.planned) };
+  }
+
+  writeScreenTransform(
+    target: string,
+    value: { current: Readonly<Record<string, number>>; planned: Readonly<Record<string, number>> },
+  ): void {
+    const reference = this.coordinateReference(),
+      unit = scenePlaneSize(reference, this.coordinateDepth(target)).height / reference.height;
+    const convert = (v: Readonly<Record<string, number>>) => ({
+      ...v,
+      x: (v.x ?? 0) * unit,
+      y: -(v.y ?? 0) * unit,
+      rotation: -(v.rotation ?? 0),
+    });
+    this.writeSceneTransform(target, { current: convert(value.current), planned: convert(value.planned) });
+  }
+  private screenFilter(target: string) {
+    const values = this.readSceneTransform(target)?.current;
+    const existing = this.screenFilters.get(target);
+    if (!values || !this.screenFilterProvider) {
+      if (existing) {
+        existing.controller.dispose();
+        this.screenFilters.delete(target);
+      }
+      return undefined;
+    }
+    if (existing?.values === values) return existing;
+    const entry = existing ?? {
+      controller: this.screenFilterProvider.create(target),
+      values,
+      render: (texture: WebGLRenderTarget) => this.renderScreenFilter(target, texture),
+    };
+    entry.controller.configure(values);
+    entry.values = values;
+    this.screenFilters.set(target, entry);
+    return entry;
+  }
+  private renderScreenFilter(target: string, texture: WebGLRenderTarget): void {
+    const filter = this.screenFilter(target)?.controller;
+    if (!filter?.active || !this.renderer) return;
+    this.screenFilterRunner ??= new ScreenFilterRunner(this.renderer);
+    this.screenFilterRunner.render(
+      filter,
+      texture,
+      this.renderer.getPixelRatio(),
+      this.screenFilterBounds(target, texture.width, texture.height),
+    );
+  }
+  private screenFilterBounds(target: string, width: number, height: number): ScreenFilterBounds | undefined {
+    if (target === "stage-main") return undefined;
+    const item = this.characterItems.get(target);
+    let bounds: { x: number; y: number; width: number; height: number };
+    if (item) {
+      bounds = Boolean(record(item.entry.profile).placement)
+        ? this.characterCanvasBounds(item)
+        : (item.model.drawableBounds() ?? item.model.canvasBounds());
+      this.characterProjection(item, this.filterBoundsMatrix);
+    } else if (target === "bg-main" && this.backgroundMesh) {
+      const mesh = this.backgroundMesh;
+      mesh.geometry.computeBoundingBox();
+      const box = mesh.geometry.boundingBox;
+      if (!box) return undefined;
+      bounds = { x: box.min.x, y: box.min.y, width: box.max.x - box.min.x, height: box.max.y - box.min.y };
+      this.filterBoundsMatrix
+        .copy(this.camera.projectionMatrix)
+        .multiply(this.camera.matrixWorldInverse)
+        .multiply(mesh.matrixWorld);
+    } else return undefined;
+    let minX = Infinity,
+      minY = Infinity,
+      maxX = -Infinity,
+      maxY = -Infinity;
+    for (const [x, y] of [
+      [0, 0],
+      [1, 0],
+      [1, 1],
+      [0, 1],
+    ]) {
+      const point = this.filterBoundsPoint
+        .set(bounds.x + x * bounds.width, bounds.y + y * bounds.height, 0)
+        .applyMatrix4(this.filterBoundsMatrix);
+      minX = Math.min(minX, point.x);
+      minY = Math.min(minY, point.y);
+      maxX = Math.max(maxX, point.x);
+      maxY = Math.max(maxY, point.y);
+    }
+    if (![minX, minY, maxX, maxY].every(Number.isFinite)) return undefined;
+    return {
+      x: ((minX + 1) * width) / 2,
+      y: ((minY + 1) * height) / 2,
+      width: ((maxX - minX) * width) / 2,
+      height: ((maxY - minY) * height) / 2,
+    };
+  }
   readonly characterItems = new Map<string, StoryCharacter>();
   private readonly characterControllerIdentities = new Map<string, string>();
   private readonly cachedCharacterControllers = new Map<string, StoryCharacter>();
   private readonly characterPreloads = new Map<string, CharacterPreloadState>();
   /** Controllers made ready ahead of, but not yet consumed by, their first In. */
-  private readonly speculativeCharacterControllers = new Map<
-    string,
-    StoryCharacter
-  >();
+  private readonly speculativeCharacterControllers = new Map<string, StoryCharacter>();
   private readonly speculativeCharacterCommandIndices = new Map<string, number>();
   private readonly discardedCharacterPreloadIdentities = new Set<string>();
   private readonly characterPreloadCapacityWaiters = new Set<() => void>();
-  private readonly characterRenderPrimes = new Map<
-    StoryCharacter,
-    CharacterRenderPrimeState
-  >();
+  private readonly characterRenderPrimes = new Map<StoryCharacter, CharacterRenderPrimeState>();
   private readonly sortedCharacterItems: StoryCharacter[] = [];
   private readonly characterRenderGroupPool: CharacterRenderGroup[] = [];
   private readonly stagedCharacterItems = new Map<string, StagedCharacterItem>();
@@ -636,6 +855,26 @@ export class ThreeStoryScene implements StorySceneBackend {
     brightness: 1,
   };
 
+  private readonly screenEffects: StoryScreenEffects;
+  private screenSprites: ScreenSpriteRenderer | undefined;
+  private readonly renderScreenBackground = (target: WebGLRenderTarget) =>
+    this.screenSprites?.render("background", target, this.spritePlaneProjection("background"));
+  private readonly renderScreenForeground = (target: WebGLRenderTarget) =>
+    this.screenSprites?.render("foreground", target, this.spritePlaneProjection("foreground"));
+  get screenEffectKeys(): readonly string[] {
+    return this.screenEffects.keys;
+  }
+  async setScreenEffect(key: string, definition: StoryScreenEffectDefinition, signal?: AbortSignal): Promise<void> {
+    await this.screenEffects.set(key, definition, signal);
+  }
+  clearScreenEffects(key?: string): void {
+    this.screenEffects.clear(key);
+  }
+  private syncScreenEffects(): void {
+    if (!this.renderer) return;
+    if (this.screenEffects.batches.length) this.screenSprites ??= new ScreenSpriteRenderer(this.renderer);
+    this.screenSprites?.sync(this.screenEffects.batches);
+  }
   private renderer: WebGLRenderer | null = null;
   private pipeline: AdvPostPipeline | null = null;
   private overlay: StoryDomOverlay | null = null;
@@ -644,6 +883,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   private resizeObserver: ResizeObserver | null = null;
   private animationFrame = 0;
   private previousFrameTime = 0;
+  private lastRenderedTimeSeconds = 0;
   private readonly targetFrameClock = new UnityTargetFrameClock();
   private backgroundMesh: BackgroundMesh | null = null;
   private backgroundCaptureMesh: BackgroundMesh | null = null;
@@ -667,10 +907,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   private readonly commandEffects: UnityParticleEffectController;
   private readonly stageEffects: UnityParticleEffectController;
   private readonly commandEffectStates = new Map<string, CommandEffectState>();
-  private readonly rendererExtensionEffects = new Map<
-    string,
-    RendererExtensionEffectInstance
-  >();
+  private readonly rendererExtensionEffects = new Map<string, RendererExtensionEffectInstance>();
   private readonly pendingRendererEffectOperations = new Set<Promise<void>>();
   private readonly commandAdvBackScene = new Scene();
   private readonly commandAdvFrontScene = new Scene();
@@ -710,12 +947,15 @@ export class ThreeStoryScene implements StorySceneBackend {
     captureStage: boolean;
     stageCaptureScene: Scene;
     advBackEffects: AdvSceneLayer | null;
+    filterBackground?: (target: WebGLRenderTarget) => void;
   };
   private readonly postFinishOptions: {
     timeSeconds: number;
     foreground: AdvSceneLayer | null;
     commandEffects: AdvSceneLayer | null;
     uiEffects: AdvSceneLayer | null;
+    filterStage?: (target: WebGLRenderTarget) => void;
+    beforePostProcessing?: (target: WebGLRenderTarget) => void;
   } = { timeSeconds: 0, foreground: null, commandEffects: null, uiEffects: null };
   private readonly adaptiveRenderQuality: AdaptiveRenderQuality;
   private readonly qualityConfig: AdvQualityConfig;
@@ -742,8 +982,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   private readonly commandVolumes = new Map<string, CommandVolumeState>();
   private stagePostEffect: UnknownRecord | null = null;
   private stageLightState: UnknownRecord | null = null;
-  private characterLightingState: UnityCharacterLightingState =
-    DEFAULT_UNITY_CHARACTER_LIGHTING;
+  private characterLightingState: UnityCharacterLightingState = DEFAULT_UNITY_CHARACTER_LIGHTING;
   private stageMultiplyTextureVersion = 0;
   private stageMultiplyTextureUrl = "";
   private stageMultiplyTextureOptions: ThreeRendererMultiplyTextureOptions = {};
@@ -763,7 +1002,11 @@ export class ThreeStoryScene implements StorySceneBackend {
   private renderFailureCount = 0;
   private renderRetryAtSeconds = 0;
   private destroyed = false;
+  private transitionController = new AbortController();
   private sceneGeneration = 0;
+  private stillGeneration = 0;
+  private readonly stillOperations = new Map<string, number>();
+  private stillOperationSerial = 0;
   private readonly lifecycleController = new AbortController();
   // Global monotonic allocation prevents an ABA race when teardown or a target
   // replacement clears the map while an older provider load is still resolving.
@@ -773,11 +1016,14 @@ export class ThreeStoryScene implements StorySceneBackend {
   private readonly context: StorySceneBackendContext;
   private readonly resources: StoryResourceResolver;
   private readonly textureCache: SharedTextureResourceCache<string, Texture>;
-  private readonly characterProviders: readonly ThreeCharacterProvider[];
-  private readonly characterModelDisposers = new WeakMap<
-    ThreeStoryCharacterModel,
-    () => Promise<void>
+  private readonly episodeTextureLeases = new Map<string, SharedTextureLease<Texture>>();
+  private readonly episodeVideoRenderables = new Map<string, { readonly url: string; readonly release: () => void }>();
+  private readonly episodeVideoRenderableLoads = new Map<
+    string,
+    Promise<{ readonly url: string; readonly release: () => void }>
   >();
+  private readonly characterProviders: readonly ThreeCharacterProvider[];
+  private readonly characterModelDisposers = new WeakMap<ThreeStoryCharacterModel, () => Promise<void>>();
   private readonly disposedCharacterModels = new WeakSet<ThreeStoryCharacterModel>();
   private readonly pendingCharacterDisposals = new Set<Promise<void>>();
   private readonly staticPortraitFallback: boolean;
@@ -790,11 +1036,51 @@ export class ThreeStoryScene implements StorySceneBackend {
   private playbackSpeedRate = 1;
   private readonly playbackSpeedEvents: Array<{ readonly rate: number; readonly queuedAtSeconds: number }> = [];
 
-  constructor(
-    context: StorySceneBackendContext,
-    options: ThreeStorySceneOptions = {},
-  ) {
+  constructor(context: StorySceneBackendContext, options: ThreeStorySceneOptions = {}) {
     this.context = context;
+    this.screenEffects = new StoryScreenEffects(
+      context.signal,
+      async (definition, signal) => {
+        const contribution = context.rendererExtensions?.effects.find(
+          (effect) => effect.effectType === definition.effectType,
+        );
+        if (!contribution) throw new Error(`Screen effect provider is unavailable: ${definition.effectType}`);
+        const renderer = this.renderer;
+        if (!renderer) throw new Error("The renderer is not ready for screen effects");
+        const effect = await contribution.create(
+          definition,
+          {
+            renderer: this.rendererId,
+            rendererContext: this.createRendererContext(renderer, renderer.getContext() as WebGL2RenderingContext),
+            runtime: this.runtime,
+            state: this.state,
+            resources: this.resources,
+            signal,
+            service: (key) => context.rendererExtensions?.service(key),
+          },
+          signal,
+        );
+        if (!isStoryScreenSpriteEffect(effect)) {
+          await disposeVegaDisposable(effect);
+          throw new TypeError("The effect provider does not expose screen sprites");
+        }
+        return effect;
+      },
+      () => this.syncScreenEffects(),
+    );
+    this.screenFilterProvider = context.rendererExtensions?.service(STORY_SCREEN_FILTER_PROVIDER);
+    this.screenTransformChannels = Object.freeze([
+      ...new Set([
+        "x",
+        "y",
+        "scaleX",
+        "scaleY",
+        "rotation",
+        "alpha",
+        "brightness",
+        ...(this.screenFilterProvider?.channels ?? []),
+      ]),
+    ]);
     this.rendererId = options.rendererId ?? VEGA_THREE_RENDERER_ID;
     this.backend = this.rendererId;
     this.profile = options.profile ?? "vega";
@@ -820,17 +1106,14 @@ export class ThreeStoryScene implements StorySceneBackend {
     });
     this.textureCache = textureCacheFor(this.resources);
     this.textureCache.configure(Math.max(8, Math.trunc(finite(this.runtime.textureCacheEntryMax, 48))));
-    this.characterProviders = [
-      ...(context.characterProviders ?? []),
-    ] as unknown as readonly ThreeCharacterProvider[];
+    this.characterProviders = [...(context.characterProviders ?? [])] as unknown as readonly ThreeCharacterProvider[];
     this.staticPortraitFallback = options.staticPortraitFallback ?? true;
     this.colorGradingMode = options.colorGradingMode ?? "ldr";
     const abortFromHost = () => this.lifecycleController.abort(context.signal.reason);
     if (context.signal.aborted) abortFromHost();
     else {
       context.signal.addEventListener("abort", abortFromHost, { once: true });
-      this.detachHostAbort = () =>
-        context.signal.removeEventListener("abort", abortFromHost);
+      this.detachHostAbort = () => context.signal.removeEventListener("abort", abortFromHost);
     }
     const initialCameraPosition = vec3(this.runtime.stage.initialCameraPosition, ZERO_VEC3);
     const initialCameraRotation = vec3(this.runtime.stage.initialCameraRotation, ZERO_VEC3);
@@ -911,12 +1194,16 @@ export class ThreeStoryScene implements StorySceneBackend {
       fieldTargetFormat,
       colorGradingMode: this.colorGradingMode,
       resolvePostTexture: (reference, usage) =>
-        this.context.rendererExtensions
-          ?.service(THREE_POST_TEXTURE_RESOLVER)
-          ?.resolve(reference, usage) ?? null,
+        this.context.rendererExtensions?.service(THREE_POST_TEXTURE_RESOLVER)?.resolve(reference, usage) ?? null,
     });
-    this.overlay = new StoryDomOverlay(mount);
-    this.ruleTransitionPass = new AdvRuleTransitionPass(this.overlay.ruleTransitionLayer);
+    this.overlay = new StoryDomOverlay(
+      mount,
+      this.renderer,
+      (source) => this.acquireTexture(source),
+      this.context.rendererExtensions?.service(STORY_FRAME_LAYOUT_PROVIDER),
+    );
+    this.overlay.canvasPass.setStillSpeed(this.playbackSpeedRate);
+    this.ruleTransitionPass = new AdvRuleTransitionPass(this.renderer);
     if (this.runtime.viewportFollowOnResolutionChanged) {
       this.resizeObserver = new ResizeObserver(() => this.resize());
       this.resizeObserver.observe(mount);
@@ -926,6 +1213,74 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.targetFrameClock.reset();
     this.settleContextReadyWaiters(true);
     this.animationFrame = requestAnimationFrame(this.onAnimationFrame);
+  }
+
+  private rendererResourcePreparationContext(
+    story: AdvStory,
+    signal: AbortSignal,
+  ): StoryRendererResourcePreparationContext {
+    return {
+      renderer: this.rendererId,
+      story,
+      runtime: this.runtime,
+      state: this.state,
+      resources: this.resources,
+      signal,
+      service: (key) => this.context.rendererExtensions?.service(key),
+    };
+  }
+
+  private storyRendererEffects(story: AdvStory): readonly {
+    readonly contribution: StoryRendererEffectContribution;
+    readonly definition: Readonly<Record<string, unknown>>;
+  }[] {
+    const effects: Array<{
+      readonly contribution: StoryRendererEffectContribution;
+      readonly definition: Readonly<Record<string, unknown>>;
+    }> = [];
+    for (const command of iterateAdvCommands(story.commands ?? [])) {
+      const effect = command.effect;
+      if (!effect) continue;
+      const contribution = this.effectContribution(effect);
+      if (!contribution) continue;
+      effects.push({
+        contribution,
+        definition:
+          effect.runtime && typeof effect.runtime === "object"
+            ? effect.runtime
+            : (effect as Readonly<Record<string, unknown>>),
+      });
+    }
+    return effects;
+  }
+
+  async prepareStoryResources(story: AdvStory, signal: AbortSignal = this.lifecycleController.signal): Promise<void> {
+    if (signal.aborted) throw signal.reason;
+    await this.context.rendererExtensions
+      ?.service(THREE_POST_TEXTURE_RESOLVER)
+      ?.preload?.(storyPostTextureRequests(story), signal);
+    const effects = this.storyRendererEffects(story);
+    const contributions = [...new Set(effects.map(({ contribution }) => contribution))];
+    const context = this.rendererResourcePreparationContext(story, signal);
+    await Promise.all(contributions.map((contribution) => contribution.prepareStoryResources?.(context)));
+    if (signal.aborted) throw signal.reason;
+  }
+
+  async enumerateStoryResources(
+    story: AdvStory,
+    signal: AbortSignal = this.lifecycleController.signal,
+  ): Promise<readonly StoryResourceDeclaration[]> {
+    if (signal.aborted) throw signal.reason;
+    const context = this.rendererResourcePreparationContext(story, signal);
+    const groups = await Promise.all(
+      this.storyRendererEffects(story).map(async ({ contribution, definition }) => {
+        if (!contribution.enumerateEffectResources) return [] as const;
+        const resources = await contribution.enumerateEffectResources(definition, context);
+        return normalizeStoryResourceDeclarations(resources, `renderer effect ${contribution.id}`);
+      }),
+    );
+    if (signal.aborted) throw signal.reason;
+    return Object.freeze(groups.flat());
   }
 
   private readonly handleContextLost = (event: Event): void => {
@@ -1089,18 +1444,11 @@ export class ThreeStoryScene implements StorySceneBackend {
     // staged TargetName+Asset controllers keep their logical state: native Out
     // unregisters only the renderer entry, while the Web staging layer bridges
     // the browser-only asynchronous resource window before Show can commit.
-    await Promise.all(
-      [...ownedItems].map((item) =>
-        this.releaseCharacterModelSafely(item, "WebGL context restore"),
-      ),
-    );
+    await Promise.all([...ownedItems].map((item) => this.releaseCharacterModelSafely(item, "WebGL context restore")));
     return [...ownedItems];
   }
 
-  private releaseCharacterModelSafely(
-    item: StoryCharacter,
-    reason: string,
-  ): Promise<void> {
+  private releaseCharacterModelSafely(item: StoryCharacter, reason: string): Promise<void> {
     return this.disposeCharacterModelSafely(item.model, reason, item.target);
   }
 
@@ -1121,17 +1469,11 @@ export class ThreeStoryScene implements StorySceneBackend {
         operation = Promise.resolve(model.release());
       }
     } catch (error) {
-      console.warn(
-        `[ThreeStoryScene] character ${target} release failed during ${reason}`,
-        error,
-      );
+      console.warn(`[ThreeStoryScene] character ${target} release failed during ${reason}`, error);
       return Promise.resolve();
     }
     const settled = operation.catch((error: unknown) => {
-      console.warn(
-        `[ThreeStoryScene] character ${target} async disposal failed during ${reason}`,
-        error,
-      );
+      console.warn(`[ThreeStoryScene] character ${target} async disposal failed during ${reason}`, error);
     });
     this.pendingCharacterDisposals.add(settled);
     void settled.finally(() => this.pendingCharacterDisposals.delete(settled));
@@ -1160,11 +1502,7 @@ export class ThreeStoryScene implements StorySceneBackend {
             !this.ownsCharacterController(item) ||
             item.model !== expectedModel
           ) {
-            this.disposeCharacterModelSafely(
-              replacement,
-              "stale context restore",
-              item.target,
-            );
+            this.disposeCharacterModelSafely(replacement, "stale context restore", item.target);
             return;
           }
           await this.prepareReplacementCharacterModel(item, replacement, signal);
@@ -1175,15 +1513,13 @@ export class ThreeStoryScene implements StorySceneBackend {
             !this.ownsCharacterController(item) ||
             item.model !== expectedModel
           ) {
-            this.disposeCharacterModelSafely(
-              replacement,
-              "stale context restore preparation",
-              item.target,
-            );
+            this.disposeCharacterModelSafely(replacement, "stale context restore preparation", item.target);
             return;
           }
 
           item.model = replacement;
+          item.model.setClockSuspended?.(this.deterministicReplayActive);
+          this.placementCache.delete(item);
           replacement = null;
           item.updateFailureCount = 0;
           item.updateRetryAtSeconds = 0;
@@ -1193,11 +1529,7 @@ export class ThreeStoryScene implements StorySceneBackend {
           item.stalledDrawCount = 0;
         } catch (error) {
           if (replacement) {
-            this.disposeCharacterModelSafely(
-              replacement,
-              "failed context restore",
-              item.target,
-            );
+            this.disposeCharacterModelSafely(replacement, "failed context restore", item.target);
           }
           if (!signal.aborted && generation === this.contextRestoreGeneration) failures.push({ item, error });
         }
@@ -1214,12 +1546,8 @@ export class ThreeStoryScene implements StorySceneBackend {
     await this.configureModelMultiplyTexture(replacement, this.stageMultiplyTextureVersion);
     if (signal.aborted) throw sceneAbortError(`Character ${item.target} recovery was aborted`);
     await Promise.all([
-      ...[...item.warmedMotionNames].map((name) =>
-        replacement.prepareMotion(name),
-      ),
-      ...[...item.warmedExpressionNames].map((name) =>
-        replacement.prepareExpression(name),
-      ),
+      ...[...item.warmedMotionNames].map((name) => replacement.prepareMotion(name)),
+      ...[...item.warmedExpressionNames].map((name) => replacement.prepareExpression(name)),
     ]);
     if (signal.aborted) {
       throw sceneAbortError(`Character ${item.target} recovery was aborted`);
@@ -1309,6 +1637,9 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.commandEffects.dispose();
     this.stageEffects.dispose();
     this.stopRendererExtensionEffects("scene destroy");
+    this.screenEffects.dispose();
+    this.screenSprites?.dispose();
+    this.screenSprites = undefined;
     this.commandEffectStates.clear();
     this.backgroundMesh?.material.dispose();
     this.backgroundMesh = null;
@@ -1321,12 +1652,18 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.backgroundCaptureBaseMaterial.dispose();
     this.backgroundGeometry.dispose();
     this.pipeline?.dispose();
+    this.screenFilterRunner?.dispose();
+    this.screenFilterRunner = undefined;
+    for (const entry of this.screenFilters.values()) entry.controller.dispose();
+    this.screenFilters.clear();
     this.pipeline = null;
     this.clearRuleTransition();
     this.ruleTransitionPass?.dispose();
     this.ruleTransitionPass = null;
     this.overlay?.destroy();
     this.overlay = null;
+    this.releaseEpisodeVideoRenderables();
+    this.releaseEpisodeTextureLeases();
     const renderer = this.renderer;
     const canvas = renderer?.domElement;
     canvas?.removeEventListener("webglcontextlost", this.handleContextLost, false);
@@ -1396,7 +1733,6 @@ export class ThreeStoryScene implements StorySceneBackend {
       height: `${height}px`,
     });
     this.pipeline.setSize(width, height, dpr);
-    this.ruleTransitionPass?.setSize(width, height, dpr);
     this.overlay?.setViewport(x, y, width, height);
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
@@ -1410,32 +1746,54 @@ export class ThreeStoryScene implements StorySceneBackend {
     });
   }
 
+  reservePreloadedTextures(count: number): void {
+    this.textureCache.configure(
+      Math.max(8, Math.trunc(finite(this.runtime.textureCacheEntryMax, 48)), Math.trunc(finite(count))),
+    );
+  }
+
   async preloadTexture(url: string, signal?: AbortSignal): Promise<Texture> {
-    return this.loadTexture(url, signal);
+    const resident = this.episodeTextureLeases.get(url);
+    if (resident) return resident.value;
+    const lease = await this.acquireTexture(url, signal);
+    try {
+      await this.uploadPreloadedTexture(lease.value, signal);
+      const existing = this.episodeTextureLeases.get(url);
+      if (existing) {
+        lease.release();
+        return existing.value;
+      }
+      this.episodeTextureLeases.set(url, lease);
+      return lease.value;
+    } catch (error) {
+      lease.release();
+      throw error;
+    }
+  }
+
+  async preloadVideo(url: string, signal?: AbortSignal): Promise<void> {
+    const overlay = this.overlay;
+    if (!overlay) throw sceneAbortError("Video preload overlay is unavailable");
+    const renderable = await this.resolveEpisodeVideoRenderable(url, signal);
+    await overlay.preloadVideo(url, renderable.url, signal);
   }
 
   async preloadResource(url: string, signal?: AbortSignal): Promise<boolean> {
     if (!this.resources?.canLoad(url)) return false;
-    await this.resources.load(url, signal);
+    if (this.resources.loadSharedBytes) {
+      await this.resources.loadSharedBytes(url, signal);
+    } else {
+      await this.resources.load(url, signal);
+    }
     return true;
   }
 
-  async preloadCharacter(
-    request: StoryCharacterPreloadRequest,
-    signal?: AbortSignal,
-  ): Promise<boolean> {
+  async preloadCharacter(request: StoryCharacterPreloadRequest, signal?: AbortSignal): Promise<boolean> {
     const cmd = request.command;
-    const target = firstString(
-      cmd.targetName,
-      cmd.targets?.[0]?.target,
-      cmd.characterKey,
-    );
+    const target = firstString(cmd.targetName, cmd.targets?.[0]?.target, cmd.characterKey);
     const entry = cmd.characterModel as StoryCharacterEntry | undefined;
     if (!target || !entry) return false;
-    const identity = firstString(
-      record(cmd).controllerIdentity,
-      `${target}\u0000${Number(cmd.targetAssetIndex) || 0}`,
-    );
+    const identity = firstString(record(cmd).controllerIdentity, `${target}\u0000${Number(cmd.targetAssetIndex) || 0}`);
     // CharacterIn synchronously registers its pending ownership before its
     // first await. Do not start a competing speculative construction in the
     // small interval between the loader pump and the command-owned load.
@@ -1451,12 +1809,9 @@ export class ThreeStoryScene implements StorySceneBackend {
       1,
       Math.floor(finite(this.runtime.characterPreloadInitialCount, 6)),
       Math.floor(finite(this.runtime.characterPreloadCacheMax, 8)),
+      Math.floor(finite(request.episodeControllerCount)),
     );
-    while (
-      this.speculativeCharacterControllers.size +
-        this.characterPreloads.size >=
-      speculativeLimit
-    ) {
+    while (this.speculativeCharacterControllers.size + this.characterPreloads.size >= speculativeLimit) {
       await this.waitForCharacterPreloadCapacity(signal);
       if (this.destroyed || signal?.aborted) return false;
       for (const pending of this.pendingCharacterPlacements.values()) {
@@ -1468,10 +1823,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     }
 
     const controller = new AbortController();
-    const detachLifecycle = this.bindControllerToSignal(
-      controller,
-      this.lifecycleController.signal,
-    );
+    const detachLifecycle = this.bindControllerToSignal(controller, this.lifecycleController.signal);
     const detachCaller = this.bindControllerToSignal(controller, signal);
     const detach = () => {
       detachCaller();
@@ -1504,53 +1856,19 @@ export class ThreeStoryScene implements StorySceneBackend {
     return Boolean(await promise);
   }
 
-  advanceCharacterPreload(
-    commandIndex: number,
-    retainBehindCommands: number,
-  ): readonly string[] {
-    const cursor = Math.max(0, Math.floor(finite(commandIndex)));
-    const retainBehind = Math.max(
-      0,
-      Math.floor(finite(retainBehindCommands)),
-    );
-    const cutoff = Math.max(0, cursor - retainBehind);
-
-    for (const [identity, preload] of [...this.characterPreloads]) {
-      if (preload.commandIndex >= cutoff) continue;
-      this.characterPreloads.delete(identity);
-      this.discardedCharacterPreloadIdentities.add(identity);
-      preload.detach();
-      preload.controller.abort();
-    }
-    this.notifyCharacterPreloadCapacity();
-    for (const [identity, firstUse] of [
-      ...this.speculativeCharacterCommandIndices,
-    ]) {
-      if (firstUse >= cutoff) continue;
-      const item = this.speculativeCharacterControllers.get(identity);
-      if (item) {
-        this.discardSpeculativeCharacter(
-          identity,
-          item,
-          "character preload window advanced",
-        );
-      } else {
-        this.speculativeCharacterCommandIndices.delete(identity);
-      }
-    }
-
+  advanceCharacterPreload(_commandIndex: number, _retainBehindCommands: number): readonly string[] {
+    // Episode preload reserves every authored controller until the episode is
+    // disposed. Playback position must not evict later or previously hidden
+    // controllers; this method only reports lifecycle losses (for example a
+    // WebGL context reset) so Vega can rebuild them immediately.
     const discarded = [...this.discardedCharacterPreloadIdentities];
     this.discardedCharacterPreloadIdentities.clear();
     return discarded;
   }
 
-  private waitForCharacterPreloadCapacity(
-    signal?: AbortSignal,
-  ): Promise<void> {
+  private waitForCharacterPreloadCapacity(signal?: AbortSignal): Promise<void> {
     if (this.destroyed || signal?.aborted || this.lifecycleController.signal.aborted) {
-      return Promise.reject(
-        sceneAbortError("Character preload capacity wait was aborted"),
-      );
+      return Promise.reject(sceneAbortError("Character preload capacity wait was aborted"));
     }
     return new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -1564,8 +1882,7 @@ export class ThreeStoryScene implements StorySceneBackend {
         else resolve();
       };
       const available = () => finish();
-      const aborted = () =>
-        finish(sceneAbortError("Character preload capacity wait was aborted"));
+      const aborted = () => finish(sceneAbortError("Character preload capacity wait was aborted"));
       this.characterPreloadCapacityWaiters.add(available);
       signal?.addEventListener("abort", aborted, { once: true });
       this.lifecycleController.signal.addEventListener("abort", aborted, {
@@ -1590,6 +1907,90 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (!url) return Promise.reject(new Error("Cannot load an empty ADV texture URL"));
     this.textureCacheKeys.add(url);
     return this.withTextureRequestSignal(signal, (requestSignal) => this.textureCache.acquire(url, requestSignal));
+  }
+
+  private async uploadPreloadedTexture(texture: Texture, signal?: AbortSignal): Promise<void> {
+    const requestSignal = signal ?? this.lifecycleController.signal;
+    if (!(await this.waitForRenderableContext(requestSignal))) {
+      throw sceneAbortError("Texture preload was aborted");
+    }
+    if (requestSignal.aborted) throw sceneAbortError("Texture preload was aborted");
+    const renderer = this.renderer;
+    if (!renderer || this.destroyed) {
+      throw sceneAbortError("Texture preload renderer is unavailable");
+    }
+    renderer.initTexture(texture);
+    const gl = renderer.getContext() as WebGL2RenderingContext;
+    if (typeof gl.fenceSync !== "function" || typeof gl.clientWaitSync !== "function") {
+      return;
+    }
+    const fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (!fence) return;
+    gl.flush();
+    try {
+      while (!requestSignal.aborted && !this.destroyed) {
+        const status = gl.clientWaitSync(fence, 0, 0);
+        if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) {
+          return;
+        }
+        if (status === gl.WAIT_FAILED) {
+          throw new Error("Texture preload GPU fence failed");
+        }
+        await nextPreloadPoll(requestSignal);
+      }
+      throw sceneAbortError("Texture preload was aborted");
+    } finally {
+      gl.deleteSync(fence);
+    }
+  }
+
+  private releaseEpisodeTextureLeases(): void {
+    for (const lease of this.episodeTextureLeases.values()) lease.release();
+    this.episodeTextureLeases.clear();
+  }
+
+  private async resolveEpisodeVideoRenderable(
+    source: string,
+    signal?: AbortSignal,
+  ): Promise<{ readonly url: string; readonly release: () => void }> {
+    const resident = this.episodeVideoRenderables.get(source);
+    if (resident) {
+      return waitForScenePromise(Promise.resolve(resident), signal, "Video preload was aborted");
+    }
+    const pending = this.episodeVideoRenderableLoads.get(source);
+    if (pending) {
+      return waitForScenePromise(pending, signal, "Video preload was aborted");
+    }
+    const load = this.resources
+      .resolveRenderable(source, this.lifecycleController.signal)
+      .then((renderable) => {
+        if (this.destroyed) {
+          renderable.release();
+          throw sceneAbortError("Video preload was aborted");
+        }
+        const existing = this.episodeVideoRenderables.get(source);
+        if (existing) {
+          renderable.release();
+          return existing;
+        }
+        this.episodeVideoRenderables.set(source, renderable);
+        return renderable;
+      })
+      .finally(() => {
+        if (this.episodeVideoRenderableLoads.get(source) === load) {
+          this.episodeVideoRenderableLoads.delete(source);
+        }
+      });
+    this.episodeVideoRenderableLoads.set(source, load);
+    return waitForScenePromise(load, signal, "Video preload was aborted");
+  }
+
+  private releaseEpisodeVideoRenderables(): void {
+    for (const renderable of this.episodeVideoRenderables.values()) {
+      renderable.release();
+    }
+    this.episodeVideoRenderables.clear();
+    this.episodeVideoRenderableLoads.clear();
   }
 
   private withTextureRequestSignal<Value>(
@@ -1617,27 +2018,42 @@ export class ThreeStoryScene implements StorySceneBackend {
   setDeterministicReplayActive(active: boolean): void {
     if (this.deterministicReplayActive === active) return;
     this.deterministicReplayActive = active;
+    for (const item of new Set(this.cachedCharacterControllers.values()))
+      item.model.setClockSuspended?.(active || this.characterItems.get(item.target) !== item);
+    this.overlay?.setFrameParticlesPaused(active);
     this.previousFrameTime = performance.now();
     this.targetFrameClock.reset();
   }
 
   private runTween(options: Parameters<typeof tween>[0]): Promise<void> {
     const lifecycleSignal = this.lifecycleController.signal;
+    const transitionSignal = this.transitionController.signal;
     const callerSignal = options.signal;
-    if (!callerSignal || callerSignal === lifecycleSignal) {
-      return tween({ ...options, signal: lifecycleSignal });
-    }
     const linked = new AbortController();
     const abort = (): void => linked.abort();
-    if (callerSignal.aborted || lifecycleSignal.aborted) linked.abort();
+    const parents = new Set([lifecycleSignal, transitionSignal, ...(callerSignal ? [callerSignal] : [])]);
+    if ([...parents].some((signal) => signal.aborted)) linked.abort();
     else {
-      callerSignal.addEventListener("abort", abort, { once: true });
-      lifecycleSignal.addEventListener("abort", abort, { once: true });
+      for (const signal of parents) signal.addEventListener("abort", abort, { once: true });
     }
     return tween({ ...options, signal: linked.signal }).finally(() => {
-      callerSignal.removeEventListener("abort", abort);
-      lifecycleSignal.removeEventListener("abort", abort);
+      for (const signal of parents) signal.removeEventListener("abort", abort);
     });
+  }
+
+  cancelTransitionsForSeek(): void {
+    this.stillGeneration++;
+    this.overlay?.canvasPass.cancelStillLoad();
+    this.stillOperations.clear();
+    this.overlay?.canvasPass.cancelPendingStills();
+    this.transitionController.abort();
+    this.transitionController = new AbortController();
+  }
+
+  presentSeekSnapshot(): void {
+    if (!this.renderer || !this.pipeline || this.destroyed || this.contextLost) return;
+    this.pipeline.resetTemporalHistory();
+    this.render(this.lastRenderedTimeSeconds || this.previousFrameTime / 1000);
   }
 
   private replaceCharacterTweenController(controllers: Map<string, AbortController>, target: string): AbortController {
@@ -1691,6 +2107,28 @@ export class ThreeStoryScene implements StorySceneBackend {
   private cancelBackgroundBlurTween(): void {
     this.backgroundBlurTweenController?.abort();
     this.backgroundBlurTweenController = null;
+  }
+
+  capturePreview(options: StoryScenePreviewOptions): string | undefined {
+    if (!this.renderer || !this.pipeline || this.destroyed || this.contextLost) return undefined;
+    try {
+      this.render(this.lastRenderedTimeSeconds || this.previousFrameTime / 1000);
+      if (this.renderFailureCount || this.renderer.getContext().isContextLost()) return undefined;
+      const source = this.renderer.domElement;
+      if (!source.width || !source.height) return undefined;
+      const preview = source.ownerDocument.createElement("canvas");
+      preview.width = Math.max(1, Math.round(options.width));
+      preview.height = Math.max(1, Math.round(options.height));
+      const context = preview.getContext("2d");
+      if (!context) return undefined;
+      const scale = Math.max(preview.width / source.width, preview.height / source.height);
+      const width = source.width * scale;
+      const height = source.height * scale;
+      context.drawImage(source, (preview.width - width) / 2, (preview.height - height) / 2, width, height);
+      return preview.toDataURL(options.format, options.quality);
+    } catch {
+      return undefined;
+    }
   }
 
   private readonly onAnimationFrame = (time: number): void => {
@@ -1752,6 +2190,11 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (!this.contextRestoreController) {
       this.pumpCharacterModelRecoveries(timeSeconds);
     }
+    this.runSceneUpdateSubsystem("screen effects", timeSeconds, () => {
+      this.screenEffects.update(deltaSeconds);
+      this.syncScreenEffects();
+    });
+    this.runSceneUpdateSubsystem("canvas layers", timeSeconds, () => this.overlay?.update(deltaSeconds));
     this.runSceneUpdateSubsystem("rule transition", timeSeconds, () => this.ruleTransition.update(deltaSeconds));
     this.runSceneUpdateSubsystem("camera shake", timeSeconds, () => this.updatePersistentCameraShake(deltaSeconds));
     for (const item of this.characterItems.values()) {
@@ -1856,12 +2299,13 @@ export class ThreeStoryScene implements StorySceneBackend {
           right.sortingOrder - left.sortingOrder ||
           this.characterPriority(left.positionType) - this.characterPriority(right.positionType),
       );
-      const groupCount = this.contextRestoreController
-        ? 0
-        : this.characterRenderGroups(characters);
+      const groupCount = this.contextRestoreController ? 0 : this.characterRenderGroups(characters);
       const beginOptions = this.postBeginOptions;
       beginOptions.captureStage = Boolean(capture);
       beginOptions.advBackEffects = this.effectLayer(this.commandAdvBackScene);
+      beginOptions.filterBackground = this.screenFilter("bg-main")?.controller.active
+        ? this.filterBackground
+        : undefined;
       this.pipeline.beginBackground(this.scene, this.camera, beginOptions);
       if (capture && capture.generation === this.stageCaptureGeneration) {
         this.stageCaptureAlpha = 1;
@@ -1869,17 +2313,15 @@ export class ThreeStoryScene implements StorySceneBackend {
         capture.resolve(capture.generation);
       }
       this.pipeline.compositeStageCapture(this.stageCaptureAlpha);
+      if (this.screenEffects.size) this.pipeline.renderBackgroundOverlay(this.renderScreenBackground);
       for (let groupIndex = 0; groupIndex < groupCount; groupIndex += 1) {
         const group = this.characterRenderGroupPool[groupIndex]!;
         const frame = this.pipeline.beginCharacterGroup(group.settings);
         for (const item of group.items) {
-          this.renderMvp
-            .copy(this.camera.projectionMatrix)
-            .multiply(this.camera.matrixWorldInverse)
-            .multiply(item.node.matrixWorld);
+          this.characterProjection(item, this.renderMvp);
           // Unity applies character Alpha/Brightness once in AlphaBlend.shader
           // after the whole adjacent group has been rendered into tempRT.
-          this.characterDrawState.objectToWorld = item.node.matrixWorld;
+          this.characterDrawState.objectToWorld = item.surface.matrixWorld;
           this.characterDrawState.timeSeconds = timeSeconds;
           if (timeSeconds >= item.drawRetryAtSeconds) {
             try {
@@ -1925,8 +2367,12 @@ export class ThreeStoryScene implements StorySceneBackend {
       finishOptions.foreground = this.stageEffects.layer(this.camera);
       finishOptions.commandEffects = this.effectLayer(this.commandAdvFrontScene);
       finishOptions.uiEffects = this.effectLayer(this.commandUiScene);
+      finishOptions.beforePostProcessing = this.screenEffects.size ? this.renderScreenForeground : undefined;
+      finishOptions.filterStage = this.screenFilter("stage-main")?.controller.active ? this.filterStage : undefined;
       this.pipeline.finish(finishOptions);
+      this.overlay?.render();
       this.ruleTransitionPass?.render(this.ruleTransition.renderState);
+      this.lastRenderedTimeSeconds = timeSeconds;
       this.renderFailureCount = 0;
       this.renderRetryAtSeconds = 0;
     } catch (error) {
@@ -1950,33 +2396,22 @@ export class ThreeStoryScene implements StorySceneBackend {
    * that work without changing the composed scene.
    */
   private renderCharacterPrimes(timeSeconds: number): void {
-    if (!this.pipeline || !this.renderer || !this.characterRenderPrimes.size)
-      return;
+    if (!this.pipeline || !this.renderer || !this.characterRenderPrimes.size) return;
     const gl = this.renderer.getContext() as WebGL2RenderingContext;
     const candidates: CharacterRenderPrimeState[] = [];
     for (const state of [...this.characterRenderPrimes.values()]) {
-      if (
-        !this.isRenderableContextGenerationCurrent(state.contextGeneration)
-      ) {
-        this.settleCharacterRenderPrime(
-          state,
-          new Error("Graphics context changed before character first draw"),
-        );
+      if (!this.isRenderableContextGenerationCurrent(state.contextGeneration)) {
+        this.settleCharacterRenderPrime(state, new Error("Graphics context changed before character first draw"));
         continue;
       }
       if (state.fence) {
         const status = gl.clientWaitSync(state.fence, 0, 0);
-        if (
-          status === gl.ALREADY_SIGNALED ||
-          status === gl.CONDITION_SATISFIED
-        ) {
+        if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) {
           this.settleCharacterRenderPrime(state);
         } else if (status === gl.WAIT_FAILED) {
           this.settleCharacterRenderPrime(
             state,
-            new Error(
-              `Character ${state.item.target} renderer-ready fence failed`,
-            ),
+            new Error(`Character ${state.item.target} renderer-ready fence failed`),
           );
         }
         continue;
@@ -2006,7 +2441,7 @@ export class ThreeStoryScene implements StorySceneBackend {
           .copy(this.camera.projectionMatrix)
           .multiply(this.camera.matrixWorldInverse)
           .multiply(item.node.matrixWorld);
-        this.characterDrawState.objectToWorld = item.node.matrixWorld;
+        this.characterDrawState.objectToWorld = item.surface.matrixWorld;
         this.characterDrawState.timeSeconds = timeSeconds;
         this.pipeline.prepareCharacterDraw(frame);
         const drawSerial = item.model.drawSerial;
@@ -2018,9 +2453,7 @@ export class ThreeStoryScene implements StorySceneBackend {
           this.characterDrawState,
         );
         if (item.model.drawSerial === drawSerial) {
-          throw new Error(
-            `Character ${item.target} did not submit its renderer-ready draw`,
-          );
+          throw new Error(`Character ${item.target} did not submit its renderer-ready draw`);
         }
         const fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
         if (fence) state.fence = fence;
@@ -2120,11 +2553,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     timeSeconds = this.monotonicSeconds(),
     immediate = false,
   ): void {
-    if (
-      this.destroyed ||
-      this.contextRestoreController ||
-      !this.ownsCharacterController(item)
-    ) {
+    if (this.destroyed || this.contextRestoreController || !this.ownsCharacterController(item)) {
       return;
     }
     let state = this.characterModelRecoveryStates.get(item);
@@ -2193,24 +2622,18 @@ export class ThreeStoryScene implements StorySceneBackend {
         replacement = await this.createCharacterModel(item.target, item.entry, controller.signal);
         if (!replacement) throw new Error(`Unable to rebuild character model ${item.target}`);
         if (!this.isCharacterModelRecoveryCurrent(item, state, generation, expectedModel, controller.signal)) {
-          this.disposeCharacterModelSafely(
-            replacement,
-            "stale supervised recovery",
-            item.target,
-          );
+          this.disposeCharacterModelSafely(replacement, "stale supervised recovery", item.target);
           return;
         }
         await this.prepareReplacementCharacterModel(item, replacement, controller.signal);
         if (!this.isCharacterModelRecoveryCurrent(item, state, generation, expectedModel, controller.signal)) {
-          this.disposeCharacterModelSafely(
-            replacement,
-            "stale supervised recovery preparation",
-            item.target,
-          );
+          this.disposeCharacterModelSafely(replacement, "stale supervised recovery preparation", item.target);
           return;
         }
 
         item.model = replacement;
+        item.model.setClockSuspended?.(this.deterministicReplayActive);
+        this.placementCache.delete(item);
         replacement = null;
         item.updateFailureCount = 0;
         item.updateRetryAtSeconds = 0;
@@ -2219,20 +2642,12 @@ export class ThreeStoryScene implements StorySceneBackend {
         item.drawRetryAtSeconds = 0;
         item.stalledDrawCount = 0;
         this.characterModelRecoveryStates.delete(item);
-        this.disposeCharacterModelSafely(
-          expectedModel,
-          "supervised recovery replacement",
-          item.target,
-        );
+        this.disposeCharacterModelSafely(expectedModel, "supervised recovery replacement", item.target);
         this.renderer?.resetState();
         console.info(`[ThreeStoryScene] character ${item.target} model recovered after ${attempt} rebuild attempt(s)`);
       } catch (recoveryError) {
         if (replacement) {
-          this.disposeCharacterModelSafely(
-            replacement,
-            "failed supervised recovery",
-            item.target,
-          );
+          this.disposeCharacterModelSafely(replacement, "failed supervised recovery", item.target);
         }
         if (!this.isCharacterModelRecoveryCurrent(item, state, generation, expectedModel, controller.signal)) return;
         state.retryAtSeconds =
@@ -2291,11 +2706,20 @@ export class ThreeStoryScene implements StorySceneBackend {
     for (const item of characters) {
       if (item.alpha <= 0.0001) continue;
       const blur = Math.max(0, item.blurIntensity);
-      const alpha = clamp(item.alpha);
-      const brightness = Math.max(0, item.brightness);
+      const globalTransform = this.screenFilterProvider ? undefined : this.readSceneTransform("stage-main")?.current;
+      const transform = this.screenFilterProvider ? undefined : this.readSceneTransform(item.target)?.current;
+      const filter = this.screenFilter(item.target);
+      const filterTarget = filter?.controller.active ? item.target : undefined;
+      const alpha = clamp(item.alpha * (globalTransform?.alpha ?? 1) * (transform?.alpha ?? 1));
+      if (alpha <= 0.0001) continue;
+      const brightness = Math.max(
+        0,
+        item.brightness * (globalTransform?.brightness ?? 1) * (transform?.brightness ?? 1),
+      );
       const previous = groupCount > 0 ? this.characterRenderGroupPool[groupCount - 1]! : undefined;
       if (
         previous &&
+        previous.settings.filterTarget === filterTarget &&
         unityApproximately(previous.settings.blur, blur) &&
         unityApproximately(previous.settings.alpha, alpha) &&
         unityApproximately(previous.settings.brightness, brightness)
@@ -2311,6 +2735,8 @@ export class ThreeStoryScene implements StorySceneBackend {
           this.characterRenderGroupPool.push(group);
         }
         group.settings.blur = blur;
+        group.settings.filterTarget = filterTarget;
+        group.settings.filter = filterTarget ? filter!.render : undefined;
         group.settings.alpha = alpha;
         group.settings.brightness = brightness;
         group.settings.radiusMax = Math.max(0, this.fieldRendererState.blurRadiusMax);
@@ -2542,6 +2968,34 @@ export class ThreeStoryScene implements StorySceneBackend {
       this.camera.fov = fov;
       this.camera.updateProjectionMatrix();
     }
+    const globalTransform = this.readSceneTransform("stage-main")?.current;
+    this.scene.matrixAutoUpdate = this.backgroundCaptureScene.matrixAutoUpdate = false;
+    if (globalTransform)
+      sceneTransformMatrix(
+        globalTransform,
+        this.coordinateReference(),
+        this.coordinateDepth("stage-main"),
+        this.scene.matrix,
+      );
+    else this.scene.matrix.identity();
+    this.scene.matrixWorldNeedsUpdate = true;
+    this.backgroundCaptureScene.matrix.copy(this.scene.matrix);
+    this.backgroundCaptureScene.matrixWorldNeedsUpdate = true;
+    this.characterField.updateMatrix();
+    const backgroundTransform = this.readSceneTransform("bg-main")?.current;
+    for (const field of [this.backgroundField, this.backgroundCaptureField]) {
+      field.updateMatrix();
+      field.matrixAutoUpdate = false;
+      if (backgroundTransform)
+        field.matrix.premultiply(
+          sceneTransformMatrix(
+            backgroundTransform,
+            this.coordinateReference(),
+            this.coordinateDepth("bg-main"),
+            this.sceneTargetMatrix,
+          ),
+        );
+    }
     const characterFieldScale = this.fieldScale("character");
     this.refreshStageNodes(characterFieldScale);
     for (const item of this.characterItems.values()) this.layoutCharacter(item, characterFieldScale);
@@ -2551,8 +3005,11 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (!mesh) return;
     // AdvBackgroundField.ApplyBrightness multiplies only the stored
     // SpriteRenderer RGB by brightness and preserves tint alpha.
-    mesh.material.color.setRGB(tint.r * brightness, tint.g * brightness, tint.b * brightness);
-    mesh.material.opacity = tint.a;
+    const globalTransform = this.screenFilterProvider ? undefined : this.readSceneTransform("stage-main")?.current;
+    const transform = this.screenFilterProvider ? undefined : this.readSceneTransform("bg-main")?.current;
+    const value = brightness * (globalTransform?.brightness ?? 1) * (transform?.brightness ?? 1);
+    mesh.material.color.setRGB(tint.r * value, tint.g * value, tint.b * value);
+    mesh.material.opacity = tint.a * (globalTransform?.alpha ?? 1) * (transform?.alpha ?? 1);
   }
 
   stagePoint(positionType: unknown): Vec3 {
@@ -2614,20 +3071,22 @@ export class ThreeStoryScene implements StorySceneBackend {
 
   private layoutCharacter(item: StoryCharacter, fieldScale = this.fieldScale("character")): void {
     const profile = item.entry.profile || {};
+    const placement = this.characterPlacement(item);
     const basePosition = vec3(profile.basePosition, CHARACTER_BASE_POSITION, this.scratchCharacterBasePosition);
-    const scale = Math.max(0.001, finite(profile.baseScale, 1.6));
+    const scale = placement ? placement.scale : Math.max(0.001, finite(profile.baseScale, 1.6));
+    const authoredPosition = item.worldPosition ?? placement?.position;
     const expectedParent = this.stageNode(item.positionType);
     if (item.node.parent !== expectedParent) expectedParent.add(item.node);
-    if (item.worldPosition) {
+    if (authoredPosition) {
       // Absolute adapter coordinates are resolved into the same authored ADV
       // field basis as native stage points. Dynamic field/stage transforms stay
       // on the parent nodes, so shake, tilt and camera movement affect both
       // placement modes through the regular scene graph.
       const fieldPosition = this.fieldPosition("character", this.scratchCharacterPosition);
       const stagePosition = this.stagePointInto(item.positionType, this.scratchStagePosition);
-      basePosition.x = (item.worldPosition.x + item.offset.x - fieldPosition.x - stagePosition.x) / fieldScale;
-      basePosition.y = (item.worldPosition.y + item.offset.y - fieldPosition.y - stagePosition.y) / fieldScale;
-      basePosition.z = (item.worldPosition.z + item.offset.z - fieldPosition.z - stagePosition.z) / fieldScale;
+      basePosition.x = (authoredPosition.x + item.offset.x - fieldPosition.x - stagePosition.x) / fieldScale;
+      basePosition.y = (authoredPosition.y + item.offset.y - fieldPosition.y - stagePosition.y) / fieldScale;
+      basePosition.z = (authoredPosition.z + item.offset.z - fieldPosition.z - stagePosition.z) / fieldScale;
     } else {
       basePosition.x += item.offset.x / fieldScale;
       basePosition.y += item.offset.y / fieldScale;
@@ -2639,10 +3098,116 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.scratchEuler.y = 0;
     this.scratchEuler.z = item.roleAngle;
     unityEulerDegrees(this.scratchEuler, item.node.quaternion);
+    if (placement) {
+      unityEulerDegrees(this.coordinateReference().rotation ?? ZERO_VEC3, this.sceneReferenceRotation);
+      item.node.quaternion.premultiply(this.sceneReferenceRotation);
+    }
+    item.node.matrixAutoUpdate = false;
+    item.node.updateMatrix();
+    const transform = this.readSceneTransform(item.target)?.current;
+    if (transform) {
+      expectedParent.updateMatrix();
+      this.characterField.updateMatrix();
+      this.sceneParentMatrix.multiplyMatrices(this.characterField.matrix, expectedParent.matrix);
+      this.sceneParentInverse.copy(this.sceneParentMatrix).invert();
+      this.scenePivot.copy(item.node.position).applyMatrix4(this.sceneParentMatrix);
+      sceneTransformMatrix(
+        transform,
+        this.coordinateReference(),
+        this.coordinateDepth(item.target),
+        this.sceneTargetMatrix,
+        this.scenePivot,
+      );
+      item.node.matrix
+        .premultiply(this.sceneParentMatrix)
+        .premultiply(this.sceneTargetMatrix)
+        .premultiply(this.sceneParentInverse);
+    }
+    item.node.matrixWorldNeedsUpdate = true;
+    item.surface.position.set(-(placement?.origin.x ?? 0), -(placement?.origin.y ?? 0), 0);
+    item.surface.updateMatrix();
+  }
+
+  private spritePlaneProjection(layer: "background" | "foreground"): Matrix4 {
+    const reference = this.coordinateReference(),
+      depth = this.coordinateDepth(layer === "background" ? "bg-main" : "stage-main");
+    const size = scenePlaneSize(reference, depth);
+    unityEulerDegrees(reference.rotation ?? ZERO_VEC3, this.sceneReferenceRotation);
+    unityVector3(reference.position, this.scenePivot);
+    this.spritePlaneMatrix.compose(this.scenePivot, this.sceneReferenceRotation, this.renderWorldPosition.set(1, 1, 1));
+    const aspect = finite(record(this.runtime.layout).designViewportAspect, this.camera.aspect);
+    this.sceneTargetMatrix.makeScale((size.height * aspect) / 2, size.height / 2, 1).setPosition(0, 0, -depth);
+    this.spritePlaneMatrix.multiply(this.sceneTargetMatrix);
+    return this.spriteProjection
+      .copy(this.camera.projectionMatrix)
+      .multiply(this.camera.matrixWorldInverse)
+      .multiply(this.scene.matrixWorld)
+      .multiply(this.spritePlaneMatrix);
+  }
+
+  private characterProjection(item: StoryCharacter, matrix: Matrix4): void {
+    matrix
+      .copy(this.camera.projectionMatrix)
+      .multiply(this.camera.matrixWorldInverse)
+      .multiply(item.surface.matrixWorld);
+  }
+
+  private characterCanvasBounds(item: StoryCharacter): { x: number; y: number; width: number; height: number } {
+    const bounds = item.model.canvasBounds(),
+      base = record(record(item.entry.profile).placement);
+    const layout = { ...base, ...record(record(base.positions)[String(item.positionType)]) };
+    const padding = Array.isArray(layout.padding) ? layout.padding : [];
+    if (!padding.length) return bounds;
+    const unit = Math.max(0.000001, item.model.pixelsPerUnit);
+    const top = finite(padding[0]) / unit,
+      right = finite(padding[1]) / unit,
+      bottom = finite(padding[2]) / unit,
+      left = finite(padding[3]) / unit;
+    return {
+      x: bounds.x - left,
+      y: bounds.y - bottom,
+      width: Math.max(0.000001, bounds.width + left + right),
+      height: Math.max(0.000001, bounds.height + top + bottom),
+    };
+  }
+
+  private characterPlacement(item: StoryCharacter): { position: Vec3; origin: Vec3; scale: number } | undefined {
+    const base = record(item.entry.profile).placement;
+    if (!base || typeof base !== "object") return undefined;
+    let cache = this.placementCache.get(item);
+    if (!cache || cache.stage !== this.runtime.stage) {
+      cache = { stage: this.runtime.stage, positions: new Map() };
+      this.placementCache.set(item, cache);
+    }
+    let placement = cache.positions.get(item.positionType);
+    if (!placement) {
+      const layout = { ...record(base), ...record(record(record(base).positions)[String(item.positionType)]) };
+      const bounds = this.characterCanvasBounds(item);
+      const fit = resolveStoryPlaneLayout(layout as StoryPlaneLayout, bounds.width, bounds.height);
+      const reference = { ...this.coordinateReference(), width: fit.referenceWidth, height: fit.referenceHeight };
+      const depth = this.coordinateDepth(item.target),
+        unit = scenePlaneSize(reference, depth).height / reference.height;
+      const scale = fit.scale * unit,
+        center = { ...scenePointFromPixels(reference, fit.x, fit.y, depth) };
+      if (record(layout).anchor === "stage") {
+        const slot = this.stagePoint(item.positionType);
+        center.x += slot.x;
+        center.y += slot.y;
+        center.z += slot.z;
+      }
+      placement = {
+        position: center,
+        origin: { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2, z: 0 },
+        scale: scale / Math.max(0.001, finite(this.runtime.stage.characterFieldScale, 4)),
+      };
+      cache.positions.set(item.positionType, placement);
+    }
+    return placement;
   }
 
   private characterAuthoredWorldPosition(item: StoryCharacter): Vec3 {
-    if (item.worldPosition) return { ...item.worldPosition };
+    const position = item.worldPosition ?? this.characterPlacement(item)?.position;
+    if (position) return { ...position };
     const profile = item.entry.profile || {};
     const base = vec3(profile.basePosition, CHARACTER_BASE_POSITION);
     const field = this.fieldPosition("character", { x: 0, y: 0, z: 0 });
@@ -2740,22 +3305,15 @@ export class ThreeStoryScene implements StorySceneBackend {
       this.characterControllerIdentities.set(target, resolvedIdentity);
     }
     const existing = this.cachedCharacterControllers.get(resolvedIdentity);
-    if (
-      existing &&
-      existing !== item &&
-      this.speculativeCharacterControllers.get(resolvedIdentity) === existing
-    ) {
-      // A rolling preload may have started just after CharacterIn checked the
+    if (existing && existing !== item && this.speculativeCharacterControllers.get(resolvedIdentity) === existing) {
+      // Episode warmup may have started just after CharacterIn checked the
       // single-flight map. The command-owned controller has already consumed
       // the live pending presentation, so it wins; dispose the never-visible
       // speculative duplicate before replacing the cache entry.
       this.speculativeCharacterControllers.delete(resolvedIdentity);
       this.speculativeCharacterCommandIndices.delete(resolvedIdentity);
       this.cachedCharacterControllers.delete(resolvedIdentity);
-      this.releaseUnownedPreloadedCharacter(
-        existing,
-        "speculative character superseded by CharacterIn",
-      );
+      this.releaseUnownedPreloadedCharacter(existing, "speculative character superseded by CharacterIn");
     }
     this.cachedCharacterControllers.set(resolvedIdentity, item);
     this.completePendingCharacterLoadController(target, token);
@@ -2770,12 +3328,12 @@ export class ThreeStoryScene implements StorySceneBackend {
   private registerVisibleCharacter(target: string, item: StoryCharacter): void {
     const previous = this.characterItems.get(target);
     if (previous && previous !== item) {
+      previous.model.setClockSuspended?.(true);
       this.characterFadeCoordinator.cancel(previous.positionType);
       this.characterItems.delete(target);
     }
-    registerCharacterItem(this.characterItems, target, item, () =>
-      this.layoutCharacter(item),
-    );
+    item.model.setClockSuspended?.(this.deterministicReplayActive);
+    registerCharacterItem(this.characterItems, target, item, () => this.layoutCharacter(item));
   }
 
   private cachedCharacterController(target: string): StoryCharacter | null {
@@ -2797,11 +3355,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     return item;
   }
 
-  private discardSpeculativeCharacter(
-    identity: string,
-    item: StoryCharacter,
-    reason: string,
-  ): void {
+  private discardSpeculativeCharacter(identity: string, item: StoryCharacter, reason: string): void {
     if (this.speculativeCharacterControllers.get(identity) !== item) return;
     this.speculativeCharacterControllers.delete(identity);
     this.speculativeCharacterCommandIndices.delete(identity);
@@ -2817,10 +3371,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     void this.releaseCharacterModelSafely(item, reason);
   }
 
-  private releaseUnownedPreloadedCharacter(
-    item: StoryCharacter,
-    reason: string,
-  ): void {
+  private releaseUnownedPreloadedCharacter(item: StoryCharacter, reason: string): void {
     this.cancelCharacterModelRecovery(item);
     item.angleTweenController?.abort();
     item.lookTweenController?.abort();
@@ -2832,9 +3383,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     // In-flight builders already observe context generation and retry after
     // restoration. Keep their promise alive so a blocking initial warmup does
     // not turn a transient WebGL loss into a story-load failure.
-    for (const [identity, item] of [
-      ...this.speculativeCharacterControllers,
-    ]) {
+    for (const [identity, item] of [...this.speculativeCharacterControllers]) {
       this.discardSpeculativeCharacter(identity, item, reason);
     }
   }
@@ -2991,21 +3540,23 @@ export class ThreeStoryScene implements StorySceneBackend {
     target: string,
     entry: StoryCharacterEntry,
     signal?: AbortSignal,
+    ancestry: readonly string[] = [],
   ): Promise<ThreeStoryCharacterModel | null> {
     const normalizedEntry = this.normalizeCharacterModelEntry(entry);
+    const source = firstString(
+      normalizedEntry.runtime?.model,
+      normalizedEntry.runtime?.imageUrl,
+      normalizedEntry.runtime?.modelUrl,
+    );
+    const identity = `${firstString(normalizedEntry.runtime?.format)}:${source}`;
+    if (ancestry.length >= 32 || (source && ancestry.includes(identity)))
+      throw new TypeError("Cyclic or excessively nested character model");
     const provider = this.characterProviders.find((candidate) => {
-      if (
-        !candidate.supports(normalizedEntry) ||
-        !isRendererAwareCharacterProvider(candidate)
-      ) {
+      if (!candidate.supports(normalizedEntry) || !isRendererAwareCharacterProvider(candidate)) {
         return false;
       }
-      const rendererAware =
-        candidate as ThreeRendererAwareCharacterProvider;
-      return (
-        typeof rendererAware.supportsRenderer !== "function" ||
-        rendererAware.supportsRenderer(this.rendererId)
-      );
+      const rendererAware = candidate as ThreeRendererAwareCharacterProvider;
+      return typeof rendererAware.supportsRenderer !== "function" || rendererAware.supportsRenderer(this.rendererId);
     }) as ThreeRendererAwareCharacterProvider | undefined;
     if (provider) {
       const renderer = this.renderer;
@@ -3022,20 +3573,29 @@ export class ThreeStoryScene implements StorySceneBackend {
         entry: normalizedEntry,
         resources: this.resources,
         signal: providerSignal,
+        children: {
+          create: async (id, child) => {
+            const model = await this.createCharacterModel(
+              `${target}/${id}`,
+              child as StoryCharacterEntry,
+              providerSignal,
+              [...ancestry, identity],
+            );
+            if (!model) throw new Error(`No character provider accepts component ${id}`);
+            return model;
+          },
+          dispose: (model) => {
+            if (!isThreeStoryCharacterModel(model)) throw new TypeError("Invalid child character model");
+            return this.disposeCharacterModelSafely(model, "composite component disposal");
+          },
+        },
       };
-      const model = await createRendererCharacterModel(
-        provider,
-        providerContext,
-      );
+      const model = await createRendererCharacterModel(provider, providerContext);
       if (!isThreeStoryCharacterModel(model)) {
         await disposeRendererCharacterModel(provider, model, providerContext);
-        throw new TypeError(
-          `Character provider ${provider.id} returned an incompatible model for ${this.rendererId}`,
-        );
+        throw new TypeError(`Character provider ${provider.id} returned an incompatible model for ${this.rendererId}`);
       }
-      this.characterModelDisposers.set(model, () =>
-        disposeRendererCharacterModel(provider, model, providerContext),
-      );
+      this.characterModelDisposers.set(model, () => disposeRendererCharacterModel(provider, model, providerContext));
       model.setMotionSpeed(this.playbackSpeedRate);
       model.setRendererLighting?.(this.characterLightingState);
       return model;
@@ -3054,9 +3614,7 @@ export class ThreeStoryScene implements StorySceneBackend {
         runtime.format,
       ].some((value) => firstString(value));
       if (hasDynamicSource) {
-        throw new Error(
-          `No renderer-aware character plugin supports model ${target}`,
-        );
+        throw new Error(`No renderer-aware character plugin supports model ${target}`);
       }
       return null;
     }
@@ -3083,8 +3641,7 @@ export class ThreeStoryScene implements StorySceneBackend {
         positiveFinite(this.runtime.stage.characterCanvasWorldHeight),
       pivot: runtime?.pivot,
       anisotropy: positiveFinite(
-        record(this.runtime).characterTextureMaxAnisotropy ??
-          record(this.runtime).live2dTextureMaxAnisotropy,
+        record(this.runtime).characterTextureMaxAnisotropy ?? record(this.runtime).live2dTextureMaxAnisotropy,
       ),
     });
     model?.setMotionSpeed(this.playbackSpeedRate);
@@ -3127,26 +3684,12 @@ export class ThreeStoryScene implements StorySceneBackend {
       try {
         model = await this.createCharacterModel(target, entry, signal);
         if (!model) return null;
-        if (
-          this.destroyed ||
-          signal.aborted ||
-          !this.isRenderableContextGenerationCurrent(contextGeneration)
-        ) {
-          this.disposeCharacterModelSafely(
-            model,
-            "stale renderer-ready preload",
-            target,
-          );
+        if (this.destroyed || signal.aborted || !this.isRenderableContextGenerationCurrent(contextGeneration)) {
+          this.disposeCharacterModelSafely(model, "stale renderer-ready preload", target);
           if (!signal.aborted && !this.destroyed) continue;
           return null;
         }
-        item = new StoryCharacter(
-          target,
-          String(cmd.characterKey || ""),
-          entry,
-          model,
-          Number(positionType) || 5,
-        );
+        item = new StoryCharacter(target, String(cmd.characterKey || ""), entry, model, Number(positionType) || 5);
         const normalizedEntry = this.normalizeCharacterModelEntry(entry);
         const modelIdentity = firstString(
           normalizedEntry.runtime?.model,
@@ -3156,49 +3699,32 @@ export class ThreeStoryScene implements StorySceneBackend {
           normalizedEntry.runtime?.json,
           normalizedEntry.runtime?.imageUrl,
         );
-        item.lipSync.randomSeed.value = hashSeed(
-          `${cmd.characterKey || modelIdentity}:${target}`,
-        );
+        item.lipSync.randomSeed.value = hashSeed(`${cmd.characterKey || modelIdentity}:${target}`);
         item.alpha = 0;
         item.blurIntensity =
-          item.positionType === this.cameraState.focusPositionType
-            ? 0
-            : this.fieldRendererState.characterBlur;
+          item.positionType === this.cameraState.focusPositionType ? 0 : this.fieldRendererState.characterBlur;
         this.layoutCharacter(item);
-        await this.configureModelMultiplyTexture(
-          model,
-          this.stageMultiplyTextureVersion,
-        );
+        await this.configureModelMultiplyTexture(model, this.stageMultiplyTextureVersion);
         const selectedMotions = [...motionNames].filter(
           (name) => model!.hasMotion(name) || declaredMotionNames.has(name),
         );
         const selectedExpressions = [...expressionNames].filter((name) =>
-          typeof model!.hasExpression === "function"
-            ? model!.hasExpression(name)
-            : declaredExpressionNames.has(name),
+          typeof model!.hasExpression === "function" ? model!.hasExpression(name) : declaredExpressionNames.has(name),
         );
         const [preparedMotions, preparedExpressions] = await Promise.all([
-          Promise.all(
-            selectedMotions.map((name) => model!.prepareMotion(name)),
-          ),
-          Promise.all(
-            selectedExpressions.map((name) => model!.prepareExpression(name)),
-          ),
+          Promise.all(selectedMotions.map((name) => model!.prepareMotion(name))),
+          Promise.all(selectedExpressions.map((name) => model!.prepareExpression(name))),
         ]);
         for (let index = 0; index < selectedMotions.length; index += 1) {
           const name = selectedMotions[index]!;
           if (!preparedMotions[index]) {
-            throw new Error(
-              `Character motion ${name} could not be prepared`,
-            );
+            throw new Error(`Character motion ${name} could not be prepared`);
           }
         }
         for (let index = 0; index < selectedExpressions.length; index += 1) {
           const name = selectedExpressions[index]!;
           if (!preparedExpressions[index]) {
-            throw new Error(
-              `Character expression ${name} could not be prepared`,
-            );
+            throw new Error(`Character expression ${name} could not be prepared`);
           }
         }
         const preparedMotionNames = new Set(selectedMotions);
@@ -3224,10 +3750,7 @@ export class ThreeStoryScene implements StorySceneBackend {
           record(entry.runtime).defaultExpressionName,
         );
         const defaultMotionName = entry.profile?.playDefaultMotionBeforePresentation
-          ? firstString(
-              entry.profile?.defaultMotionName,
-              record(entry.runtime).defaultMotionName,
-            )
+          ? firstString(entry.profile?.defaultMotionName, record(entry.runtime).defaultMotionName)
           : "";
         if (
           defaultMotionName &&
@@ -3235,80 +3758,58 @@ export class ThreeStoryScene implements StorySceneBackend {
           preparedMotionNames.has(defaultMotionName)
         ) {
           if (!model.playMotion(defaultMotionName, presentationFadeIn)) {
-            throw new Error(
-              `Prepared character motion ${defaultMotionName} could not start`,
-            );
+            throw new Error(`Prepared character motion ${defaultMotionName} could not start`);
           }
+          item.currentMotionName = defaultMotionName;
+          item.currentMotionFadeInSeconds = presentationFadeIn;
         }
         if (
           initialMotionName &&
           preparedMotionNames.has(initialMotionName) &&
           !model.playMotion(initialMotionName, presentationFadeIn)
         ) {
-          throw new Error(
-            `Prepared character motion ${initialMotionName} could not start`,
-          );
+          throw new Error(`Prepared character motion ${initialMotionName} could not start`);
+        }
+        if (initialMotionName && preparedMotionNames.has(initialMotionName)) {
+          item.currentMotionName = initialMotionName;
+          item.currentMotionFadeInSeconds = presentationFadeIn;
         }
         if (
           initialExpressionName &&
           preparedExpressionNames.has(initialExpressionName) &&
           !model.playExpression(initialExpressionName, presentationFadeIn)
         ) {
-          throw new Error(
-            `Prepared character expression ${initialExpressionName} could not start`,
-          );
+          throw new Error(`Prepared character expression ${initialExpressionName} could not start`);
+        }
+        if (initialExpressionName && preparedExpressionNames.has(initialExpressionName)) {
+          item.currentExpressionName = initialExpressionName;
+          item.currentExpressionFadeInSeconds = presentationFadeIn;
+          item.activeExpressionName = initialExpressionName;
+          item.activeExpressionFadeInSeconds = presentationFadeIn;
         }
         model.primeInitialFrame(this.characterParameterFrame(item));
-        await this.waitForCharacterFirstDraw(
-          item,
-          contextGeneration,
-          signal,
-        );
-        if (
-          this.destroyed ||
-          signal.aborted ||
-          !this.isRenderableContextGenerationCurrent(contextGeneration)
-        ) {
-          this.releaseUnownedPreloadedCharacter(
-            item,
-            "stale prepared character",
-          );
+        await this.waitForCharacterFirstDraw(item, contextGeneration, signal);
+        if (this.destroyed || signal.aborted || !this.isRenderableContextGenerationCurrent(contextGeneration)) {
+          this.releaseUnownedPreloadedCharacter(item, "stale prepared character");
           if (!signal.aborted && !this.destroyed) continue;
           return null;
         }
         const existing = this.cachedCharacterControllers.get(identity);
         if (existing) {
-          this.releaseUnownedPreloadedCharacter(
-            item,
-            "duplicate prepared character",
-          );
+          this.releaseUnownedPreloadedCharacter(item, "duplicate prepared character");
           return existing;
         }
         this.cachedCharacterControllers.set(identity, item);
         this.speculativeCharacterControllers.set(identity, item);
-        this.speculativeCharacterCommandIndices.set(
-          identity,
-          Math.max(0, Math.floor(finite(commandIndex))),
-        );
+        this.speculativeCharacterCommandIndices.set(identity, Math.max(0, Math.floor(finite(commandIndex))));
         return item;
       } catch (error) {
         if (item) {
-          this.releaseUnownedPreloadedCharacter(
-            item,
-            "failed character preload",
-          );
+          this.releaseUnownedPreloadedCharacter(item, "failed character preload");
         } else if (model) {
-          this.disposeCharacterModelSafely(
-            model,
-            "failed character preload",
-            target,
-          );
+          this.disposeCharacterModelSafely(model, "failed character preload", target);
         }
-        if (
-          !signal.aborted &&
-          !this.destroyed &&
-          !this.isRenderableContextGenerationCurrent(contextGeneration)
-        ) {
+        if (!signal.aborted && !this.destroyed && !this.isRenderableContextGenerationCurrent(contextGeneration)) {
           continue;
         }
         throw error;
@@ -3323,17 +3824,12 @@ export class ThreeStoryScene implements StorySceneBackend {
     signal: AbortSignal,
   ): Promise<void> {
     if (signal.aborted) {
-      return Promise.reject(
-        sceneAbortError(`Character ${item.target} preload was aborted`),
-      );
+      return Promise.reject(sceneAbortError(`Character ${item.target} preload was aborted`));
     }
     return new Promise<void>((resolve, reject) => {
       let state: CharacterRenderPrimeState;
       const aborted = () =>
-        this.settleCharacterRenderPrime(
-          state,
-          sceneAbortError(`Character ${item.target} preload was aborted`),
-        );
+        this.settleCharacterRenderPrime(state, sceneAbortError(`Character ${item.target} preload was aborted`));
       signal.addEventListener("abort", aborted, { once: true });
       state = {
         item,
@@ -3347,16 +3843,11 @@ export class ThreeStoryScene implements StorySceneBackend {
     });
   }
 
-  private settleCharacterRenderPrime(
-    state: CharacterRenderPrimeState,
-    error?: unknown,
-  ): void {
+  private settleCharacterRenderPrime(state: CharacterRenderPrimeState, error?: unknown): void {
     if (this.characterRenderPrimes.get(state.item) !== state) return;
     this.characterRenderPrimes.delete(state.item);
     if (state.fence && this.renderer) {
-      (this.renderer.getContext() as WebGL2RenderingContext).deleteSync(
-        state.fence,
-      );
+      (this.renderer.getContext() as WebGL2RenderingContext).deleteSync(state.fence);
       state.fence = null;
     }
     state.detach();
@@ -3411,6 +3902,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       try {
         model = await this.createCharacterModel(target, entry, token.signal);
         if (!model) return null;
+        model.setClockSuspended?.(true);
         if (!this.isCharacterLoadCurrent(target, token)) {
           this.disposeCharacterModelSafely(model, "superseded load", target);
           return null;
@@ -3419,11 +3911,7 @@ export class ThreeStoryScene implements StorySceneBackend {
         // wrapper reports success, resources created before that loss belong to
         // the invalid generation and must never enter the staged controller.
         if (!this.isRenderableContextGenerationCurrent(contextGeneration)) {
-          this.disposeCharacterModelSafely(
-            model,
-            "context generation changed during load",
-            target,
-          );
+          this.disposeCharacterModelSafely(model, "context generation changed during load", target);
           continue;
         }
         item = new StoryCharacter(target, String(cmd.characterKey || ""), entry, model, positionType);
@@ -3440,11 +3928,7 @@ export class ThreeStoryScene implements StorySceneBackend {
         item.lipSync.randomSeed.value = hashSeed(`${cmd.characterKey || modelIdentity}:${target}`);
         this.layoutCharacter(item);
         if (!this.stageCharacter(target, token.target, item)) {
-          this.disposeCharacterModelSafely(
-            model,
-            "staging ownership changed",
-            target,
-          );
+          this.disposeCharacterModelSafely(model, "staging ownership changed", target);
           return null;
         }
         await this.configureModelMultiplyTexture(model, this.stageMultiplyTextureVersion);
@@ -3576,47 +4060,25 @@ export class ThreeStoryScene implements StorySceneBackend {
         ? authoredRenderOrder
         : threeVector3ToUnity(this.renderWorldPosition, this.renderUnityPosition).z;
       const fadeStartedAt = pendingPlacement?.fadeInStartedAtSeconds;
-      const elapsed =
-        fadeStartedAt == null
-          ? 0
-          : Math.max(0, this.monotonicSeconds() - fadeStartedAt);
+      const elapsed = fadeStartedAt == null ? 0 : Math.max(0, this.monotonicSeconds() - fadeStartedAt);
       const startRaw = duration > 0 ? clamp(elapsed / duration) : 1;
       const remainingDuration = duration * (1 - startRaw);
       const layoutMove =
         pendingWorld?.token === token.target
-          ? this.moveCharacterToWorld(
-              target,
-              pendingWorld.position,
-              pendingWorld.positionType,
-              0,
-              6,
-            )
+          ? this.moveCharacterToWorld(target, pendingWorld.position, pendingWorld.positionType, 0, 6)
           : transitionTo
-            ? this.moveCharacterToWorld(
-                target,
-                transitionTo,
-                cached.positionType,
-                remainingDuration,
-                6,
-              )
+            ? this.moveCharacterToWorld(target, transitionTo, cached.positionType, remainingDuration, 6)
             : Promise.resolve();
-      const pendingAlphaOwnsFade =
-        this.characterAlphaOperations.get(target) !== alphaOperationAtStart;
+      const pendingAlphaOwnsFade = this.characterAlphaOperations.get(target) !== alphaOperationAtStart;
       if (duration > 0 && !pendingAlphaOwnsFade) {
         if (startRaw >= 1) cached.alpha = 1;
         await Promise.all([
           startRaw >= 1
             ? Promise.resolve(true)
-            : this.fadeCharacterLifecycle(
-                cached,
-                0,
-                1,
-                remainingDuration,
-                {
-                  delayFrames: fadeStartedAt == null ? undefined : 0,
-                  startRaw,
-                },
-              ),
+            : this.fadeCharacterLifecycle(cached, 0, 1, remainingDuration, {
+                delayFrames: fadeStartedAt == null ? undefined : 0,
+                startRaw,
+              }),
           layoutMove,
         ]);
       } else {
@@ -3679,23 +4141,14 @@ export class ThreeStoryScene implements StorySceneBackend {
     const pendingWorld = this.pendingCharacterWorldPositions.get(target);
     if (pendingWorld?.token === token.target) this.pendingCharacterWorldPositions.delete(target);
     const fadeStartedAt = pendingPlacement?.fadeInStartedAtSeconds;
-    const elapsed =
-      fadeStartedAt == null
-        ? 0
-        : Math.max(0, this.monotonicSeconds() - fadeStartedAt);
+    const elapsed = fadeStartedAt == null ? 0 : Math.max(0, this.monotonicSeconds() - fadeStartedAt);
     const startRaw = duration > 0 ? clamp(elapsed / duration) : 1;
     const remainingDuration = duration * (1 - startRaw);
     const layoutMove =
       pendingWorld?.token === token.target
         ? this.moveCharacterToWorld(target, pendingWorld.position, pendingWorld.positionType, 0, 6)
         : transitionTo
-          ? this.moveCharacterToWorld(
-              target,
-              transitionTo,
-              item.positionType,
-              remainingDuration,
-              6,
-            )
+          ? this.moveCharacterToWorld(target, transitionTo, item.positionType, remainingDuration, 6)
           : Promise.resolve();
     const pendingAlphaOwnsFade = this.characterAlphaOperations.get(target) !== alphaOperationAtStart;
     if (duration > 0 && !pendingAlphaOwnsFade) {
@@ -3964,6 +4417,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       item.activeExpressionFadeInSeconds = undefined;
     }
     this.invokeCharacterModel(item, "hide controller", undefined, (model) => {
+      model.setClockSuspended?.(true);
       model.setPaused(false);
       if (!preservePresentation) model.resetExpressionParametersToDefault();
     });
@@ -4043,6 +4497,40 @@ export class ThreeStoryScene implements StorySceneBackend {
     });
   }
 
+  /**
+   * Reset command ownership and visibility without releasing renderer-ready
+   * character controllers. Seek snapshots are logical presentation states;
+   * retaining the episode cache makes the loading-phase model warmup survive
+   * both scene-index compilation and every later progress jump.
+   */
+  private prepareCharactersForSeekRestore(): void {
+    this.cancelAllCharacterModelRecoveries();
+    this.cancelAllCharacterOwnedTweens();
+    this.characterAlphaOperations.clear();
+    for (const pending of this.pendingCharacterLoadControllers.values()) {
+      pending.detach();
+      pending.controller.abort();
+    }
+    this.pendingCharacterLoadControllers.clear();
+    this.pendingCharacterCommands.clear();
+    this.pendingCharacterPlacements.clear();
+    this.pendingCharacterWorldPositions.clear();
+    for (const controller of this.pendingAngleWaitControllers.values()) controller.abort();
+    this.pendingAngleWaitControllers.clear();
+    for (const controller of this.pendingLookWaitControllers.values()) controller.abort();
+    this.pendingLookWaitControllers.clear();
+    this.characterPresentationHistory.clear();
+    for (const item of this.characterItems.values()) {
+      this.characterFadeCoordinator.cancel(item.positionType);
+    }
+    this.characterItems.clear();
+    this.speculativeCharacterControllers.clear();
+    this.speculativeCharacterCommandIndices.clear();
+    this.characterControllerIdentities.clear();
+    this.sortedCharacterItems.length = 0;
+    for (const group of this.characterRenderGroupPool) group.items.length = 0;
+  }
+
   clearCharacters(): void {
     this.cancelAllCharacterModelRecoveries();
     this.cancelAllCharacterOwnedTweens();
@@ -4054,10 +4542,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.characterPreloads.clear();
     this.notifyCharacterPreloadCapacity();
     for (const prime of [...this.characterRenderPrimes.values()]) {
-      this.settleCharacterRenderPrime(
-        prime,
-        sceneAbortError(`Character ${prime.item.target} preload was cleared`),
-      );
+      this.settleCharacterRenderPrime(prime, sceneAbortError(`Character ${prime.item.target} preload was cleared`));
     }
     this.characterLoadTokens.clear();
     this.characterAlphaOperations.clear();
@@ -4316,6 +4801,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       this.playbackSpeedEvents.push({ rate: next, queuedAtSeconds: this.monotonicSeconds() });
     }
     this.playbackSpeedRate = next;
+    this.overlay?.canvasPass.setStillSpeed(next);
     const controllers = new Set<StoryCharacter>(this.cachedCharacterControllers.values());
     for (const { item } of this.stagedCharacterItems.values()) controllers.add(item);
     for (const item of controllers) {
@@ -4380,7 +4866,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     let width = finite(size.width, this.runtime.stage.backgroundSize.width);
     let height = finite(size.height, this.runtime.stage.backgroundSize.height);
     let appliedFieldScale = fieldScale;
-    if (fit === "camera-width") {
+    if (fit === "camera-width" || fit === "cover" || fit === "contain") {
       const cameraPosition = vec3(stage.initialCameraPosition ?? this.runtime.stage.initialCameraPosition, ZERO_VEC3);
       const backgroundPosition = vec3(
         stage.backgroundFieldPosition ?? this.runtime.stage.backgroundFieldPosition,
@@ -4388,10 +4874,17 @@ export class ThreeStoryScene implements StorySceneBackend {
       );
       const depth = Math.max(0.001, backgroundPosition.z - cameraPosition.z);
       const fov = Math.max(1, finite(stage.fov, finite(this.runtime.stage.fov, 39.6)));
-      const visibleWidth = 2 * depth * Math.tan((fov * Math.PI) / 360) * Math.max(0.001, this.camera.aspect);
+      const visibleHeight = 2 * depth * Math.tan((fov * Math.PI) / 360);
+      const visibleWidth = visibleHeight * Math.max(0.001, this.camera.aspect);
+      const aspect = textureAspect(texture, this.camera.aspect);
       width =
-        visibleWidth * Math.max(1, finite(stage.backgroundOverscan, finite(this.runtime.stage.backgroundOverscan, 1)));
-      height = width / textureAspect(texture, this.camera.aspect);
+        fit === "cover"
+          ? Math.max(visibleWidth, visibleHeight * aspect)
+          : fit === "contain"
+            ? Math.min(visibleWidth, visibleHeight * aspect)
+            : visibleWidth;
+      width *= Math.max(1, finite(stage.backgroundOverscan, finite(this.runtime.stage.backgroundOverscan, 1)));
+      height = width / aspect;
       // Camera-fit dimensions are already world units. Field scale remains an
       // authored-stage concern and must not be multiplied in a second time.
       appliedFieldScale = 1;
@@ -4486,6 +4979,8 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.state.stage = stageValue || null;
     const stageUpdate = { ...this.runtime.stage } as AdvRuntimeConfig["stage"] & UnknownRecord;
     for (const key of [
+      "screenReferenceWidth",
+      "screenReferenceHeight",
       "initialCameraPosition",
       "initialCameraRotation",
       "characterFieldPosition",
@@ -4751,37 +5246,60 @@ export class ThreeStoryScene implements StorySceneBackend {
       if (!runtime) return;
       const key = `stage:${requestedIndex}:${effectIndex}`;
       this.stageParticleKeys.add(key);
-      void this.stageEffects.play(
-        key,
-        runtime as unknown as UnityEffectRuntimeDefinition,
-        { simulationSpeed: 1, anchor: this.characterField },
-      ).catch((error) => {
-        if (!this.state.error) this.state.error = error instanceof Error ? error.message : String(error);
-      });
+      void this.stageEffects
+        .play(key, runtime as unknown as UnityEffectRuntimeDefinition, {
+          simulationSpeed: 1,
+          anchor: this.characterField,
+        })
+        .catch((error) => {
+          if (!this.state.error) this.state.error = error instanceof Error ? error.message : String(error);
+        });
+    });
+  }
+
+  private stillKey(still: AdvStillEntry): string {
+    return String(still.assetName || still.sourcePath || still.url || "");
+  }
+
+  private async fadeStillLayer(key: string, alpha: number, duration: number, operation: number): Promise<void> {
+    const pass = this.overlay?.canvasPass,
+      from = pass?.stillOpacity(key) || 0;
+    await this.runTween({
+      duration,
+      ease: resolveEase(6),
+      update: (progress) => {
+        if (this.stillOperations.get(key) === operation) pass?.setStillOpacity(key, lerp(from, clamp(alpha), progress));
+      },
     });
   }
 
   async setStill(still: AdvStillEntry | null | undefined, alpha = 1, duration = 0): Promise<void> {
-    const source = firstString(still?.url);
-    const from = this.overlay?.stillAlpha || 0;
-    if (source) this.overlay?.setStill(source, duration > 0 ? from : alpha);
-    if (duration > 0) {
-      await this.runTween({
-        duration,
-        ease: resolveEase(6),
-        update: (progress) => this.overlay?.setStillAlpha(lerp(from, source ? clamp(alpha) : 0, progress)),
-      });
-    }
-    if (!source) {
-      this.overlay?.setStill("", 0);
+    const generation = ++this.stillGeneration,
+      pass = this.overlay?.canvasPass;
+    this.stillOperations.clear();
+    if (!pass) return;
+    if (!still?.url) {
+      await this.fadeStill(0, duration);
+      if (generation !== this.stillGeneration || this.destroyed) return;
+      pass.clearStills();
+      await this.overlay?.setStill("", 0);
       this.overlay?.setStillViewAlpha(0, 0);
-    } else {
-      this.overlay?.setStillViewAlpha(1, 0);
+      this.state.still = null;
+      return;
     }
-    this.state.still = still || null;
+    pass.clearStills();
+    const key = this.stillKey(still),
+      operation = ++this.stillOperationSerial;
+    this.stillOperations.set(key, operation);
+    const presentation = this.context.rendererExtensions?.service(STORY_STILL_PRESENTATION_PROVIDER)?.resolve(still);
+    await pass.showStill(key, still, duration > 0 ? 0 : alpha, presentation, 0);
+    if (generation !== this.stillGeneration || this.destroyed) return;
+    await this.fadeStillLayer(key, alpha, duration, operation);
+    if (generation !== this.stillGeneration || this.destroyed) return;
+    this.overlay?.setStillViewAlpha(1, 0);
+    this.state.still = pass.topStill;
   }
 
-  /** AdvStillCommand: any currently showing Still makes the next command Hide. */
   async runStillCommand(
     still: AdvStillEntry | null | undefined,
     stillAlpha: number,
@@ -4789,58 +5307,70 @@ export class ThreeStoryScene implements StorySceneBackend {
     animationIndex: number,
     duration = 0,
   ): Promise<void> {
-    const source = firstString(still?.url);
-    if (!source) return;
-    // AdvStillCommand branches on AdvStill.IsShowing, not on an asset-name
-    // comparison. A different Still command while one is visible hides the
-    // existing Still; it does not swap the sprite in the same invocation.
-    const hide = Boolean(this.state.still);
+    const pass = this.overlay?.canvasPass;
+    if (!still?.url || !pass) return;
+    const generation = ++this.stillGeneration;
+    const key = this.stillKey(still),
+      operation = ++this.stillOperationSerial;
+    this.stillOperations.set(key, operation);
+    const owns = () => !this.destroyed && this.stillOperations.get(key) === operation;
     const seconds = Math.max(0, finite(duration));
-    if (hide) {
-      // AdvStillCommand starts HideStill and UIAdvWidget.FadeToStill together,
-      // then awaits UniTask.WhenAll. HideStill keeps IsShowing true throughout
-      // its alpha tween and deactivates only after that tween completes.
-      const hideStill = this.fadeStill(0, seconds).then(() => {
-        this.overlay?.setStill("", 0);
-        this.state.still = null;
-      });
-      await Promise.all([hideStill, this.fadeStillView(0, 0, seconds)]);
+    if (pass.isStillVisible(key)) {
+      await Promise.all([
+        this.fadeStillLayer(key, 0, seconds, operation),
+        this.fadeStillView(0, 0, seconds, generation),
+      ]);
+      if (owns()) {
+        pass.hideStill(key);
+        this.state.still = pass.topStill;
+      }
       return;
     }
-
-    this.overlay?.setStill(source, this.overlay?.stillAlpha || 0);
+    const presentation = this.context.rendererExtensions?.service(STORY_STILL_PRESENTATION_PROVIDER)?.resolve(still);
+    await pass.showStill(key, still, seconds > 0 ? 0 : clamp(stillAlpha), presentation, animationIndex);
+    if (!owns()) return;
     this.overlay?.setStillAnimationIndex(animationIndex);
-    this.state.still = still || null;
-    const resolvedOverlayAlpha = clamp(overlayAlpha);
-    // ShowStill sets the GameObject active synchronously before beginning its
-    // alpha tween; FadeToStill is the parallel sibling awaited by WhenAll.
+    this.state.still = pass.topStill;
+    const shade = clamp(overlayAlpha);
     await Promise.all([
-      this.fadeStill(clamp(stillAlpha), seconds),
-      this.fadeStillView(resolvedOverlayAlpha === 0 ? 1 : null, resolvedOverlayAlpha, seconds),
+      this.fadeStillLayer(key, clamp(stillAlpha), seconds, operation),
+      this.fadeStillView(shade === 0 ? 1 : null, shade, seconds, generation),
     ]);
   }
 
-  private async fadeStillView(backgroundAlpha: number | null, overlayAlpha: number, duration: number): Promise<void> {
+  private async fadeStillView(
+    backgroundAlpha: number | null,
+    overlayAlpha: number,
+    duration: number,
+    generation = this.stillGeneration,
+  ): Promise<void> {
     const fromBackground = this.overlay?.stillBackgroundAlpha || 0;
     const fromOverlay = this.overlay?.stillOverlayAlpha || 0;
     const targetBackground = backgroundAlpha == null ? fromBackground : clamp(backgroundAlpha);
     await this.runTween({
       duration,
       ease: resolveEase(6),
-      update: (progress) =>
-        this.overlay?.setStillViewAlpha(
-          lerp(fromBackground, targetBackground, progress),
-          lerp(fromOverlay, clamp(overlayAlpha), progress),
-        ),
+      update: (progress) => {
+        if (generation === this.stillGeneration)
+          this.overlay?.setStillViewAlpha(
+            lerp(fromBackground, targetBackground, progress),
+            lerp(fromOverlay, clamp(overlayAlpha), progress),
+          );
+      },
     });
   }
 
   async fadeStill(alpha: number, duration = 0): Promise<void> {
-    const from = this.overlay?.stillAlpha || 0;
+    const generation = this.stillGeneration;
+    const pass = this.overlay?.canvasPass;
+    const values = pass?.visibleStillKeys.map((key) => [key, pass.stillOpacity(key)] as const) ?? [];
     await this.runTween({
       duration,
       ease: resolveEase(6),
-      update: (progress) => this.overlay?.setStillAlpha(lerp(from, clamp(alpha), progress)),
+      update: (progress) => {
+        if (generation === this.stillGeneration)
+          for (const [key, from] of values) pass?.setStillOpacity(key, lerp(from, clamp(alpha), progress));
+      },
     });
   }
 
@@ -4926,6 +5456,11 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.ruleTransitionTextureLease = null;
   }
 
+  setVideoLayout(layout?: import("@haneoka/vega/renderer-kit").StoryVideoLayout): void {
+    this.state.video.layout = layout;
+    this.overlay?.canvasPass.setVideoLayout(layout);
+  }
+
   async showVideo(
     videoInfo: AdvVideoEntry | string,
     fadeIn = 0,
@@ -4936,11 +5471,13 @@ export class ThreeStoryScene implements StorySceneBackend {
   ): Promise<void> {
     const generation = this.sceneGeneration;
     const overlay = this.overlay;
-    const video = await overlay?.showVideo(videoInfo, playbackRate, signal);
-    if (this.destroyed || generation !== this.sceneGeneration || signal?.aborted || this.overlay !== overlay) return;
-    if (!video) return;
     const source =
       typeof videoInfo === "string" ? videoInfo : firstString(videoInfo.playableUrl, videoInfo.src, videoInfo.url);
+    overlay?.canvasPass.setVideoLayout(this.state.video.layout);
+    const renderable = source ? await this.resolveEpisodeVideoRenderable(source, signal) : undefined;
+    const video = await overlay?.showVideo(videoInfo, playbackRate, signal, renderable?.url);
+    if (this.destroyed || generation !== this.sceneGeneration || signal?.aborted || this.overlay !== overlay) return;
+    if (!video) return;
     Object.assign(this.state.video, {
       visible: true,
       src: source,
@@ -5109,9 +5646,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.pipeline.setVolumeLayers(volumeLayers);
   }
 
-  private effectContribution(
-    effect: AdvEffectEntry,
-  ): StoryRendererEffectContribution | null {
+  private effectContribution(effect: AdvEffectEntry): StoryRendererEffectContribution | null {
     const runtime = record(effect.runtime);
     const effectType = firstString(effect.effectType, runtime.effectType);
     if (!effectType) return null;
@@ -5119,16 +5654,12 @@ export class ThreeStoryScene implements StorySceneBackend {
       (candidate) => candidate.effectType === effectType,
     );
     if (!contribution) {
-      throw new Error(
-        `No renderer effect plugin is registered for effect type ${effectType}`,
-      );
+      throw new Error(`No renderer effect plugin is registered for effect type ${effectType}`);
     }
     return contribution;
   }
 
-  private trackRendererEffectOperation(
-    operation: Promise<void>,
-  ): Promise<void> {
+  private trackRendererEffectOperation(operation: Promise<void>): Promise<void> {
     const settled = operation.catch(() => undefined);
     this.pendingRendererEffectOperations.add(settled);
     void settled.then(() => {
@@ -5148,10 +5679,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     try {
       await disposeVegaDisposable(resource);
     } catch (error) {
-      console.warn(
-        `[ThreeStoryScene] renderer effect ${instance.key} disposal failed during ${reason}`,
-        error,
-      );
+      console.warn(`[ThreeStoryScene] renderer effect ${instance.key} disposal failed during ${reason}`, error);
     }
   }
 
@@ -5163,9 +5691,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     instance.detach();
     instance.controller.abort();
     if (instance.resource) {
-      this.trackRendererEffectOperation(
-        this.disposeRendererEffectResource(instance, reason),
-      );
+      this.trackRendererEffectOperation(this.disposeRendererEffectResource(instance, reason));
     }
   }
 
@@ -5183,9 +5709,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   ): Promise<void> {
     const renderer = this.renderer;
     if (!renderer) {
-      throw new Error(
-        `Renderer effect ${contribution.id} cannot start before scene setup`,
-      );
+      throw new Error(`Renderer effect ${contribution.id} cannot start before scene setup`);
     }
     const gl = renderer.getContext();
     if (!(gl instanceof WebGL2RenderingContext)) {
@@ -5205,10 +5729,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       key: state.key,
       contribution,
       controller,
-      detach: this.bindControllerToSignal(
-        controller,
-        this.lifecycleController.signal,
-      ),
+      detach: this.bindControllerToSignal(controller, this.lifecycleController.signal),
       resource: null,
       stopRequested: false,
       resourceDisposed: false,
@@ -5229,10 +5750,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       controller.abort();
       throw new Error("Renderer effect registry is unavailable");
     }
-    const extensionContext: StoryRendererExtensionContext<
-      ThreeRendererId,
-      ThreeRendererContext
-    > = {
+    const extensionContext: StoryRendererExtensionContext<ThreeRendererId, ThreeRendererContext> = {
       renderer: this.rendererId,
       rendererContext,
       runtime: this.runtime,
@@ -5246,14 +5764,10 @@ export class ThreeStoryScene implements StorySceneBackend {
         ? effect.runtime
         : (effect as Readonly<Record<string, unknown>>);
     const operation = Promise.resolve()
-      .then(() =>
-        contribution.create(definition, extensionContext, controller.signal),
-      )
+      .then(() => contribution.create(definition, extensionContext, controller.signal))
       .then(async (resource) => {
         if (!isVegaDisposable(resource)) {
-          throw new TypeError(
-            `Renderer effect ${contribution.id} did not return a disposable resource`,
-          );
+          throw new TypeError(`Renderer effect ${contribution.id} did not return a disposable resource`);
         }
         instance.resource = resource;
         if (
@@ -5271,11 +5785,7 @@ export class ThreeStoryScene implements StorySceneBackend {
           this.commandEffectStates.delete(state.key);
         }
         instance.detach();
-        if (
-          instance.stopRequested ||
-          controller.signal.aborted ||
-          this.destroyed
-        ) {
+        if (instance.stopRequested || controller.signal.aborted || this.destroyed) {
           return;
         }
         throw error;
@@ -5294,10 +5804,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     } = {},
   ): Promise<void> {
     const key = firstString(options.targetName, effect?.name, "adv-command-effect");
-    if (
-      this.commandEffects.isPlaying(key) ||
-      this.rendererExtensionEffects.has(key)
-    ) {
+    if (this.commandEffects.isPlaying(key) || this.rendererExtensionEffects.has(key)) {
       this.commandEffects.stop(key, Boolean(options.atOnce));
       this.stopRendererExtensionEffect(key, "command stop");
       this.commandEffectStates.delete(key);
@@ -5317,12 +5824,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.commandEffectStates.set(key, state);
     const contribution = this.effectContribution(effect);
     if (contribution) {
-      await this.playRendererExtensionEffect(
-        contribution,
-        effect,
-        state,
-        route,
-      );
+      await this.playRendererExtensionEffect(contribution, effect, state, route);
       return;
     }
     if (!effect.runtime) {
@@ -5337,23 +5839,16 @@ export class ThreeStoryScene implements StorySceneBackend {
           : route.phase === "advFront"
             ? this.characterField
             : null;
-    await this.commandEffects.play(
-      key,
-      effect.runtime as unknown as UnityEffectRuntimeDefinition,
-      {
+    await this.commandEffects.play(key, effect.runtime as unknown as UnityEffectRuntimeDefinition, {
       simulationSpeed: state.simulationSpeed,
       anchor,
       sortingOrderOverride: route.sortingOrder,
       targetScene: this.commandEffectScene(route),
-      },
-    );
+    });
   }
 
   isCommandEffectPlaying(key: string): boolean {
-    return (
-      this.commandEffects.isPlaying(key) ||
-      this.rendererExtensionEffects.has(key)
-    );
+    return this.commandEffects.isPlaying(key) || this.rendererExtensionEffects.has(key);
   }
 
   stopCommandEffects(): void {
@@ -5386,48 +5881,24 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (this.pendingRendererEffectOperations.size) {
       return { safe: false, reason: "renderer-effect-loading" };
     }
-    if (this.commandEffects.hasAdvancedEffects || this.stageEffects.hasAdvancedEffects) {
-      return { safe: false, reason: "particle-effect-advanced" };
-    }
     if (this.backgroundBlurTweenController) return { safe: false, reason: "background-blur-active" };
     if (this.characterBlurTweenControllers.size || this.characterBrightnessTweenControllers.size) {
       return { safe: false, reason: "character-renderer-tween-active" };
     }
     if (this.state.video.visible || this.overlay?.videoElement) return { safe: false, reason: "video-active" };
-    const visibleControllers = new Set(this.characterItems.values());
-    for (const [identity, controller] of this.cachedCharacterControllers) {
-      if (!visibleControllers.has(controller)) {
-        if (this.speculativeCharacterControllers.get(identity) === controller) {
-          continue;
-        }
-        // Hidden cached controllers carry native angle/look/motion state. Until
-        // snapshots serialize that cache, force seek to deterministic replay.
-        return { safe: false, reason: `hidden-character-controller:${controller.target}` };
-      }
-    }
     if (
       this.commandShakeControllers.size > 0 ||
       Math.abs(this.backgroundShake.x) > 0.000001 ||
       Math.abs(this.backgroundShake.y) > 0.000001 ||
       Math.abs(this.characterShake.x) > 0.000001 ||
-      Math.abs(this.characterShake.y) > 0.000001 ||
-      Math.abs(this.cameraShake.x) > 0.000001 ||
-      Math.abs(this.cameraShake.y) > 0.000001 ||
-      this.cameraShakeMode !== "idle"
+      Math.abs(this.characterShake.y) > 0.000001
     ) {
-      return { safe: false, reason: "shake-active" };
+      return { safe: false, reason: "transient-shake-active" };
     }
-    for (const item of this.characterItems.values()) {
-      if (item.model.format !== "static-portrait") {
-        // Replaying the final motion/expression name does not restore character plugin's
-        // motion queue time, expression fade, physics, pose or blink phase.
-        // Reject that checkpoint instead of presenting a plausible but false
-        // internal state; the player will replay from the nearest safe boundary.
-        return { safe: false, reason: `character-runtime-phase:${item.target}` };
-      }
-      if (item.pendingPausedMotion || item.pendingPausedExpression) {
-        return { safe: false, reason: `character-paused-presentation-pending:${item.target}` };
-      }
+    if (this.cameraShakeMode === "stopping") {
+      return { safe: false, reason: "camera-shake-stopping" };
+    }
+    for (const item of new Set(this.cachedCharacterControllers.values())) {
       if (item.angleTweenController) return { safe: false, reason: `character-angle-active:${item.target}` };
       if (item.lookTweenController) return { safe: false, reason: `character-look-active:${item.target}` };
       if (item.lipSync.enabled || item.lipSync.motionSyncPcm || item.lipSync.sources.length) {
@@ -5438,25 +5909,21 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   createSeekSnapshot(): AdvStorySceneSeekSnapshot | null {
+    if (!this.screenEffects.ready) return null;
+    if (this.overlay && !this.overlay.canvasPass.ready) return null;
     if (!this.seekSnapshotSafety().safe) return null;
-    const characters = [...this.characterItems.values()].map((item) => ({
+    const characters = [...this.cachedCharacterControllers.entries()].map(([controllerIdentity, item]) => ({
       target: item.target,
       characterKey: item.characterKey,
-      identity:
-        this.characterControllerIdentities.get(item.target) ||
-        firstString(
-          item.characterKey,
-          item.entry.url,
-          record(item.entry.runtime).modelUrl,
-          item.target,
-        ),
-      controllerIdentity:
-        this.characterControllerIdentities.get(item.target) ||
-        firstString(item.characterKey, item.entry.url, record(item.entry.runtime).modelUrl, item.target),
+      identity: controllerIdentity,
+      controllerIdentity,
+      visible: this.characterItems.get(item.target) === item,
+      speculative: this.speculativeCharacterControllers.get(controllerIdentity) === item,
       entry: item.entry,
       positionType: item.positionType,
       worldPosition: item.worldPosition ? { ...item.worldPosition } : null,
       offset: { ...item.offset },
+      ...(item.model.createSnapshot ? { modelState: item.model.createSnapshot() } : {}),
       alpha: item.alpha,
       brightness: item.brightness,
       facing: item.facing,
@@ -5472,7 +5939,18 @@ export class ThreeStoryScene implements StorySceneBackend {
       blurIntensity: item.blurIntensity,
       sortingOrder: item.sortingOrder,
       rimLight: clonePlain(item.rimLight),
-      presentation: (this.characterPresentationHistory.get(item.target) || []).map((event) => ({ ...event })),
+      presentation: [
+        ...(item.currentMotionName ? [{ kind: "motion" as const, name: item.currentMotionName }] : []),
+        ...(item.activeExpressionName ? [{ kind: "expression" as const, name: item.activeExpressionName }] : []),
+      ],
+      currentMotionName: item.currentMotionName,
+      currentMotionFadeInSeconds: item.currentMotionFadeInSeconds,
+      currentExpressionName: item.currentExpressionName,
+      currentExpressionFadeInSeconds: item.currentExpressionFadeInSeconds,
+      activeExpressionName: item.activeExpressionName,
+      activeExpressionFadeInSeconds: item.activeExpressionFadeInSeconds,
+      pendingPausedMotion: item.pendingPausedMotion ? { ...item.pendingPausedMotion } : null,
+      pendingPausedExpression: item.pendingPausedExpression ? { ...item.pendingPausedExpression } : null,
       // Active lip states are rejected by seekSnapshotSafety; retain the
       // normalized idle values without serializing browser audio objects.
       lipSync: {
@@ -5486,6 +5964,17 @@ export class ThreeStoryScene implements StorySceneBackend {
     }));
     return {
       version: STORY_SCENE_SEEK_SNAPSHOT_VERSION,
+      rendererState: {
+        kind: "three",
+        version: 3,
+        transforms: [...this.sceneTransforms].map(([target, value]) => ({
+          target,
+          current: { ...value.current },
+          planned: { ...value.planned },
+        })),
+      },
+      pluginState: clonePlain(this.state.pluginState),
+      ...(this.state.video.layout ? { videoLayout: clonePlain(this.state.video.layout) } : {}),
       background: (this.state.background as AdvBackgroundEntry | null) || null,
       still: (this.state.still as AdvStillEntry | null) || null,
       stillAlpha: this.overlay?.stillAlpha || 0,
@@ -5497,10 +5986,24 @@ export class ThreeStoryScene implements StorySceneBackend {
       frameOpacity: this.state.frameOpacity,
       frameSlide: this.state.frameSlide,
       frameEntries: clonePlain(this.state.frameEntries),
+      frameParticles: this.overlay?.snapshotFrameParticles() ?? {},
+      stillLayers: this.overlay?.canvasPass.snapshotStills() ?? [],
       stage: this.state.stage,
+      screenEffects: this.screenEffects.snapshot(),
+      screenFilterState: [...this.screenFilters].map(([target, entry]) => ({
+        target,
+        state: entry.controller.snapshot(),
+      })),
       stageEnv: clonePlain(this.state.stageEnv),
       stageOffsets: [...this.stageOffsets.entries()].map(([key, value]) => [key, { ...value }] as const),
       cameraState: clonePlain(this.cameraState),
+      cameraShake: {
+        enabled: this.cameraShakeMode === "playing",
+        strength: this.cameraShakeStrength,
+        cycleSeconds: this.cameraShakeCycleSeconds,
+        vibrato: this.cameraShakeVibrato,
+        randomness: this.cameraShakeRandomness,
+      },
       fieldRendererState: clonePlain(this.fieldRendererState),
       postEffect: clonePlain(this.state.postEffect),
       commandVolumes: [...this.commandVolumes.entries()].map(([key, child]) => ({
@@ -5531,22 +6034,20 @@ export class ThreeStoryScene implements StorySceneBackend {
       lifecycle: {
         characterLoadSequence: this.characterLoadSequence,
         characterLoadTokens: [...this.characterLoadTokens.entries()],
+        characterControllerIdentities: [...this.characterControllerIdentities.entries()],
         pendingCharacters: this.pendingCharacterCommands.createSnapshot(),
         characterPriorityOrder: [...this.characterPriorityOrder],
       },
     };
   }
 
-  async restoreSeekSnapshot(
-    snapshot: PortableAdvStorySceneSeekSnapshot,
-  ): Promise<void> {
+  async restoreSeekSnapshot(snapshot: PortableAdvStorySceneSeekSnapshot, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted || this.destroyed) return;
     if (snapshot.version !== STORY_SCENE_SEEK_SNAPSHOT_VERSION) {
       throw new Error(`Unsupported ADV scene seek snapshot version: ${String(snapshot.version)}`);
     }
     if (!isDetailedThreeStorySceneSeekSnapshot(snapshot)) {
-      throw new Error(
-        "The Three renderer cannot restore a snapshot created by another backend",
-      );
+      throw new Error("Unsupported Three scene checkpoint");
     }
     // A pending browser-side model load has no serializable continuation. Such
     // a checkpoint must never have passed seekSnapshotSafety in the first place.
@@ -5554,11 +6055,8 @@ export class ThreeStoryScene implements StorySceneBackend {
       throw new Error("ADV seek snapshot contains a pending character load");
     }
 
-    // A checkpoint is only captured while shake is idle, but it is restored
-    // into the currently running scene. Clear that scene's transient state
-    // before replay: CameraShake is a native state toggle, so carrying a
-    // previous `playing` value across this boundary would invert both the
-    // authored start and stop commands during deterministic replay.
+    // Clear transient offsets first. Persistent CameraShake is restored from
+    // its logical enabled/configuration state below and starts a fresh cycle.
     this.resetShakeState();
     this.cancelPendingStageCapture(true);
     this.clearRuleTransition();
@@ -5567,12 +6065,28 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.commandEffectStates.clear();
     this.stageParticleKeys.clear();
     await this.hideVideo(0);
-    this.clearCharacters();
+    if (signal?.aborted || this.destroyed) return;
+    this.prepareCharactersForSeekRestore();
     this.clearFrameOverlay();
 
     await this.setBackground(snapshot.background, 0);
+    if (signal?.aborted || this.destroyed) return;
     const stageEnv = snapshot.stageEnv;
     this.state.stage = snapshot.stage;
+    this.state.pluginState = clonePlain(snapshot.pluginState ?? {});
+    this.setVideoLayout(snapshot.videoLayout ? clonePlain(snapshot.videoLayout) : undefined);
+    this.sceneTransforms.clear();
+    for (const transform of snapshot.rendererState.transforms)
+      this.sceneTransforms.set(transform.target, {
+        current: { ...transform.current },
+        planned: { ...transform.planned },
+      });
+    await this.screenEffects.restore(snapshot.screenEffects ?? [], signal);
+    if (signal?.aborted || this.destroyed) return;
+    for (const entry of this.screenFilters.values()) entry.controller.dispose();
+    this.screenFilters.clear();
+    for (const entry of snapshot.screenFilterState ?? [])
+      this.screenFilter(entry.target)?.controller.restore(entry.state);
     this.applyStageEnv(stageEnv.focusPosition);
     this.applyStageLight(stageEnv.light);
     this.changeStageParticleEffects(stageEnv.effect);
@@ -5585,31 +6099,55 @@ export class ThreeStoryScene implements StorySceneBackend {
     }
     Object.assign(this.cameraState, clonePlain(snapshot.cameraState));
     Object.assign(this.fieldRendererState, clonePlain(snapshot.fieldRendererState));
-
-    for (const character of snapshot.characters) {
-      const placement = this.placeCharacter(
-        {
-          targetName: character.target,
-          targets: [{ target: character.target }],
-          characterModel: character.entry,
-          characterKey: character.characterKey,
-          controllerIdentity: character.controllerIdentity,
-          characterWorldPosition: character.worldPosition || undefined,
-        },
-        character.positionType,
+    if (snapshot.cameraShake.enabled) {
+      await this.enableCameraShake(
+        snapshot.cameraShake.strength,
+        snapshot.cameraShake.cycleSeconds,
+        snapshot.cameraShake.vibrato,
+        snapshot.cameraShake.randomness,
         0,
-        false,
       );
-      // Restore the active channel heads while CharacterIn is still staged so
-      // seek never exposes defaults while the historical clips lazy-parse.
-      const reversedPresentation = [...character.presentation].reverse();
-      const lastMotion = reversedPresentation.find((event) => event.kind === "motion");
-      const lastExpression = reversedPresentation.find((event) => event.kind === "expression");
-      if (lastMotion) this.playMotionForTarget(character.target, lastMotion.name, 0);
-      if (lastExpression) this.playExpressionForTarget(character.target, lastExpression.name, 0);
-      await placement;
-      const item = this.characterItems.get(character.target);
-      if (!item) throw new Error(`ADV seek could not restore character ${character.target}`);
+    }
+
+    const snapshotControllerIdentities = new Set(snapshot.characters.map((character) => character.controllerIdentity));
+    for (const [identity, item] of this.cachedCharacterControllers) {
+      if (snapshotControllerIdentities.has(identity)) continue;
+      this.speculativeCharacterControllers.set(identity, item);
+      this.speculativeCharacterCommandIndices.set(identity, 0);
+      this.resetLipSync(item);
+      item.paused = false;
+      item.pendingPausedMotion = null;
+      item.pendingPausedExpression = null;
+      this.invokeCharacterModel(item, "reset extra seek controller", undefined, (model) => model.setPaused(false));
+    }
+
+    const orderedCharacters = [...snapshot.characters].sort(
+      (left, right) => Number(left.visible) - Number(right.visible),
+    );
+    for (const character of orderedCharacters) {
+      if (signal?.aborted || this.destroyed) return;
+      let item = this.cachedCharacterControllers.get(character.controllerIdentity);
+      if (!item) {
+        await this.placeCharacter(
+          {
+            targetName: character.target,
+            targets: [{ target: character.target }],
+            characterModel: character.entry,
+            characterKey: character.characterKey,
+            controllerIdentity: character.controllerIdentity,
+            characterWorldPosition: character.worldPosition || undefined,
+          },
+          character.positionType,
+          0,
+          false,
+        );
+        if (signal?.aborted || this.destroyed) return;
+        item = this.cachedCharacterControllers.get(character.controllerIdentity);
+      }
+      if (!item) {
+        throw new Error(`ADV seek could not restore character ${character.target}`);
+      }
+      item.positionType = character.positionType;
       item.worldPosition = character.worldPosition ? { ...character.worldPosition } : null;
       Object.assign(item.offset, character.offset);
       item.alpha = character.alpha;
@@ -5627,6 +6165,17 @@ export class ThreeStoryScene implements StorySceneBackend {
       item.blurIntensity = character.blurIntensity;
       item.sortingOrder = character.sortingOrder;
       item.rimLight = clonePlain(character.rimLight);
+      item.currentMotionName = character.currentMotionName;
+      item.currentMotionFadeInSeconds = character.currentMotionFadeInSeconds;
+      item.currentExpressionName = character.currentExpressionName;
+      item.currentExpressionFadeInSeconds = character.currentExpressionFadeInSeconds;
+      item.activeExpressionName = character.activeExpressionName;
+      item.activeExpressionFadeInSeconds = character.activeExpressionFadeInSeconds;
+      item.pendingPausedMotion = character.pendingPausedMotion ? { ...character.pendingPausedMotion } : null;
+      item.pendingPausedExpression = character.pendingPausedExpression
+        ? { ...character.pendingPausedExpression }
+        : null;
+      item.harmonicTime = 0;
       item.lipSync = {
         ...character.lipSync,
         motionSyncPcm: null,
@@ -5635,7 +6184,18 @@ export class ThreeStoryScene implements StorySceneBackend {
         randomSeed: { ...character.lipSync.randomSeed },
       };
       item.paused = character.paused;
-      this.invokeCharacterModel(item, "restore seek pause state", undefined, (model) => model.setPaused(item.paused));
+      this.invokeCharacterModel(item, "restore seek presentation", undefined, (model) => {
+        model.setPaused(false);
+        model.stopMotions();
+        model.resetExpressionParametersToDefault();
+        if (item.currentMotionName) model.playMotion(item.currentMotionName, 0);
+        if (item.activeExpressionName) model.playExpression(item.activeExpressionName, 0);
+        model.setMotionSpeed(this.playbackSpeedRate);
+        if (item.paused) model.setPaused(true);
+        model.primeInitialFrame(this.characterParameterFrame(item));
+      });
+      if (character.modelState !== undefined) await item.model.restoreSnapshot?.(character.modelState);
+      if (signal?.aborted || this.destroyed) return;
       if (item.lookOverride) {
         this.invokeCharacterModel(item, "restore seek look", undefined, (model) =>
           model.setEyeBallPosition(item.lookX, item.lookY),
@@ -5646,9 +6206,18 @@ export class ThreeStoryScene implements StorySceneBackend {
         character.presentation.map((event) => ({ ...event })),
       );
       this.layoutCharacter(item);
+      if (character.visible) this.registerVisibleCharacter(character.target, item);
+      if (character.speculative) {
+        this.speculativeCharacterControllers.set(character.controllerIdentity, item);
+        this.speculativeCharacterCommandIndices.set(character.controllerIdentity, 0);
+      }
     }
 
     this.characterPriorityOrder = [...snapshot.lifecycle.characterPriorityOrder];
+    this.characterControllerIdentities.clear();
+    for (const [target, identity] of snapshot.lifecycle.characterControllerIdentities) {
+      this.characterControllerIdentities.set(target, identity);
+    }
     this.characterLoadTokens.clear();
     for (const [target, token] of snapshot.lifecycle.characterLoadTokens) {
       this.characterLoadTokens.set(target, token);
@@ -5662,6 +6231,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.pendingCharacterCommands.restoreSnapshot(snapshot.lifecycle.pendingCharacters);
 
     await this.stageEffects.waitForPending();
+    if (signal?.aborted || this.destroyed) return;
     for (const entry of snapshot.commandEffects) {
       await this.playCommandEffect(entry.effect, {
         atOnce: entry.atOnce,
@@ -5670,8 +6240,24 @@ export class ThreeStoryScene implements StorySceneBackend {
         targetName: entry.targetName,
         canvasLayers: entry.canvasLayers,
       });
+      if (signal?.aborted || this.destroyed) return;
     }
-    await this.setStill(snapshot.still, snapshot.stillAlpha, 0);
+    const canvas = this.overlay?.canvasPass;
+    if (canvas && snapshot.stillLayers) {
+      ++this.stillGeneration;
+      this.stillOperations.clear();
+      canvas.clearStills();
+      for (const layer of snapshot.stillLayers) {
+        const presentation = this.context.rendererExtensions
+          ?.service(STORY_STILL_PRESENTATION_PROVIDER)
+          ?.resolve(layer.still);
+        await canvas.showStill(layer.key, layer.still, layer.opacity, presentation, 0);
+        if (signal?.aborted || this.destroyed) return;
+        canvas.restoreStillAnimation(layer.key, layer.animation, layer.visible);
+      }
+      this.state.still = canvas.topStill;
+    } else await this.setStill(snapshot.still, snapshot.stillAlpha, 0);
+    if (signal?.aborted || this.destroyed) return;
     this.overlay?.setStillViewAlpha(snapshot.stillBackgroundAlpha, snapshot.stillOverlayAlpha);
     this.overlay?.setStillAnimationIndex(snapshot.stillAnimationIndex);
     this.state.frame = snapshot.frame;
@@ -5682,8 +6268,10 @@ export class ThreeStoryScene implements StorySceneBackend {
     for (const [key, value] of Object.entries(this.state.frameEntries)) {
       if (!value.frame || value.opacity <= 0.001) continue;
       await this.setFrameOverlay(value.frame, value.opacity, key);
+      if (signal?.aborted || this.destroyed) return;
       this.setFrameOpacity(value.opacity, value.slide, key);
     }
+    this.overlay?.restoreFrameParticles(snapshot.frameParticles ?? {});
 
     this.commandVolumes.clear();
     for (const child of snapshot.commandVolumes) {

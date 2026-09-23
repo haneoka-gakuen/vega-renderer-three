@@ -105,6 +105,7 @@ export interface AdvPostPipelineOptions {
 }
 
 export interface AdvPostBeginOptions {
+  readonly filterBackground?: (target: WebGLRenderTarget) => void;
   readonly clearColor?: ColorRepresentation;
   readonly clearAlpha?: number;
   /** ScreenCaptureRenderPass redraw of the raw AdvBack layer, before field blur. */
@@ -120,6 +121,8 @@ export interface AdvSceneLayer {
 }
 
 export interface AdvPostFinishOptions {
+  readonly filterStage?: (target: WebGLRenderTarget) => void;
+  readonly beforePostProcessing?: (target: WebGLRenderTarget) => void;
   /** Three objects which must be composited after the raw Character draw. */
   readonly foreground?: AdvSceneLayer | null;
   /** Command-owned particles/overlays rendered with their authored material. */
@@ -132,6 +135,8 @@ export interface AdvPostFinishOptions {
 }
 
 export interface AdvCharacterGroupSettings {
+  readonly filterTarget?: string;
+  readonly filter?: (target: WebGLRenderTarget) => void;
   readonly blur: number;
   readonly alpha: number;
   readonly brightness: number;
@@ -617,6 +622,10 @@ export class AdvPostPipeline {
     this.effects = copyEffects(DEFAULT_EFFECTS);
   }
 
+  resetTemporalHistory(): void {
+    this.urpPostProcessor.resetTemporalHistory();
+  }
+
   setFinalPostFxaaEnabled(enabled: boolean): void {
     this.assertUsable();
     this.finalPostFxaaEnabled = Boolean(enabled);
@@ -670,6 +679,7 @@ export class AdvPostPipeline {
         this.captureStageBackground(options.stageCaptureScene ?? background, camera, options.advBackEffects);
       }
       this.applyBackgroundEffects();
+      options.filterBackground?.(this.mainTarget);
       this.activeCharacterTarget = this.mainTarget;
     } catch (error: unknown) {
       this.restoreRendererState();
@@ -712,6 +722,13 @@ export class AdvPostPipeline {
     this.renderFullscreen(this.compositeMaterial, this.mainTarget, false);
   }
 
+  renderBackgroundOverlay(draw: (target: WebGLRenderTarget) => void): void {
+    this.assertUsable();
+    if (!this.frameActive || this.characterGroupActive)
+      throw new Error("Background overlays require an active field before characters");
+    draw(this.mainTarget);
+  }
+
   /**
    * Starts one adjacent Unity character-entry group. Groups with default
    * alpha/brightness/blur draw directly into mainRT; affected groups use the
@@ -724,7 +741,7 @@ export class AdvPostPipeline {
     const blur = nonNegative(settings.blur);
     const alpha = clamp01(settings.alpha, 1);
     const brightness = nonNegative(settings.brightness, 1);
-    this.characterGroupIsolated = blur > 0 || alpha < 1 || brightness < 1;
+    this.characterGroupIsolated = blur > 0 || alpha < 1 || brightness !== 1 || Boolean(settings.filter);
     this.characterGroupActive = true;
     this.activeCharacterTarget = this.characterGroupIsolated ? this.temporaryTarget : this.mainTarget;
     if (this.characterGroupIsolated) this.clearTarget(this.temporaryTarget, 0x000000, 0);
@@ -764,6 +781,7 @@ export class AdvPostPipeline {
           true,
         );
       }
+      settings.filter?.(this.temporaryTarget);
       this.compositeUniforms.tInput.value = this.temporaryTarget.texture;
       this.compositeUniforms.uBrightness.value = nonNegative(settings.brightness, 1);
       this.compositeUniforms.uAlpha.value = clamp01(settings.alpha, 1);
@@ -806,6 +824,7 @@ export class AdvPostPipeline {
 
       if (options.foreground) this.renderSceneLayer(options.foreground, this.mainTarget);
       if (options.commandEffects) this.renderSceneLayer(options.commandEffects, this.mainTarget);
+      options.beforePostProcessing?.(this.mainTarget);
 
       // The ADV camera has m_RenderPostProcessing=1. Compatibility-mode URP
       // builds the 16^3 LUT, bloom pyramid and UberPost before the custom
@@ -829,6 +848,7 @@ export class AdvPostPipeline {
         source = destination;
       }
       if (options.uiEffects) this.renderSceneLayer(options.uiEffects, source);
+      options.filterStage?.(source);
 
       this.lastOutputTarget = source;
       const outputTarget = options.outputTarget ?? null;

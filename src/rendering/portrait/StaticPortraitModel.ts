@@ -1,7 +1,4 @@
-import type {
-  AdvStaticPortraitPivot,
-  StoryResourceResolver,
-} from "@haneoka/vega/renderer-kit";
+import type { AdvStaticPortraitPivot, StoryResourceResolver } from "@haneoka/vega/renderer-kit";
 import type { Matrix4 } from "three";
 import { loadRendererImage } from "../ImageResource";
 import type {
@@ -342,6 +339,8 @@ export class StaticPortraitModel implements ThreeStoryCharacterModel {
   private updateSerialValue = 0;
   private drawSerialValue = 0;
   private released = false;
+  private mutableSurface = false;
+  private pendingSurface: TexImageSource | null = null;
 
   private constructor(
     options: StaticPortraitModelOptions,
@@ -382,6 +381,48 @@ export class StaticPortraitModel implements ThreeStoryCharacterModel {
       if (resources) releaseDrawResources(options.gl, resources);
       throw error;
     }
+  }
+
+  static createSurface(
+    options: StaticPortraitModelOptions,
+    source: TexImageSource,
+    width: number,
+    height: number,
+  ): StaticPortraitModel {
+    const gl = options.gl,
+      texture = gl.createTexture();
+    if (!texture) throw new Error("Unable to allocate a media surface");
+    let resources: PortraitDrawResources | undefined;
+    try {
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, source);
+      resources = acquireDrawResources(gl);
+      const model = new StaticPortraitModel(
+        options,
+        { texture, width, height, release: () => gl.deleteTexture(texture) },
+        resources,
+      );
+      model.mutableSurface = true;
+      return model;
+    } catch (error) {
+      gl.deleteTexture(texture);
+      if (resources) releaseDrawResources(gl, resources);
+      throw error;
+    } finally {
+      gl.bindTexture(gl.TEXTURE_2D, null);
+    }
+  }
+
+  updateSurface(source: TexImageSource): void {
+    if (this.released) return;
+    if (!this.mutableSurface) throw new Error("Shared portrait textures are immutable");
+    this.pendingSurface = source;
   }
 
   setPaused(_paused: boolean): void {
@@ -513,6 +554,12 @@ export class StaticPortraitModel implements ThreeStoryCharacterModel {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindSampler(0, null);
     gl.bindTexture(gl.TEXTURE_2D, this.textureLease.texture);
+    if (this.pendingSurface) {
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, this.pendingSurface);
+      this.pendingSurface = null;
+    }
     gl.uniform1i(resources.textureLocation, 0);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     this.drawSerialValue += 1;
@@ -522,6 +569,7 @@ export class StaticPortraitModel implements ThreeStoryCharacterModel {
   release(): void {
     if (this.released) return;
     this.released = true;
+    this.pendingSurface = null;
     this.textureLease.release();
     releaseDrawResources(this.gl, this.resources);
   }

@@ -7,10 +7,7 @@ const abortError = (source: string, signal?: AbortSignal): unknown => {
   return error;
 };
 
-const loadBrowserImage = (
-  source: string,
-  signal?: AbortSignal,
-): Promise<HTMLImageElement> => {
+const loadBrowserImage = (source: string, signal?: AbortSignal): Promise<HTMLImageElement> => {
   if (signal?.aborted) return Promise.reject(abortError(source, signal));
   return new Promise((resolve, reject) => {
     const image = new Image();
@@ -29,8 +26,7 @@ const loadBrowserImage = (
         reject(abortError(source, signal));
       });
     image.onload = () => finish(() => resolve(image));
-    image.onerror = () =>
-      finish(() => reject(new Error(`Image failed to load: ${source}`)));
+    image.onerror = () => finish(() => reject(new Error(`Image failed to load: ${source}`)));
     signal?.addEventListener("abort", abort, { once: true });
     image.src = source;
   });
@@ -41,10 +37,7 @@ export const loadRendererImage = async (
   resources?: StoryResourceResolver,
   signal?: AbortSignal,
 ): Promise<HTMLImageElement> => {
-  const renderable =
-    resources?.canLoad(source) === true
-      ? await resources.resolveRenderable(source, signal)
-      : null;
+  const renderable = resources?.canLoad(source) === true ? await resources.resolveRenderable(source, signal) : null;
   try {
     return await loadBrowserImage(renderable?.url ?? source, signal);
   } finally {

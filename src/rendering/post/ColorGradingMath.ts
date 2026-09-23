@@ -7,27 +7,14 @@ import {
   NoColorSpace,
   RedFormat,
 } from "three";
-import type {
-  UnityColorValue,
-  UnityCurveKeyframe,
-  UnityTextureCurve,
-} from "./AdvVolumeStack";
+import type { UnityColorValue, UnityCurveKeyframe, UnityTextureCurve } from "./AdvVolumeStack";
 
-export type AdvColorVector4 = readonly [
-  red: number,
-  green: number,
-  blue: number,
-  scalar: number,
-];
+export type AdvColorVector4 = readonly [red: number, green: number, blue: number, scalar: number];
 
 type Rgb = readonly [red: number, green: number, blue: number];
 
 /** Linear-sRGB Y row, derived from the sRGB primaries and D65 white. */
-const LINEAR_SRGB_LUMINANCE = [
-  0.21263900587151036,
-  0.7151686787677559,
-  0.07219231536073371,
-] as const;
+const LINEAR_SRGB_LUMINANCE = [0.21263900587151036, 0.7151686787677559, 0.07219231536073371] as const;
 
 const CURVE_TEXTURE_WIDTH = 128;
 
@@ -41,11 +28,9 @@ const finiteOrInfinite = (value: unknown, fallback = 0): number => {
   return Number.isNaN(candidate) ? fallback : candidate;
 };
 
-const clamp = (value: number, minimum: number, maximum: number): number =>
-  Math.max(minimum, Math.min(maximum, value));
+const clamp = (value: number, minimum: number, maximum: number): number => Math.max(minimum, Math.min(maximum, value));
 
-const cleanNearZero = (value: number): number =>
-  Math.abs(value) <= 1e-12 ? 0 : value;
+const cleanNearZero = (value: number): number => (Math.abs(value) <= 1e-12 ? 0 : value);
 
 /** Extended sRGB electro-optical transfer function from CSS Color 4. */
 export function srgbToLinear(channelValue: number): number {
@@ -53,10 +38,7 @@ export function srgbToLinear(channelValue: number): number {
   const sign = channel < 0 ? -1 : 1;
   const magnitude = Math.abs(channel);
   if (magnitude <= 0.04045) return channel / 12.92;
-  return (
-    sign *
-    Math.pow((magnitude + 0.055) / 1.055, 2.4)
-  );
+  return sign * Math.pow((magnitude + 0.055) / 1.055, 2.4);
 }
 
 export function advLinearColor(color: UnityColorValue): AdvColorVector4 {
@@ -83,18 +65,12 @@ const trackball = (value: UnityColorValue): AdvColorVector4 => [
   finite(value.a ?? value.w),
 ];
 
-const trackballChroma = (
-  value: UnityColorValue,
-): { readonly chroma: Rgb; readonly scalar: number } => {
+const trackballChroma = (value: UnityColorValue): { readonly chroma: Rgb; readonly scalar: number } => {
   const source = trackball(value);
   const linear = source.slice(0, 3).map(srgbToLinear) as unknown as Rgb;
   const luminance = linearSrgbLuminance(linear);
   return {
-    chroma: [
-      linear[0] - luminance,
-      linear[1] - luminance,
-      linear[2] - luminance,
-    ],
+    chroma: [linear[0] - luminance, linear[1] - luminance, linear[2] - luminance],
     scalar: source[3],
   };
 };
@@ -120,11 +96,7 @@ export function prepareAdvTonalRanges(
       0,
     ];
   };
-  return [
-    prepare(shadowsInput),
-    prepare(midtonesInput),
-    prepare(highlightsInput),
-  ];
+  return [prepare(shadowsInput), prepare(midtonesInput), prepare(highlightsInput)];
 }
 
 /**
@@ -193,9 +165,7 @@ export function prepareAdvSplitToning(
   ];
 }
 
-const normalizedCurveKeys = (
-  curve: UnityTextureCurve,
-): UnityCurveKeyframe[] =>
+const normalizedCurveKeys = (curve: UnityTextureCurve): UnityCurveKeyframe[] =>
   [...(curve.m_Curve?.m_Curve ?? [])]
     .map((key) => ({
       time: finite(key.time),
@@ -208,11 +178,7 @@ const normalizedCurveKeys = (
     }))
     .sort((left, right) => left.time - right.time);
 
-const sampleHermite = (
-  left: UnityCurveKeyframe,
-  right: UnityCurveKeyframe,
-  time: number,
-): number => {
+const sampleHermite = (left: UnityCurveKeyframe, right: UnityCurveKeyframe, time: number): number => {
   const duration = right.time - left.time;
   if (!(duration > 0)) return right.value;
   const amount = clamp((time - left.time) / duration, 0, 1);
@@ -242,24 +208,14 @@ const sampleCubicBezier = (
   );
 };
 
-const sampleWeightedSegment = (
-  left: UnityCurveKeyframe,
-  right: UnityCurveKeyframe,
-  time: number,
-): number => {
+const sampleWeightedSegment = (left: UnityCurveKeyframe, right: UnityCurveKeyframe, time: number): number => {
   const duration = right.time - left.time;
   if (!(duration > 0)) return right.value;
   if (!Number.isFinite(left.outSlope) || !Number.isFinite(right.inSlope)) {
     return left.value;
   }
-  const leftWeight =
-    (finite(left.weightedMode) & 2) !== 0
-      ? clamp(finite(left.outWeight, 1 / 3), 0, 1)
-      : 1 / 3;
-  const rightWeight =
-    (finite(right.weightedMode) & 1) !== 0
-      ? clamp(finite(right.inWeight, 1 / 3), 0, 1)
-      : 1 / 3;
+  const leftWeight = (finite(left.weightedMode) & 2) !== 0 ? clamp(finite(left.outWeight, 1 / 3), 0, 1) : 1 / 3;
+  const rightWeight = (finite(right.weightedMode) & 1) !== 0 ? clamp(finite(right.inWeight, 1 / 3), 0, 1) : 1 / 3;
   const x1 = left.time + duration * leftWeight;
   const x2 = right.time - duration * rightWeight;
   const y1 = left.value + left.outSlope * duration * leftWeight;
@@ -269,51 +225,30 @@ const sampleWeightedSegment = (
   let high = 1;
   for (let iteration = 0; iteration < 28; iteration += 1) {
     const midpoint = (low + high) * 0.5;
-    if (
-      sampleCubicBezier(left.time, x1, x2, right.time, midpoint) <
-      time
-    ) {
+    if (sampleCubicBezier(left.time, x1, x2, right.time, midpoint) < time) {
       low = midpoint;
     } else {
       high = midpoint;
     }
   }
-  return sampleCubicBezier(
-    left.value,
-    y1,
-    y2,
-    right.value,
-    (low + high) * 0.5,
-  );
+  return sampleCubicBezier(left.value, y1, y2, right.value, (low + high) * 0.5);
 };
 
-const positiveModulo = (value: number, modulus: number): number =>
-  ((value % modulus) + modulus) % modulus;
+const positiveModulo = (value: number, modulus: number): number => ((value % modulus) + modulus) % modulus;
 
-const wrapCurveTime = (
-  time: number,
-  first: number,
-  last: number,
-  mode: number,
-): number => {
+const wrapCurveTime = (time: number, first: number, last: number, mode: number): number => {
   const duration = last - first;
   if (!(duration > 0)) return first;
   if (mode === 2) return first + positiveModulo(time - first, duration);
   if (mode === 4) {
     const position = positiveModulo(time - first, duration * 2);
-    return (
-      first +
-      (position <= duration ? position : duration * 2 - position)
-    );
+    return first + (position <= duration ? position : duration * 2 - position);
   }
   return clamp(time, first, last);
 };
 
 /** Evaluate the serialized ADV texture-curve representation. */
-export function evaluateAdvTextureCurve(
-  curve: UnityTextureCurve,
-  timeValue: number,
-): number {
+export function evaluateAdvTextureCurve(curve: UnityTextureCurve, timeValue: number): number {
   const source = normalizedCurveKeys(curve);
   if (source.length === 0) return finite(curve.m_ZeroValue);
   if (source.length === 1) return source[0]!.value;
@@ -333,19 +268,9 @@ export function evaluateAdvTextureCurve(
   const last = keys[keys.length - 1]!;
   let time = finite(timeValue, first.time);
   if (time < first.time) {
-    time = wrapCurveTime(
-      time,
-      first.time,
-      last.time,
-      finite(curve.m_Curve?.m_PreInfinity),
-    );
+    time = wrapCurveTime(time, first.time, last.time, finite(curve.m_Curve?.m_PreInfinity));
   } else if (time > last.time) {
-    time = wrapCurveTime(
-      time,
-      first.time,
-      last.time,
-      finite(curve.m_Curve?.m_PostInfinity),
-    );
+    time = wrapCurveTime(time, first.time, last.time, finite(curve.m_Curve?.m_PostInfinity));
   }
   if (time <= first.time) return first.value;
   if (time >= last.time) return last.value;
@@ -358,12 +283,8 @@ export function evaluateAdvTextureCurve(
     if (!Number.isFinite(left.outSlope) || !Number.isFinite(right.inSlope)) {
       return left.value;
     }
-    const weighted =
-      (finite(left.weightedMode) & 2) !== 0 ||
-      (finite(right.weightedMode) & 1) !== 0;
-    return weighted
-      ? sampleWeightedSegment(left, right, time)
-      : sampleHermite(left, right, time);
+    const weighted = (finite(left.weightedMode) & 2) !== 0 || (finite(right.weightedMode) & 1) !== 0;
+    return weighted ? sampleWeightedSegment(left, right, time) : sampleHermite(left, right, time);
   }
   return last.value;
 }
@@ -372,17 +293,9 @@ export function evaluateAdvTextureCurve(
 export function bakeAdvTextureCurve(curve: UnityTextureCurve): DataTexture {
   const data = new Uint16Array(CURVE_TEXTURE_WIDTH);
   for (let index = 0; index < data.length; index += 1) {
-    data[index] = DataUtils.toHalfFloat(
-      evaluateAdvTextureCurve(curve, index / CURVE_TEXTURE_WIDTH),
-    );
+    data[index] = DataUtils.toHalfFloat(evaluateAdvTextureCurve(curve, index / CURVE_TEXTURE_WIDTH));
   }
-  const texture = new DataTexture(
-    data,
-    CURVE_TEXTURE_WIDTH,
-    1,
-    RedFormat,
-    HalfFloatType,
-  );
+  const texture = new DataTexture(data, CURVE_TEXTURE_WIDTH, 1, RedFormat, HalfFloatType);
   texture.name = "ADV texture curve 128 R16F";
   texture.colorSpace = NoColorSpace;
   texture.minFilter = LinearFilter;

@@ -116,10 +116,7 @@ export class AdvHarmonicMotionController {
     this.elapsedSeconds = 0;
   }
 
-  advance(
-    deltaSeconds: number,
-    model: AdvHarmonicParameterSource,
-  ): ThreeCharacterParameterBlend[] {
+  advance(deltaSeconds: number, model: AdvHarmonicParameterSource): ThreeCharacterParameterBlend[] {
     this.elapsedSeconds += Math.max(0, finite(deltaSeconds));
     return evaluateAdvHarmonicMotion(this.data, this.elapsedSeconds, model);
   }

@@ -16,6 +16,7 @@ const DEFAULT_RIM_LIGHT: RimLightState = {
 
 export class StoryCharacter implements StoryCharacterItem {
   readonly node = new Object3D();
+  readonly surface = new Object3D();
   worldPosition: AdvWorldPosition | null = null;
   readonly offset = { x: 0, y: 0, z: 0 };
   alpha = 1;
@@ -102,6 +103,8 @@ export class StoryCharacter implements StoryCharacterItem {
     public positionType: number,
   ) {
     this.node.name = `ADV Character ${target}`;
+    this.surface.name = `Character surface ${target}`;
+    this.node.add(this.surface);
   }
 
   get paused(): boolean {

@@ -201,8 +201,8 @@ export function unityQuaternion(
 }
 
 /**
- * Unity's Quaternion.Euler applies the serialized Euler components in Z-X-Y
- * order. The basis conversion is still performed through C*R*C.
+ * Fixed-axis Z-X-Y rotation has matrix Ry * Rx * Rz. Three's Euler order
+ * describes intrinsic rotations, so the equivalent order is YXZ.
  */
 export function unityEulerDegrees(source: UnityVector3Source, target = new Quaternion()): Quaternion {
   const radians = Math.PI / 180;
@@ -210,7 +210,7 @@ export function unityEulerDegrees(source: UnityVector3Source, target = new Quate
     component3(source, 0) * radians,
     component3(source, 1) * radians,
     component3(source, 2) * radians,
-    "ZXY",
+    "YXZ",
   );
   scratchQuaternion.setFromEuler(scratchEuler);
   // `unityQuaternion` reads all source components before mutating its target,

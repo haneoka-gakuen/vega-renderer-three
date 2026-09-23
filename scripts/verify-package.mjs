@@ -1,18 +1,9 @@
-import {
-  access,
-  lstat,
-  readFile,
-  readdir,
-  realpath,
-  stat,
-} from "node:fs/promises";
+import { access, lstat, readFile, readdir, realpath, stat } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
-const manifest = JSON.parse(
-  await readFile(resolve(root, "package.json"), "utf8"),
-);
+const manifest = JSON.parse(await readFile(resolve(root, "package.json"), "utf8"));
 const fail = (message) => {
   throw new Error(`Package verification failed: ${message}`);
 };
@@ -27,10 +18,7 @@ if (manifest.publishConfig?.access !== "public") {
 if (manifest.publishConfig?.provenance !== true) {
   fail("publishConfig.provenance must be enabled");
 }
-if (
-  manifest.repository?.url !==
-  "git+https://github.com/haneoka-gakuen/vega-renderer-three.git"
-) {
+if (manifest.repository?.url !== "git+https://github.com/haneoka-gakuen/vega-renderer-three.git") {
   fail("repository URL is not canonical");
 }
 if (Object.keys(manifest.dependencies ?? {}).length > 0) {
@@ -40,12 +28,7 @@ if (Object.keys(manifest.optionalDependencies ?? {}).length > 0) {
   fail("optional runtime dependencies are not allowed");
 }
 
-const requiredPublishedDocuments = [
-  "LICENSE",
-  "LICENSE-SCOPE.md",
-  "NOTICE.md",
-  "THIRD_PARTY_NOTICES.md",
-];
+const requiredPublishedDocuments = ["LICENSE", "LICENSE-SCOPE.md", "NOTICE.md", "THIRD_PARTY_NOTICES.md"];
 for (const document of requiredPublishedDocuments) {
   if (!(manifest.files ?? []).includes(document)) {
     fail(`${document} must be included in the published package`);
@@ -84,12 +67,7 @@ const collectTargets = (value) => {
   return Object.values(value).flatMap(collectTargets);
 };
 const targets = new Set(
-  [
-    manifest.main,
-    manifest.module,
-    manifest.types,
-    ...collectTargets(manifest.exports),
-  ].filter(
+  [manifest.main, manifest.module, manifest.types, ...collectTargets(manifest.exports)].filter(
     (value) => typeof value === "string" && value.startsWith("./dist/"),
   ),
 );
@@ -110,9 +88,7 @@ const insideRoot = (path) => {
   const pathFromRoot = relative(root, path);
   return (
     pathFromRoot === "" ||
-    (!pathFromRoot.startsWith(`..${sep}`) &&
-      pathFromRoot !== ".." &&
-      !pathFromRoot.startsWith(sep))
+    (!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !pathFromRoot.startsWith(sep))
   );
 };
 const walkRepository = async (path, relativePath = "") => {
@@ -122,10 +98,7 @@ const walkRepository = async (path, relativePath = "") => {
   if (info.isDirectory()) {
     for (const entry of await readdir(path)) {
       if (!relativePath && ignoredRoots.has(entry)) continue;
-      await walkRepository(
-        resolve(path, entry),
-        relativePath ? `${relativePath}/${entry}` : entry,
-      );
+      await walkRepository(resolve(path, entry), relativePath ? `${relativePath}/${entry}` : entry);
     }
     return;
   }
@@ -140,9 +113,7 @@ const removedPortSources = new Set([
   "src/rendering/post/UnityColorGrading.ts",
   "src/rendering/post/UnityColorUtils.ts",
 ]);
-const restoredPortSources = repositoryFiles.filter((path) =>
-  removedPortSources.has(path),
-);
+const restoredPortSources = repositoryFiles.filter((path) => removedPortSources.has(path));
 if (restoredPortSources.length > 0) {
   fail(`removed engine-port source restored:\n${restoredPortSources.join("\n")}`);
 }
@@ -179,10 +150,7 @@ const walkPublishable = async (path, relativePath) => {
   if (info.isSymbolicLink()) fail(`publish path is a symlink: ${relativePath}`);
   if (info.isDirectory()) {
     for (const entry of await readdir(path)) {
-      await walkPublishable(
-        resolve(path, entry),
-        relativePath ? `${relativePath}/${entry}` : entry,
-      );
+      await walkPublishable(resolve(path, entry), relativePath ? `${relativePath}/${entry}` : entry);
     }
     return;
   }
@@ -197,42 +165,28 @@ for (const entry of manifest.files ?? []) {
   }
   await walkPublishable(resolve(root, entry), entry);
 }
-const forbiddenPublishable = publishableFiles.filter((path) =>
-  forbiddenPath.test(path),
-);
+const forbiddenPublishable = publishableFiles.filter((path) => forbiddenPath.test(path));
 if (forbiddenPublishable.length > 0) {
   fail(`forbidden publish payload:\n${forbiddenPublishable.join("\n")}`);
 }
-const legacyPortOutput =
-  /(?:^|\/)UnityColor(?:Grading|Utils)(?:\.|\/)/u;
-const publishedLegacyPortOutput = publishableFiles.filter((path) =>
-  legacyPortOutput.test(path),
-);
+const legacyPortOutput = /(?:^|\/)UnityColor(?:Grading|Utils)(?:\.|\/)/u;
+const publishedLegacyPortOutput = publishableFiles.filter((path) => legacyPortOutput.test(path));
 if (publishedLegacyPortOutput.length > 0) {
-  fail(
-    `removed engine-port build output is publishable:\n${publishedLegacyPortOutput.join("\n")}`,
-  );
+  fail(`removed engine-port build output is publishable:\n${publishedLegacyPortOutput.join("\n")}`);
 }
 if (publishableBytes > 5 * 1024 * 1024) {
   fail(`publish payload is unexpectedly large (${publishableBytes} bytes)`);
 }
 
 const builtJavaScript = await readFile(resolve(root, "dist/index.js"), "utf8");
-const importPattern =
-  /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s*)["']([^"']+)["']/gu;
+const importPattern = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s*)["']([^"']+)["']/gu;
 const externalImports = new Set(
   [...builtJavaScript.matchAll(importPattern)]
     .map((match) => match[1])
     .filter((specifier) => specifier && !specifier.startsWith(".")),
 );
-const allowedImports = new Set([
-  "@haneoka/vega",
-  "@haneoka/vega/renderer-kit",
-  "three",
-]);
-const unexpectedImports = [...externalImports].filter(
-  (specifier) => !allowedImports.has(specifier),
-);
+const allowedImports = new Set(["@haneoka/vega", "@haneoka/vega/renderer-kit", "three"]);
+const unexpectedImports = [...externalImports].filter((specifier) => !allowedImports.has(specifier));
 if (unexpectedImports.length > 0) {
   fail(`unexpected runtime imports: ${unexpectedImports.join(", ")}`);
 }
@@ -246,8 +200,7 @@ const sourceEntries = await Promise.all(
     })),
 );
 const sourceText = sourceEntries.map(({ text }) => text).join("\n");
-const rendererKitImportPattern =
-  /import\s*(?:type\s*)?\{([\s\S]*?)\}\s*from\s*["']@haneoka\/vega\/renderer-kit["']/gu;
+const rendererKitImportPattern = /import\s*(?:type\s*)?\{([^{}]*?)\}\s*from\s*["']@haneoka\/vega\/renderer-kit["']/gu;
 const forbiddenCoreAdapterNames = [
   "AdvFieldTargetFormat",
   "AdvRainFrameRenderer",
@@ -269,24 +222,19 @@ for (const { path, text } of sourceEntries) {
     const imports = match[1] ?? "";
     for (const name of forbiddenCoreAdapterNames) {
       if (new RegExp(`\\b${name}\\b`, "u").test(imports)) {
-        fail(
-          `renderer adapter ${name} must be imported locally, not from Vega core (${path})`,
-        );
+        fail(`renderer adapter ${name} must be imported locally, not from Vega core (${path})`);
       }
     }
   }
 }
-const uberPostSource = await readFile(
-  resolve(root, "src/rendering/post/AdvUrpUberPost.ts"),
-  "utf8",
-);
-const publicEntrySource = await readFile(
-  resolve(root, "src/index.ts"),
-  "utf8",
-);
+const uberPostSource = await readFile(resolve(root, "src/rendering/post/AdvUrpUberPost.ts"), "utf8");
+const publicEntrySource = await readFile(resolve(root, "src/index.ts"), "utf8");
 if (
-  !uberPostSource.includes("resolveAdvFilmGrainTextureBinding") ||
-  !sourceText.includes('haneoka.renderer-three/film-grain')
+  !(
+    uberPostSource.includes("resolveAdvFilmGrainTextureBinding") ||
+    uberPostSource.includes("advFilmGrainTextureReference")
+  ) ||
+  !sourceText.includes("haneoka.renderer-three/film-grain")
 ) {
   fail("film-grain built-ins must resolve through stable host asset requests");
 }

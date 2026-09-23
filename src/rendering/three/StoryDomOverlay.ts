@@ -1,20 +1,8 @@
-import type {
-  AdvFrameEntry,
-  AdvVideoEntry,
-} from "@haneoka/vega/renderer-kit";
-import { computeAdvFrameBandLayout } from "@haneoka/vega/renderer-kit";
-import { AdvRainFrameRenderer } from "./AdvRainFrameRenderer";
+import type { AdvFrameEntry, AdvVideoEntry, StoryFrameLayoutProvider } from "@haneoka/vega/renderer-kit";
+import type { WebGLRenderer } from "three";
+import type { AdvRainFrameSnapshot } from "./AdvRainFrameRenderer";
+import { AdvCanvasPass, type CanvasTextureLoader } from "./AdvCanvasPass";
 import { videoAbortError, waitForVideo } from "./AdvVideoWait";
-
-interface FrameDomEntry {
-  readonly root: HTMLDivElement;
-  readonly image: HTMLImageElement | null;
-  readonly topBand: HTMLDivElement | null;
-  readonly bottomBand: HTMLDivElement | null;
-  readonly rain: AdvRainFrameRenderer | null;
-  readonly frame: AdvFrameEntry;
-  slide: number;
-}
 
 function absoluteLayer(zIndex: number): HTMLDivElement {
   const element = document.createElement("div");
@@ -28,53 +16,19 @@ function absoluteLayer(zIndex: number): HTMLDivElement {
   return element;
 }
 
-function imageLayer(): HTMLImageElement {
-  const image = document.createElement("img");
-  image.decoding = "async";
-  image.draggable = false;
-  Object.assign(image.style, {
-    width: "100%",
-    height: "100%",
-    display: "block",
-    objectFit: "cover",
-    userSelect: "none",
-  });
-  return image;
-}
-
-function frameTexture(frame: AdvFrameEntry): string {
-  if (frame.texture) return frame.texture;
-  const textures = Object.values(frame.textures || {}).filter(Boolean);
-  return String(textures[0] || frame.elements?.[0]?.texture || frame.edges?.[0]?.texture || "");
-}
-
-function frameKind(frame: AdvFrameEntry): string {
-  return String(frame.type || frame.name || frame.source || "").toLowerCase();
-}
-
-/** DOM-only Unity canvas layers rendered after the camera target. */
+/** Media lifecycle and screen-space canvas composition. */
 export class StoryDomOverlay {
   readonly root = absoluteLayer(20);
-  readonly stillLayer = absoluteLayer(30);
-  readonly videoLayer = absoluteLayer(28);
-  readonly effectLayer = absoluteLayer(40);
-  readonly frameLayer = absoluteLayer(50);
-  // UIAdvWidget's FrontCanvas (sorting order 304) child order starts with
-  // FlashView and RuleTransition, then LocationView, curtains and safe-area UI.
-  // These internal values preserve that first pair's order; StoryPlayerFull's
-  // canvas-host stacking context keeps the whole root below the sibling DOM
-  // implementation of the later FrontCanvas UI children.
-  readonly flashLayer = absoluteLayer(55);
-  readonly coverLayer = absoluteLayer(56);
   readonly ruleTransitionLayer = absoluteLayer(60);
-
-  private readonly stillBackground = absoluteLayer(0);
-  private readonly stillImage = imageLayer();
-  private readonly stillShade = absoluteLayer(2);
-  private readonly frames = new Map<string, FrameDomEntry>();
+  private readonly videoLayer = absoluteLayer(28);
+  readonly canvasPass: AdvCanvasPass;
+  private animationIndex = 0;
   private video: HTMLVideoElement | null = null;
   private videoLoadController: AbortController | null = null;
   private readonly videoWaiters = new Set<() => void>();
+  private readonly preloadedVideos = new Map<string, HTMLVideoElement>();
+  private readonly videoPreloadPromises = new Map<string, Promise<void>>();
+  private readonly episodeVideoSources = new Set<string>();
   private destroyed = false;
   private readonly mount: HTMLElement;
   private viewportX = 0;
@@ -84,182 +38,123 @@ export class StoryDomOverlay {
   private offsetX = 0;
   private offsetY = 0;
 
-  constructor(mount: HTMLElement) {
+  constructor(
+    mount: HTMLElement,
+    renderer: WebGLRenderer,
+    loadTexture: CanvasTextureLoader,
+    layouts?: StoryFrameLayoutProvider,
+  ) {
     this.mount = mount;
+    this.canvasPass = new AdvCanvasPass(renderer, loadTexture, layouts);
     this.root.className = "adv-three-overlay";
-    // The canvas host already supplies the Unity Canvas-order stacking
-    // boundary. Keeping these two wrappers out of the stacking-context chain
-    // lets an additive frame blend against the Three canvas instead of an
-    // isolated transparent group.
-    this.root.style.zIndex = "auto";
-    this.frameLayer.style.zIndex = "auto";
-    this.stillBackground.style.background = "#000000";
-    this.stillBackground.style.opacity = "0";
-    // AdvStillView renders its background behind the Still sprite and its
-    // shade overlay in front.  A plain in-flow <img> is painted underneath a
-    // positioned z-index:0 sibling, which made an opaque Still background
-    // cover the authored sprite entirely.
-    Object.assign(this.stillImage.style, {
-      position: "absolute",
-      inset: "0",
-      zIndex: "1",
-    });
-    this.stillImage.style.opacity = "0";
-    this.stillShade.style.background = "#000000";
-    this.stillShade.style.opacity = "0";
-    this.stillLayer.append(this.stillBackground, this.stillImage, this.stillShade);
-    this.coverLayer.style.opacity = "0";
-    this.coverLayer.style.visibility = "hidden";
-    this.flashLayer.style.opacity = "0";
-    this.flashLayer.style.visibility = "hidden";
-    this.root.append(
-      this.videoLayer,
-      this.stillLayer,
-      this.effectLayer,
-      this.frameLayer,
-      this.flashLayer,
-      this.coverLayer,
-      this.ruleTransitionLayer,
-    );
-    const position = getComputedStyle(this.mount).position;
-    if (position === "static") this.mount.style.position = "relative";
-    this.mount.appendChild(this.root);
+    this.videoLayer.style.display = "none";
+    this.root.append(this.videoLayer, this.ruleTransitionLayer);
+    if (getComputedStyle(mount).position === "static") mount.style.position = "relative";
+    mount.appendChild(this.root);
   }
-
-  setStill(source: string, alpha: number): void {
-    if (source && this.stillImage.src !== new URL(source, location.href).href) this.stillImage.src = source;
-    if (!source) this.stillImage.removeAttribute("src");
-    this.setStillAlpha(source ? alpha : 0);
+  setStill(source: string, alpha: number): Promise<void> {
+    return this.canvasPass.setStill(source, alpha);
   }
-
   setStillAlpha(alpha: number): void {
-    this.stillImage.style.opacity = String(clamp(alpha));
+    this.canvasPass.setStillAlpha(alpha);
   }
-
   get stillAlpha(): number {
-    return clamp(this.stillImage.style.opacity);
+    return this.canvasPass.stillAlpha;
   }
-
-  setStillViewAlpha(backgroundAlpha: number, overlayAlpha: number): void {
-    this.stillBackground.style.opacity = String(clamp(backgroundAlpha));
-    this.stillShade.style.opacity = String(clamp(overlayAlpha));
+  setStillViewAlpha(background: number, shade: number): void {
+    this.canvasPass.setStillViewAlpha(background, shade);
   }
-
   get stillBackgroundAlpha(): number {
-    return clamp(this.stillBackground.style.opacity);
+    return this.canvasPass.stillBackgroundAlpha;
   }
-
   get stillOverlayAlpha(): number {
-    return clamp(this.stillShade.style.opacity);
+    return this.canvasPass.stillOverlayAlpha;
   }
-
   setStillAnimationIndex(index: number): void {
-    this.stillImage.dataset.advAnimationIndex = String(Math.max(0, Math.trunc(Number(index) || 0)));
+    this.animationIndex = Math.max(0, Math.trunc(Number(index) || 0));
   }
-
   get stillAnimationIndex(): number {
-    return Math.max(0, Math.trunc(Number(this.stillImage.dataset.advAnimationIndex) || 0));
+    return this.animationIndex;
   }
-
   setCover(color: string, opacity: number): void {
-    const alpha = clamp(opacity);
-    this.coverLayer.style.background = color || "#000000";
-    this.coverLayer.style.opacity = String(alpha);
-    // Mobile Safari occasionally keeps a transparent composited layer painted
-    // over WebGL after rapid white no-wait transitions. Removing the fully
-    // transparent layer from painting makes the terminal state unambiguous.
-    this.coverLayer.style.visibility = alpha > 0 ? "visible" : "hidden";
+    this.canvasPass.setCover(color || "#000000", clamp(opacity));
   }
-
   setFlash(opacity: number): void {
-    const alpha = clamp(opacity);
-    this.flashLayer.style.background = "#ffffff";
-    this.flashLayer.style.opacity = String(alpha);
-    this.flashLayer.style.visibility = alpha > 0 ? "visible" : "hidden";
+    this.canvasPass.setFlash(clamp(opacity));
   }
-
-  async setFrame(key: string, frame: AdvFrameEntry, alpha: number): Promise<void> {
-    this.clearFrame(key);
-    const root = absoluteLayer(50);
-    const texture = frameTexture(frame);
-    const kind = frameKind(frame);
-    let image: HTMLImageElement | null = null;
-    let topBand: HTMLDivElement | null = null;
-    let bottomBand: HTMLDivElement | null = null;
-    let rain: AdvRainFrameRenderer | null = null;
-    if (kind.includes("rain")) {
-      rain = new AdvRainFrameRenderer(frame);
-      // This root is the final compositing group against the Three canvas.
-      // Mobile/Particles/Additive is Blend SrcAlpha One, so source black must
-      // contribute zero even while the Frame CanvasGroup is fading.
-      root.style.mixBlendMode = "plus-lighter";
-      root.appendChild(rain.element);
-    } else if (kind.includes("letterbox") || kind.includes("cinema")) {
-      topBand = absoluteLayer(0);
-      bottomBand = absoluteLayer(0);
-      root.append(topBand, bottomBand);
-    } else if (kind.includes("pillarbox")) {
-      const left = absoluteLayer(0);
-      const right = absoluteLayer(0);
-      Object.assign(left.style, { inset: "0 auto 0 0", width: "10%", background: "#000" });
-      Object.assign(right.style, { inset: "0 0 0 auto", width: "10%", background: "#000" });
-      root.append(left, right);
-    } else if (texture) {
-      image = imageLayer();
-      image.src = texture;
-      root.appendChild(image);
-    } else {
-      root.style.background = String(frame.color || "#000000");
-    }
-    root.style.opacity = String(rain ? 0 : clamp(alpha));
-    this.frameLayer.appendChild(root);
-    const entry = { root, image, topBand, bottomBand, rain, frame, slide: 0 };
-    this.frames.set(key, entry);
-    this.layoutFrame(entry);
-    await rain?.ready;
-    if (rain && this.frames.get(key) === entry) root.style.opacity = String(clamp(alpha));
+  setFrame(key: string, frame: AdvFrameEntry, alpha: number): Promise<void> {
+    return this.canvasPass.setFrame(key, frame, alpha);
   }
-
+  setFrameParticlesPaused(paused: boolean): void {
+    this.canvasPass.setFrameParticlesPaused(paused);
+  }
+  snapshotFrameParticles(): Readonly<Record<string, AdvRainFrameSnapshot>> {
+    return this.canvasPass.snapshotFrameParticles();
+  }
+  restoreFrameParticles(snapshots: Readonly<Record<string, AdvRainFrameSnapshot>>): void {
+    this.canvasPass.restoreFrameParticles(snapshots);
+  }
   setFrameOpacity(key: string, alpha: number, slide = 0): void {
-    const entry = this.frames.get(key);
-    if (!entry) return;
-    entry.slide = Number.isFinite(slide) ? slide : 0;
-    entry.root.style.opacity = String(clamp(alpha));
-    this.layoutFrame(entry);
+    this.canvasPass.setFrameOpacity(key, alpha, slide);
+  }
+  clearFrame(key?: string): void {
+    this.canvasPass.clearFrame(key);
+  }
+  update(deltaSeconds: number): void {
+    this.canvasPass.update(deltaSeconds);
+  }
+  render(): void {
+    this.canvasPass.render();
   }
 
-  clearFrame(key?: string): void {
-    if (key) {
-      const entry = this.frames.get(key);
-      entry?.rain?.destroy();
-      entry?.root.remove();
-      this.frames.delete(key);
+  async preloadVideo(source: string, playableUrl: string, signal?: AbortSignal): Promise<void> {
+    if (this.destroyed) throw videoAbortError("Story overlay was destroyed");
+    if (!source) return;
+    this.episodeVideoSources.add(source);
+    const resident = this.preloadedVideos.get(source);
+    if (resident && resident.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
       return;
     }
-    for (const entry of this.frames.values()) {
-      entry.rain?.destroy();
-      entry.root.remove();
-    }
-    this.frames.clear();
+    const pending = this.videoPreloadPromises.get(source);
+    if (pending) return pending;
+    if (resident) this.releaseVideoElement(resident);
+    const video = document.createElement("video");
+    video.src = playableUrl;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.autoplay = false;
+    video.controls = false;
+    video.muted = true;
+    video.volume = 0;
+    video.dataset.vegaSource = source;
+    this.preloadedVideos.set(source, video);
+    const preload = (async () => {
+      video.load();
+      await waitForVideo(video, "loadeddata", signal, HTMLMediaElement.HAVE_CURRENT_DATA);
+      await waitForVideo(video, "canplay", signal, HTMLMediaElement.HAVE_FUTURE_DATA);
+    })()
+      .catch((error) => {
+        if (this.preloadedVideos.get(source) === video) {
+          this.preloadedVideos.delete(source);
+        }
+        this.releaseVideoElement(video);
+        throw error;
+      })
+      .finally(() => {
+        if (this.videoPreloadPromises.get(source) === preload) {
+          this.videoPreloadPromises.delete(source);
+        }
+      });
+    this.videoPreloadPromises.set(source, preload);
+    await preload;
   }
 
-  setEffect(source: string, enabled: boolean): void {
-    this.effectLayer.replaceChildren();
-    if (!enabled) return;
-    const layer = absoluteLayer(0);
-    layer.className = "adv-three-command-effect";
-    if (source) layer.style.backgroundImage = `url(${JSON.stringify(source).slice(1, -1)})`;
-    Object.assign(layer.style, {
-      backgroundPosition: "center",
-      backgroundRepeat: "no-repeat",
-      backgroundSize: "cover",
-      mixBlendMode: "screen",
-      opacity: "0.7",
-    });
-    this.effectLayer.appendChild(layer);
-  }
-
-  async showVideo(info: AdvVideoEntry | string, playbackRate: number, signal?: AbortSignal): Promise<HTMLVideoElement> {
+  async showVideo(
+    info: AdvVideoEntry | string,
+    playbackRate: number,
+    signal?: AbortSignal,
+    playableUrl?: string,
+  ): Promise<HTMLVideoElement> {
     if (this.destroyed) throw videoAbortError("Story overlay was destroyed");
     this.clearVideo();
     const loadController = new AbortController();
@@ -268,12 +163,17 @@ export class StoryDomOverlay {
     else signal?.addEventListener("abort", abortLoad, { once: true });
     this.videoLoadController = loadController;
     const source = typeof info === "string" ? info : String(info.playableUrl || info.src || info.url || "");
-    const video = document.createElement("video");
-    video.src = source;
+    const prepared = this.preloadedVideos.get(source);
+    const video = prepared || document.createElement("video");
+    this.preloadedVideos.delete(source);
+    if (!prepared) video.src = playableUrl || source;
+    video.dataset.vegaSource = source;
     video.playsInline = true;
     video.preload = "auto";
     video.autoplay = false;
     video.controls = false;
+    video.muted = false;
+    video.volume = 1;
     video.playbackRate = Math.max(0.1, Number(playbackRate) || 1);
     Object.assign(video.style, {
       width: "100%",
@@ -289,6 +189,7 @@ export class StoryDomOverlay {
       if (this.destroyed || this.video !== video || loadController.signal.aborted) {
         throw videoAbortError("Video load was cancelled");
       }
+      this.canvasPass.setVideo(video);
       await video.play();
       if (this.destroyed || this.video !== video || loadController.signal.aborted) {
         throw videoAbortError("Video playback was cancelled");
@@ -306,7 +207,7 @@ export class StoryDomOverlay {
   }
 
   setVideoAlpha(alpha: number): void {
-    this.videoLayer.style.opacity = String(clamp(alpha));
+    this.canvasPass.setVideoAlpha(clamp(alpha));
   }
 
   get videoElement(): HTMLVideoElement | null {
@@ -339,13 +240,24 @@ export class StoryDomOverlay {
   }
 
   clearVideo(): void {
+    this.canvasPass.setVideo(null);
     this.videoLoadController?.abort();
     this.videoLoadController = null;
     for (const settle of [...this.videoWaiters]) settle();
     if (this.video) {
       this.video.pause();
-      this.video.removeAttribute("src");
-      this.video.load();
+      const source = this.video.dataset.vegaSource || "";
+      this.video.remove();
+      if (!this.destroyed && source && this.episodeVideoSources.has(source)) {
+        try {
+          this.video.currentTime = 0;
+        } catch {}
+        this.video.muted = true;
+        this.video.volume = 0;
+        this.preloadedVideos.set(source, this.video);
+      } else {
+        this.releaseVideoElement(this.video);
+      }
     }
     this.video = null;
     this.videoLayer.replaceChildren();
@@ -356,12 +268,13 @@ export class StoryDomOverlay {
     this.offsetX = Number.isFinite(x) ? x : 0;
     this.offsetY = Number.isFinite(y) ? y : 0;
     this.layoutRoot();
+    this.canvasPass.setOffset(this.offsetX, this.offsetY);
   }
 
   setStillOffset(x: number, y: number): void {
     const offsetX = Number.isFinite(x) ? x : 0;
     const offsetY = Number.isFinite(y) ? y : 0;
-    this.stillLayer.style.transform = `translate3d(${offsetX}px, ${offsetY}px, 0)`;
+    this.canvasPass.setStillOffset(offsetX, offsetY);
   }
 
   setViewport(x: number, y: number, width: number, height: number): void {
@@ -375,7 +288,7 @@ export class StoryDomOverlay {
       height: `${height}px`,
     });
     this.layoutRoot();
-    for (const entry of this.frames.values()) this.layoutFrame(entry);
+    this.canvasPass.setViewport(width, height);
   }
 
   private layoutRoot(): void {
@@ -386,30 +299,26 @@ export class StoryDomOverlay {
     this.root.style.top = `${this.viewportY + this.offsetY}px`;
   }
 
-  private layoutFrame(entry: FrameDomEntry): void {
-    entry.rain?.setViewport(this.viewportWidth, this.viewportHeight);
-    if (!entry.topBand || !entry.bottomBand) return;
-    const layout = computeAdvFrameBandLayout(entry.frame, this.viewportWidth, entry.slide);
-    Object.assign(entry.topBand.style, {
-      inset: "0 0 auto",
-      height: `${layout.bandHeight}px`,
-      background: layout.color,
-      transform: `translate3d(0, ${layout.topOffset}px, 0)`,
-    });
-    Object.assign(entry.bottomBand.style, {
-      inset: "auto 0 0",
-      height: `${layout.bandHeight}px`,
-      background: layout.color,
-      transform: `translate3d(0, ${layout.bottomOffset}px, 0)`,
-    });
-  }
-
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
     this.clearVideo();
+    for (const video of this.preloadedVideos.values()) {
+      this.releaseVideoElement(video);
+    }
+    this.preloadedVideos.clear();
+    this.videoPreloadPromises.clear();
+    this.episodeVideoSources.clear();
     this.clearFrame();
+    this.canvasPass.dispose();
     this.root.remove();
+  }
+
+  private releaseVideoElement(video: HTMLVideoElement): void {
+    video.pause();
+    video.remove();
+    video.removeAttribute("src");
+    video.load();
   }
 }
 

@@ -328,6 +328,11 @@ export class AdvMotionBlur {
     this.cameraMotionTarget.texture.generateMipmaps = false;
   }
 
+  resetHistory(): void {
+    this.hasPreviousViewProjection = false;
+    this.previousCameraUuid = "";
+  }
+
   render(
     source: WebGLRenderTarget,
     destination: WebGLRenderTarget,
@@ -339,11 +344,24 @@ export class AdvMotionBlur {
     const pass = advMotionBlurPass(settings.mode, settings.quality);
     const mode = Math.trunc(settings.mode);
     const needsMotionBlur = settings.active && settings.intensity > 0 && pass !== null;
+    if (!needsMotionBlur) {
+      // Do not carry an old camera transform across an inactive interval. The
+      // first enabled frame initializes current == previous and produces no
+      // stale full-screen velocity spike.
+      this.hasPreviousViewProjection = false;
+      this.previousCameraUuid = "";
+      return false;
+    }
     const needsCameraTexture = needsMotionBlur && mode === 1 && motionVectors === null;
-    const cameraMotionVectors = camera
-      ? this.updateCameraMotionVectors(camera, source.width, source.height, renderFullscreen, needsCameraTexture)
-      : null;
-    if (!needsMotionBlur) return false;
+    const needsCameraMotion = mode === 0 || motionVectors === null;
+    if (!needsCameraMotion || !camera) {
+      this.hasPreviousViewProjection = false;
+      this.previousCameraUuid = "";
+    }
+    const cameraMotionVectors =
+      camera && needsCameraMotion
+        ? this.updateCameraMotionVectors(camera, source.width, source.height, renderFullscreen, needsCameraTexture)
+        : null;
     source.texture.minFilter = NearestFilter;
     source.texture.magFilter = NearestFilter;
     source.texture.colorSpace = NoColorSpace;

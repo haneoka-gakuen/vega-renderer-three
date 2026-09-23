@@ -1,8 +1,5 @@
 import { Color, Texture } from "three";
-import type {
-  UnityAnimationCurve,
-  UnityAnimationCurveKeyframe,
-} from "@haneoka/vega/renderer-kit";
+import type { UnityAnimationCurve, UnityAnimationCurveKeyframe } from "@haneoka/vega/renderer-kit";
 
 const WEIGHTED_IN = 1;
 const WEIGHTED_OUT = 2;

@@ -1,8 +1,5 @@
 import { Object3D, Vector3 } from "three";
-import type {
-  StoryPoint2 as Vec2,
-  StoryPoint3 as Vec3,
-} from "@haneoka/vega/renderer-kit";
+import type { StoryPoint2 as Vec2, StoryPoint3 as Vec3 } from "@haneoka/vega/renderer-kit";
 
 function finite(value: unknown): number {
   const numeric = Number(value);

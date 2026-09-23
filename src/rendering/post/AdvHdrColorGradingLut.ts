@@ -89,10 +89,7 @@ type HdrUniforms = Record<string, IUniform<unknown>> & {
   uLutParams: IUniform<{ readonly x: number; readonly y: number; readonly z: number; readonly w: number }>;
 };
 
-export const advHdrToneMap = (
-  value: number,
-  mode: number,
-): number => {
+export const advHdrToneMap = (value: number, mode: number): number => {
   const color = Math.max(0, Number.isFinite(value) ? value : 0);
   if (Math.trunc(mode) >= 2) {
     const shaped = (color * (1 + color * 0.12)) / (1 + color * 0.02);
@@ -144,14 +141,9 @@ export class AdvHdrColorGradingLut {
     this.target.texture.generateMipmaps = false;
   }
 
-  render(
-    state: Readonly<AdvUrpVolumeState>,
-    renderFullscreen: AdvRenderFullscreen,
-  ): Texture {
+  render(state: Readonly<AdvUrpVolumeState>, renderFullscreen: AdvRenderFullscreen): Texture {
     const ldrTexture = this.ldr.render(state, renderFullscreen);
-    const toneMode = state.tonemapping.active
-      ? Math.trunc(state.tonemapping.mode)
-      : 0;
+    const toneMode = state.tonemapping.active ? Math.trunc(state.tonemapping.mode) : 0;
     if (state === this.lastState && toneMode === this.lastToneMode) {
       return this.target.texture;
     }

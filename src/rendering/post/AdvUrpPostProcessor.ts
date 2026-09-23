@@ -18,9 +18,8 @@ import {
 
 export type AdvColorGradingPipelineMode = "ldr" | "hdr";
 
-export const normalizeAdvColorGradingPipelineMode = (
-  mode: unknown,
-): AdvColorGradingPipelineMode => (mode === "hdr" ? "hdr" : "ldr");
+export const normalizeAdvColorGradingPipelineMode = (mode: unknown): AdvColorGradingPipelineMode =>
+  mode === "hdr" ? "hdr" : "ldr";
 
 export interface AdvUrpPostProcessorOptions {
   readonly resolveTexture?: AdvPostTextureResolver;
@@ -60,6 +59,10 @@ export class AdvUrpPostProcessor {
 
   setColorGradingMode(mode: AdvColorGradingPipelineMode): void {
     this.colorGradingMode = normalizeAdvColorGradingPipelineMode(mode);
+  }
+
+  resetTemporalHistory(): void {
+    this.motionBlur.resetHistory();
   }
 
   render(

@@ -34,15 +34,8 @@ import {
   ZeroFactor,
 } from "three";
 import type { BlendingDstFactor, BlendingSrcFactor, Side } from "three";
-import type {
-  StoryResourceResolver,
-} from "@haneoka/vega/renderer-kit";
-import {
-  unityEulerDegrees,
-  unityQuaternion,
-  unityScale,
-  unityVector3,
-} from "../three/UnityTransform";
+import type { StoryResourceResolver } from "@haneoka/vega/renderer-kit";
+import { unityEulerDegrees, unityQuaternion, unityScale, unityVector3 } from "../three/UnityTransform";
 import {
   evaluateUnityStreamedCurve,
   multiplyUnityColors,
@@ -121,9 +114,9 @@ vec3 rotateUnityZXY(vec3 threeValue, vec3 radians) {
   float de = d * e;
   float df = d * f;
   mat3 unityZXY = mat3(
-    ce - df * b, cf + de * b, -a * d,
-    -a * f, a * e, b,
-    de + cf * b, df - ce * b, a * c
+    ce + df * b, a * f, -de + cf * b,
+    -cf + de * b, a * e, df + ce * b,
+    a * d, -b, a * c
   );
   vec3 unityValue = vec3(threeValue.x, threeValue.y, -threeValue.z);
   vec3 rotated = unityZXY * unityValue;
@@ -220,9 +213,7 @@ const whiteTexture = new DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1)
 whiteTexture.colorSpace = NoColorSpace;
 whiteTexture.needsUpdate = true;
 
-const createParticleTextureCache = (
-  resources?: StoryResourceResolver,
-): SharedAsyncResourceCache<string, Texture> =>
+const createParticleTextureCache = (resources?: StoryResourceResolver): SharedAsyncResourceCache<string, Texture> =>
   new SharedAsyncResourceCache<string, Texture>(
     async (url) => {
       const texture = new Texture(await loadRendererImage(url, resources));
@@ -236,14 +227,9 @@ const createParticleTextureCache = (
   );
 
 const directTextureCache = createParticleTextureCache();
-const resolverTextureCaches = new WeakMap<
-  StoryResourceResolver,
-  SharedAsyncResourceCache<string, Texture>
->();
+const resolverTextureCaches = new WeakMap<StoryResourceResolver, SharedAsyncResourceCache<string, Texture>>();
 
-const particleTextureCacheFor = (
-  resources?: StoryResourceResolver,
-): SharedAsyncResourceCache<string, Texture> => {
+const particleTextureCacheFor = (resources?: StoryResourceResolver): SharedAsyncResourceCache<string, Texture> => {
   if (!resources) return directTextureCache;
   let cache = resolverTextureCaches.get(resources);
   if (!cache) {
@@ -268,7 +254,10 @@ async function loadTexture(
   const pending = particleTextureCacheFor(resources).acquire(url);
   if (!signal) return pending;
   if (signal.aborted) {
-    void pending.then((lease) => lease.release(), () => undefined);
+    void pending.then(
+      (lease) => lease.release(),
+      () => undefined,
+    );
     throw particleAbortError(url, signal);
   }
   return new Promise<SharedResourceLease<Texture>>((resolve, reject) => {
@@ -279,8 +268,7 @@ async function loadTexture(
       signal.removeEventListener("abort", abort);
       callback();
     };
-    const abort = (): void =>
-      finish(() => reject(particleAbortError(url, signal)));
+    const abort = (): void => finish(() => reject(particleAbortError(url, signal)));
     signal.addEventListener("abort", abort, { once: true });
     pending.then(
       (lease) => {
@@ -653,9 +641,7 @@ class UnityParticleSystemView {
   ): Promise<UnityParticleSystemView> {
     const material = renderer.material;
     const url = material?.textureUrl;
-    const textureLease = url
-      ? await loadTexture(url, resources, signal).catch(() => null)
-      : null;
+    const textureLease = url ? await loadTexture(url, resources, signal).catch(() => null) : null;
     return new UnityParticleSystemView(
       definition,
       renderer,
@@ -1329,10 +1315,9 @@ export class UnityParticleEffect {
       ...new Set(asset.animations.flatMap((clip) => clip.pptrTextures).filter((url): url is string => Boolean(url))),
     ];
     const animationTextureEntries = await Promise.all(
-      animationTextureUrls.map(async (url) => [
-        url,
-        await loadTexture(url, resources, signal).catch(() => null),
-      ] as const),
+      animationTextureUrls.map(
+        async (url) => [url, await loadTexture(url, resources, signal).catch(() => null)] as const,
+      ),
     );
     const animationTextures = new Map(
       animationTextureEntries.map(([url, lease]) => [url, lease?.value ?? whiteTexture] as const),
@@ -1346,9 +1331,7 @@ export class UnityParticleEffect {
         if (!node || !renderer.enabled) return null;
         const url =
           renderer.sprite?.textureUrl || asset.animations.flatMap((clip) => clip.pptrTextures).find(Boolean) || null;
-        const textureLease = url
-          ? await loadTexture(url, resources, signal).catch(() => null)
-          : null;
+        const textureLease = url ? await loadTexture(url, resources, signal).catch(() => null) : null;
         const map = textureLease?.value ?? whiteTexture;
         const width =
           renderer.sprite?.rect.width && renderer.sprite.pixelsToUnits
@@ -1419,11 +1402,7 @@ export class UnityParticleEffect {
         if (!node || !renderer.enabled) return null;
         const definition = asset.materials.find((entry) => entry.id === renderer.materialId) || null;
         const textureLease = definition?.textureUrl
-          ? await loadTexture(
-              definition.textureUrl,
-              resources,
-              signal,
-            ).catch(() => null)
+          ? await loadTexture(definition.textureUrl, resources, signal).catch(() => null)
           : null;
         const map = textureLease?.value ?? null;
         const baseColor = color(definition?.properties.colors._BaseColor ?? definition?.properties.colors._Color);
@@ -1610,11 +1589,13 @@ export class UnityParticleEffectController {
   private readonly signal?: AbortSignal;
   private readonly onNaturalComplete?: (key: string) => void;
 
-  constructor(options: {
-    readonly resources?: StoryResourceResolver;
-    readonly signal?: AbortSignal;
-    readonly onNaturalComplete?: (key: string) => void;
-  } = {}) {
+  constructor(
+    options: {
+      readonly resources?: StoryResourceResolver;
+      readonly signal?: AbortSignal;
+      readonly onNaturalComplete?: (key: string) => void;
+    } = {},
+  ) {
     this.resources = options.resources;
     this.signal = options.signal;
     this.onNaturalComplete = options.onNaturalComplete;
@@ -1631,12 +1612,7 @@ export class UnityParticleEffectController {
     this.pending.add(key);
     let effect: UnityParticleEffect;
     if (this.signal?.aborted) throw particleAbortError(asset.source, this.signal);
-    const creation = UnityParticleEffect.create(
-      asset,
-      hashSeed(`${key}:${asset.source}`),
-      this.resources,
-      this.signal,
-    );
+    const creation = UnityParticleEffect.create(asset, hashSeed(`${key}:${asset.source}`), this.resources, this.signal);
     this.creations.set(key, creation);
     try {
       effect = await creation;

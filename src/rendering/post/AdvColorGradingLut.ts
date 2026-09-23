@@ -370,10 +370,7 @@ export class AdvColorGradingLut {
       return this.target.texture;
     }
 
-    const balance = advColorBalanceLms(
-      state.whiteBalance.temperature,
-      state.whiteBalance.tint,
-    );
+    const balance = advColorBalanceLms(state.whiteBalance.temperature, state.whiteBalance.tint);
     this.uniforms.uColorBalance.value.set(...balance);
     const linearFilter = advLinearColor(state.colorAdjustments.colorFilter);
     this.uniforms.uColorFilter.value.set(linearFilter[0], linearFilter[1], linearFilter[2]);

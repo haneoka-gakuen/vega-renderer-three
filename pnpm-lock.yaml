@@ -20,6 +20,9 @@ importers:
       howler:
         specifier: 2.2.4
         version: 2.2.4
+      prettier:
+        specifier: 3.7.4
+        version: 3.7.4
       three:
         specifier: 0.184.0
         version: 0.184.0
@@ -56,6 +59,11 @@ packages:
   meshoptimizer@1.1.1:
     resolution: {integrity: sha512-oRFNWJRDA/WTrVj7NWvqa5HqE1t9MYDj2VaWirQCzCCrAd2GHrqR/sQezCxiWATPNlKTcRaPRHPJwIRoPBAp5g==}
 
+  prettier@3.7.4:
+    resolution: {integrity: sha512-v6UNi1+3hSlVvv8fSaoUbggEM5VErKmmpGA7Pl3HF8V6uKY7rvClBOJlH6yNwQtfTueNkGVpOv/mtWL9L4bgRA==}
+    engines: {node: '>=14'}
+    hasBin: true
+
   three@0.184.0:
     resolution: {integrity: sha512-wtTRjG92pM5eUg/KuUnHsqSAlPM296brTOcLgMRqEeylYTh/CdtvKUvCyyCQTzFuStieWxvZb8mVTMvdPyUpxg==}
 
@@ -90,6 +98,8 @@ snapshots:
   howler@2.2.4: {}
 
   meshoptimizer@1.1.1: {}
+
+  prettier@3.7.4: {}
 
   three@0.184.0: {}
 

@@ -19,10 +19,7 @@ function clamp(value: number, min = 0, max = 1): number {
 }
 
 /** Reads the decoded voice immediately behind the Howl playhead. */
-function pcmWindowRms(
-  source: AdvVoicePcmSnapshot | null,
-  windowSeconds = 0.025,
-): number {
+function pcmWindowRms(source: AdvVoicePcmSnapshot | null, windowSeconds = 0.025): number {
   if (!source?.channelData?.length) return 0;
   const end = Math.max(0, Math.min(source.channelData.length, Math.trunc(finite(source.samplePosition))));
   const sampleCount = Math.max(1, Math.trunc(Math.max(1, finite(source.sampleRate)) * windowSeconds));

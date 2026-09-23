@@ -74,10 +74,7 @@ export {
   type AdvFieldTargetFormat,
   type AdvFieldTargetPrecision,
 } from "./rendering/three/AdvFieldTargetFormat";
-export {
-  computeAdvCharacterHeadWorldPosition,
-  computeAdvLookTarget,
-} from "./rendering/three/AdvLookTarget";
+export { computeAdvCharacterHeadWorldPosition, computeAdvLookTarget } from "./rendering/three/AdvLookTarget";
 export {
   createUnityAdvViewport,
   FULL_UNITY_VIEWPORT,
@@ -89,10 +86,7 @@ export { UnityTargetFrameClock } from "./rendering/three/UnityTargetFrameClock";
 export * from "./rendering/three/UnityTransform";
 export * from "./rendering/three/PendingCharacterCommands";
 export { AdvRainFrameRenderer } from "./rendering/three/AdvRainFrameRenderer";
-export {
-  videoAbortError,
-  waitForVideo,
-} from "./rendering/three/AdvVideoWait";
+export { videoAbortError, waitForVideo } from "./rendering/three/AdvVideoWait";
 export { StoryDomOverlay } from "./rendering/three/StoryDomOverlay";
 export * from "./rendering/three/SharedTextureResourceCache";
 export * from "./rendering/three/StorySceneSnapshot";
@@ -103,9 +97,7 @@ export type { AdvColorGradingPipelineMode } from "./rendering/post/AdvUrpPostPro
 export interface ThreeRendererPluginOptions extends ThreeStorySceneOptions {
   readonly contributionId?: string;
   readonly contributionName?: string;
-  readonly backend?:
-    | typeof VEGA_THREE_RENDERER_ID
-    | typeof LEGACY_HANEOKA_THREE_RENDERER_ID;
+  readonly backend?: typeof VEGA_THREE_RENDERER_ID | typeof LEGACY_HANEOKA_THREE_RENDERER_ID;
   /**
    * Plugin-scoped resolver registered as a typed Vega service. If it exposes
    * `dispose`, the plugin lifetime owns it.
@@ -124,13 +116,9 @@ export const createThreeStorySceneBackend = (
   options: ThreeStorySceneOptions = {},
 ): StorySceneBackend => new ThreeStoryScene(context, options);
 
-export const createThreeRendererPlugin = (
-  options: ThreeRendererPluginOptions = {},
-): VegaPlugin => {
+export const createThreeRendererPlugin = (options: ThreeRendererPluginOptions = {}): VegaPlugin => {
   if (options.postTextureResolver && options.postTextureAssets) {
-    throw new TypeError(
-      "Choose postTextureResolver or postTextureAssets, not both",
-    );
+    throw new TypeError("Choose postTextureResolver or postTextureAssets, not both");
   }
   return defineVegaPlugin({
     manifest: {
@@ -150,14 +138,9 @@ export const createThreeRendererPlugin = (
             })
           : undefined);
       if (postTextureResolver) {
-        context.provide(
-          THREE_POST_TEXTURE_RESOLVER,
-          postTextureResolver,
-        );
+        context.provide(THREE_POST_TEXTURE_RESOLVER, postTextureResolver);
         if (postTextureResolver.dispose) {
-          context.lifetime.defer(() =>
-            postTextureResolver.dispose?.(),
-          );
+          context.lifetime.defer(() => postTextureResolver.dispose?.());
         }
       }
       context.contribute("render", {

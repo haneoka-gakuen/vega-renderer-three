@@ -1,15 +1,7 @@
-import type {
-  AdvVoicePcmSnapshot,
-  StoryCharacterRendererModel,
-} from "@haneoka/vega/renderer-kit";
+import type { AdvVoicePcmSnapshot, StoryCharacterRendererModel } from "@haneoka/vega/renderer-kit";
 import type { Matrix4 } from "three";
 
-export type ThreeCharacterMotionSyncStatus =
-  | "unconfigured"
-  | "loading"
-  | "ready"
-  | "failed"
-  | "released";
+export type ThreeCharacterMotionSyncStatus = "unconfigured" | "loading" | "ready" | "failed" | "released";
 
 export interface ThreeCharacterParameterBlend {
   readonly id: string;
@@ -46,17 +38,8 @@ export interface ThreeCharacterDrawState {
   readonly timeSeconds?: number;
 }
 
-export type ThreeRendererVec3 = readonly [
-  x: number,
-  y: number,
-  z: number,
-];
-export type ThreeRendererVec4 = readonly [
-  x: number,
-  y: number,
-  z: number,
-  w: number,
-];
+export type ThreeRendererVec3 = readonly [x: number, y: number, z: number];
+export type ThreeRendererVec4 = readonly [x: number, y: number, z: number, w: number];
 
 export interface ThreeRendererSphericalHarmonics {
   readonly ar: ThreeRendererVec4;
@@ -98,8 +81,7 @@ export interface ThreeRendererMultiplyTextureOptions {
  * Format plugins implement this contract through `createForRenderer`; the
  * renderer never imports or initializes their SDKs.
  */
-export interface ThreeStoryCharacterModel
-  extends StoryCharacterRendererModel {
+export interface ThreeStoryCharacterModel extends StoryCharacterRendererModel {
   readonly format: string;
   readonly modelUrl: string;
   readonly pixelsPerUnit: number;
@@ -124,6 +106,9 @@ export interface ThreeStoryCharacterModel
   drawableBounds(visibleOnly?: boolean): ThreeCharacterBounds | null;
   canvasBounds(): ThreeCharacterBounds;
   resetMotionSync(): void;
+  setClockSuspended?(suspended: boolean): void;
+  createSnapshot?(): unknown;
+  restoreSnapshot?(snapshot: unknown): void | Promise<void>;
 
   playMotion(name: string, fadeInSeconds?: number): boolean;
   playExpression(name: string, fadeInSeconds?: number): boolean;
@@ -136,15 +121,10 @@ export interface ThreeStoryCharacterModel
   prepareMotion(name: string): Promise<boolean>;
   prepareExpression(name: string): Promise<boolean>;
   isCurrentExpression(name: string): boolean;
-  refreshCurrentExpressionFadeIn(
-    name: string,
-    fadeInSeconds?: number,
-  ): void;
+  refreshCurrentExpressionFadeIn(name: string, fadeInSeconds?: number): void;
   primeInitialFrame(frame: ThreeCharacterParameterFrame): void;
   setParameter(id: string, value: number, weight?: number): void;
-  parameterRange(
-    id: string,
-  ): { readonly minimum: number; readonly maximum: number } | null;
+  parameterRange(id: string): { readonly minimum: number; readonly maximum: number } | null;
 
   eyeBallPosition(): { readonly x: number; readonly y: number };
   setEyeBallPosition(x: number, y: number): void;
@@ -161,18 +141,13 @@ export interface ThreeStoryCharacterModel
 
   /** Optional renderer-profile extensions; unsupported models simply ignore them. */
   setRendererLighting?(state: ThreeRendererLightState): void;
-  loadRendererMultiplyTexture?(
-    source: string,
-    options: ThreeRendererMultiplyTextureOptions,
-  ): Promise<void>;
+  loadRendererMultiplyTexture?(source: string, options: ThreeRendererMultiplyTextureOptions): Promise<void>;
   clearRendererMultiplyTexture?(): void;
 
   release(): void;
 }
 
-export const isThreeStoryCharacterModel = (
-  value: unknown,
-): value is ThreeStoryCharacterModel => {
+export const isThreeStoryCharacterModel = (value: unknown): value is ThreeStoryCharacterModel => {
   const model = value as Partial<ThreeStoryCharacterModel> | null;
   if (!model) return false;
   const requiredMethods: readonly (keyof ThreeStoryCharacterModel)[] = [

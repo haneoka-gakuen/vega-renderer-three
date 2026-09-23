@@ -12,24 +12,17 @@ import {
 } from "three";
 import type { IUniform } from "three";
 import type { AdvBloomResult, AdvRenderFullscreen } from "./AdvUrpBloom";
-import {
-  resolveAdvFilmGrainTextureBinding,
-} from "./AdvFilmGrainAssets";
+import { advFilmGrainTextureReference } from "./AdvFilmGrainAssets";
 import type { AdvUrpVolumeState } from "./AdvVolumeStack";
+import { UnityRandom } from "../particles/UnityParticleMath";
 
-export type AdvPostTextureUsage =
-  | "color-lookup"
-  | "film-grain"
-  | "lens-dirt";
+export type AdvPostTextureUsage = "color-lookup" | "film-grain" | "lens-dirt";
 
 /**
  * Synchronous bridge for host- or plugin-owned textures. The renderer never
  * downloads opaque URLs or bundles material textures of its own.
  */
-export type AdvPostTextureResolver = (
-  reference: unknown,
-  usage: AdvPostTextureUsage,
-) => Texture | null;
+export type AdvPostTextureResolver = (reference: unknown, usage: AdvPostTextureUsage) => Texture | null;
 
 const FULLSCREEN_VERTEX = /* glsl */ `
 varying vec2 vUv;
@@ -65,6 +58,7 @@ uniform vec4 uVignette1;
 uniform vec4 uVignette2;
 uniform vec2 uGrainParams;
 uniform vec2 uGrainSeed;
+uniform vec2 uGrainScale;
 uniform vec4 uUserLutParams;
 uniform vec4 uLensDirtParams;
 uniform float uLensDirtIntensity;
@@ -226,10 +220,10 @@ void main() {
 
   if (uUseGrain > 0.5) {
     float noise = uUseGrainTexture > 0.5
-      ? texture2D(tGrain, uv * vec2(2.0) + uGrainSeed).a
+      ? texture2D(tGrain, uv * uGrainScale + uGrainSeed).a
       : proceduralNoise(uv);
     noise = noise * 2.0 - 1.0;
-    float luminance = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    float luminance = dot(color, vec3(0.212672904, 0.715152204, 0.0721750036));
     float response = mix(1.0, 1.0 - sqrt(clamp(luminance, 0.0, 1.0)), uGrainParams.y);
     color += color * noise * uGrainParams.x * response;
   }
@@ -260,6 +254,7 @@ type UberUniforms = Record<string, IUniform<unknown>> & {
   uVignette2: IUniform<Vector4>;
   uGrainParams: IUniform<Vector2>;
   uGrainSeed: IUniform<Vector2>;
+  uGrainScale: IUniform<Vector2>;
   uUserLutParams: IUniform<Vector4>;
   uLensDirtParams: IUniform<Vector4>;
   uLensDirtIntensity: IUniform<number>;
@@ -273,22 +268,6 @@ type UberUniforms = Record<string, IUniform<unknown>> & {
   uUseGrainTexture: IUniform<number>;
   uUseUserLut: IUniform<number>;
   uUseLensDirt: IUniform<number>;
-};
-
-const textureDimensions = (
-  texture: Texture | null,
-): readonly [number, number] | null => {
-  const image = texture?.image as
-    | { readonly width?: unknown; readonly height?: unknown }
-    | undefined;
-  const width = Number(image?.width);
-  const height = Number(image?.height);
-  return Number.isFinite(width) &&
-    width > 0 &&
-    Number.isFinite(height) &&
-    height > 0
-    ? [width, height]
-    : null;
 };
 
 /** Letterbox-style texture scale and offset for a full-screen lens-dirt map. */
@@ -329,23 +308,8 @@ export const advHdrLutInput = (value: number): number => {
 };
 
 /** @deprecated Use `advFilmGrainTextureReference` for all preset slots. */
-export const advFilmGrainTextureUrl = (
-  type: number,
-  customTextureReference: unknown,
-): string | null =>
-  Math.trunc(type) === 10 && typeof customTextureReference === "string"
-    ? customTextureReference || null
-    : null;
-
-const frameNoise = (frame: number, channel: number): number => {
-  let value = (Math.trunc(frame) ^ Math.imul(channel + 1, 0x9e3779b1)) >>> 0;
-  value ^= value >>> 16;
-  value = Math.imul(value, 0x7feb352d) >>> 0;
-  value ^= value >>> 15;
-  value = Math.imul(value, 0x846ca68b) >>> 0;
-  value ^= value >>> 16;
-  return value / 0xffffffff;
-};
+export const advFilmGrainTextureUrl = (type: number, customTextureReference: unknown): string | null =>
+  Math.trunc(type) === 10 && typeof customTextureReference === "string" ? customTextureReference || null : null;
 
 export class AdvUrpUberPost {
   private readonly uniforms: UberUniforms = {
@@ -367,6 +331,7 @@ export class AdvUrpUberPost {
     uVignette2: { value: new Vector4(0.5, 0.5, 0, 1) },
     uGrainParams: { value: new Vector2() },
     uGrainSeed: { value: new Vector2() },
+    uGrainScale: { value: new Vector2(1, 1) },
     uUserLutParams: { value: new Vector4(1, 1, 0, 0) },
     uLensDirtParams: { value: new Vector4(1, 1, 0, 0) },
     uLensDirtIntensity: { value: 0 },
@@ -392,9 +357,7 @@ export class AdvUrpUberPost {
     toneMapped: false,
   });
 
-  constructor(
-    private readonly resolveTexture?: AdvPostTextureResolver,
-  ) {}
+  constructor(private readonly resolveTexture?: AdvPostTextureResolver) {}
 
   render(
     source: WebGLRenderTarget,
@@ -409,19 +372,13 @@ export class AdvUrpUberPost {
     source.texture.minFilter = LinearFilter;
     source.texture.magFilter = LinearFilter;
     this.uniforms.tInput.value = source.texture;
-    this.uniforms.uInputTexelSize.value.set(
-      1 / source.width,
-      1 / source.height,
-    );
+    this.uniforms.uInputTexelSize.value.set(1 / source.width, 1 / source.height);
     this.uniforms.tLut.value = lut;
     this.uniforms.uPostExposure.value = 2 ** state.colorAdjustments.postExposure;
 
     this.uniforms.uUseBloom.value = bloom ? 1 : 0;
     this.uniforms.tBloom.value = bloom?.texture ?? source.texture;
-    this.uniforms.uBloomTexelSize.value.set(
-      1 / (bloom?.width ?? source.width),
-      1 / (bloom?.height ?? source.height),
-    );
+    this.uniforms.uBloomTexelSize.value.set(1 / (bloom?.width ?? source.width), 1 / (bloom?.height ?? source.height));
     this.uniforms.uBloomParams.value.set(
       bloom?.intensity ?? 0,
       bloom?.tint[0] ?? 1,
@@ -429,64 +386,60 @@ export class AdvUrpUberPost {
       bloom?.tint[2] ?? 1,
     );
 
-    const dirt = this.resolveExternalTexture(
-      state.bloom.dirtTexture,
-      "lens-dirt",
-    );
-    const dirtSize = textureDimensions(dirt);
-    const dirtActive = Boolean(
-      bloom && dirt && dirtSize && state.bloom.dirtIntensity > 0,
-    );
+    const dirtRequested = Boolean(bloom && state.bloom.dirtIntensity > 0 && state.bloom.dirtTexture != null);
+    const dirt = dirtRequested ? this.resolveExternalTexture(state.bloom.dirtTexture, "lens-dirt") : null;
+    const dirtImage = dirt?.image as { readonly width?: unknown; readonly height?: unknown } | undefined;
+    const dirtWidth = Number(dirtImage?.width);
+    const dirtHeight = Number(dirtImage?.height);
+    const dirtSizeValid = Number.isFinite(dirtWidth) && dirtWidth > 0 && Number.isFinite(dirtHeight) && dirtHeight > 0;
+    const dirtActive = Boolean(dirt && dirtSizeValid);
     this.uniforms.uUseLensDirt.value = dirtActive ? 1 : 0;
     this.uniforms.tLensDirt.value = dirt ?? source.texture;
-    this.uniforms.uLensDirtIntensity.value = Math.max(
-      0,
-      state.bloom.dirtIntensity,
-    );
-    if (dirtSize) {
-      this.uniforms.uLensDirtParams.value.set(
-        ...advLensDirtScaleOffset(
-          source.width,
-          source.height,
-          dirtSize[0],
-          dirtSize[1],
-        ),
-      );
+    this.uniforms.uLensDirtIntensity.value = dirtActive ? Math.max(0, state.bloom.dirtIntensity) : 0;
+    if (dirtActive) {
+      const screenRatio = source.width / source.height;
+      const dirtRatio = dirtWidth / dirtHeight;
+      if (dirtRatio > screenRatio) {
+        const scale = screenRatio / dirtRatio;
+        this.uniforms.uLensDirtParams.value.set(scale, 1, (1 - scale) * 0.5, 0);
+      } else if (dirtRatio < screenRatio) {
+        const scale = dirtRatio / screenRatio;
+        this.uniforms.uLensDirtParams.value.set(1, scale, 0, (1 - scale) * 0.5);
+      } else {
+        this.uniforms.uLensDirtParams.value.set(1, 1, 0, 0);
+      }
     }
 
-    const userLut = this.resolveExternalTexture(
-      state.colorLookup.texture,
-      "color-lookup",
-    );
-    const userLutSize = textureDimensions(userLut);
+    const userLutRequested =
+      state.colorLookup.active && state.colorLookup.contribution > 0 && state.colorLookup.texture != null;
+    const userLut = userLutRequested ? this.resolveExternalTexture(state.colorLookup.texture, "color-lookup") : null;
+    const userLutImage = userLut?.image as { readonly width?: unknown; readonly height?: unknown } | undefined;
+    const userLutWidth = Number(userLutImage?.width);
+    const userLutHeight = Number(userLutImage?.height);
     const userLutActive = Boolean(
-      state.colorLookup.active &&
-        state.colorLookup.contribution > 0 &&
-        userLut &&
-        userLutSize &&
-        userLutSize[0] === userLutSize[1] * userLutSize[1],
+      userLut &&
+      Number.isFinite(userLutWidth) &&
+      Number.isFinite(userLutHeight) &&
+      userLutWidth > 0 &&
+      userLutHeight > 0 &&
+      userLutWidth === userLutHeight * userLutHeight,
     );
     this.uniforms.uUseUserLut.value = userLutActive ? 1 : 0;
     this.uniforms.tUserLut.value = userLut ?? lut;
-    if (userLutSize) {
+    if (userLutActive) {
       this.uniforms.uUserLutParams.value.set(
-        ...advUserLutParams(
-          userLutSize[0],
-          userLutSize[1],
-          state.colorLookup.contribution,
-        ),
+        1 / userLutWidth,
+        1 / userLutHeight,
+        userLutHeight - 1,
+        Math.max(0, Math.min(1, state.colorLookup.contribution)),
       );
     }
 
     this.uniforms.uHdrGrading.value = hdrGrading ? 1 : 0;
-    this.uniforms.uTonemapping.value =
-      !hdrGrading && state.tonemapping.active
-        ? Math.trunc(state.tonemapping.mode)
-        : 0;
+    this.uniforms.uTonemapping.value = !hdrGrading && state.tonemapping.active ? Math.trunc(state.tonemapping.mode) : 0;
 
     const distortion = state.lensDistortion;
-    const distortionActive =
-      distortion.active && Math.abs(distortion.intensity) > 0;
+    const distortionActive = distortion.active && Math.abs(distortion.intensity) > 0;
     this.uniforms.uUseDistortion.value = distortionActive ? 1 : 0;
     if (distortionActive) {
       const amount = 1.6 * Math.max(Math.abs(distortion.intensity * 100), 1);
@@ -507,16 +460,11 @@ export class AdvUrpUberPost {
     }
 
     this.uniforms.uUseChromatic.value =
-      state.chromaticAberration.active &&
-      state.chromaticAberration.intensity > 0
-        ? 1
-        : 0;
-    this.uniforms.uChromaAmount.value =
-      Math.max(0, state.chromaticAberration.intensity) * 0.05;
+      state.chromaticAberration.active && state.chromaticAberration.intensity > 0 ? 1 : 0;
+    this.uniforms.uChromaAmount.value = Math.max(0, state.chromaticAberration.intensity) * 0.05;
 
     const vignette = state.vignette;
-    this.uniforms.uUseVignette.value =
-      vignette.active && vignette.intensity > 0 ? 1 : 0;
+    this.uniforms.uUseVignette.value = vignette.active && vignette.intensity > 0 ? 1 : 0;
     this.uniforms.uVignette1.value.set(
       vignette.color.r ?? vignette.color.x ?? 0,
       vignette.color.g ?? vignette.color.y ?? 0,
@@ -531,27 +479,24 @@ export class AdvUrpUberPost {
     );
 
     const grain = state.filmGrain;
-    const grainBinding = resolveAdvFilmGrainTextureBinding(
-      grain.type,
-      grain.texture,
-      (reference) =>
-        this.resolveExternalTexture(reference, "film-grain"),
-    );
-    const grainTexture = grainBinding.texture;
     const grainRequested = grain.active && grain.intensity > 0;
-    const grainActive =
-      grainRequested && grainBinding.activeWhenRequested;
+    const grainType = Math.trunc(Number(grain.type));
+    const grainReference = grainRequested ? advFilmGrainTextureReference(grainType, grain.texture) : null;
+    const grainTexture = grainReference === null ? null : this.resolveExternalTexture(grainReference, "film-grain");
+    const grainActive = grainRequested && (grainType !== 10 || grainTexture !== null);
     this.uniforms.uUseGrain.value = grainActive ? 1 : 0;
-    this.uniforms.uUseGrainTexture.value = grainTexture ? 1 : 0;
+    this.uniforms.uUseGrainTexture.value = grainActive && grainTexture ? 1 : 0;
     this.uniforms.tGrain.value = grainTexture ?? source.texture;
-    this.uniforms.uGrainParams.value.set(
-      Math.max(0, grain.intensity),
-      Math.max(0, Math.min(1, grain.response)),
-    );
-    this.uniforms.uGrainSeed.value.set(
-      frameNoise(frameCount, 0),
-      frameNoise(frameCount, 1),
-    );
+    if (grainActive) {
+      this.uniforms.uGrainParams.value.set(Math.max(0, grain.intensity) * 4, Math.max(0, Math.min(1, grain.response)));
+      const image = grainTexture?.image as { width?: number; height?: number } | undefined;
+      this.uniforms.uGrainScale.value.set(
+        source.width / Math.max(1, Number(image?.width) || 512),
+        source.height / Math.max(1, Number(image?.height) || 512),
+      );
+      const random = new UnityRandom(frameCount);
+      this.uniforms.uGrainSeed.value.set(random.next(), random.next());
+    }
 
     renderFullscreen(this.material, destination, true);
   }
@@ -560,14 +505,8 @@ export class AdvUrpUberPost {
     this.material.dispose();
   }
 
-  private resolveExternalTexture(
-    reference: unknown,
-    usage: AdvPostTextureUsage,
-  ): Texture | null {
-    const texture =
-      reference instanceof Texture
-        ? reference
-        : this.resolveTexture?.(reference, usage) ?? null;
+  private resolveExternalTexture(reference: unknown, usage: AdvPostTextureUsage): Texture | null {
+    const texture = reference instanceof Texture ? reference : (this.resolveTexture?.(reference, usage) ?? null);
     if (!texture) return null;
     texture.colorSpace = NoColorSpace;
     texture.minFilter = LinearFilter;

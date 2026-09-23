@@ -1,3 +1,6 @@
+import type { StoryScreenEffectSnapshot } from "@haneoka/vega/renderer-kit";
+import type { AdvRainFrameSnapshot } from "./AdvRainFrameRenderer";
+import type { CanvasStillSnapshot } from "./AdvCanvasPass";
 import type {
   AdvBackgroundEntry,
   AdvEffectEntry,
@@ -21,11 +24,14 @@ export interface AdvSeekCharacterSnapshot {
   readonly identity: string;
   readonly characterKey: string;
   readonly controllerIdentity: string;
+  readonly visible: boolean;
+  readonly speculative: boolean;
   /** Immutable episode resource record. */
   readonly entry: StoryCharacterEntry;
   readonly positionType: number;
   readonly worldPosition: Vec3 | null;
   readonly offset: Vec3;
+  readonly modelState?: unknown;
   readonly alpha: number;
   readonly brightness: number;
   readonly facing: 1 | -1;
@@ -51,6 +57,20 @@ export interface AdvSeekCharacterSnapshot {
    * deterministic command replay without serializing SDK internals.
    */
   readonly presentation: readonly AdvCharacterPresentationEvent[];
+  readonly currentMotionName: string;
+  readonly currentMotionFadeInSeconds?: number;
+  readonly currentExpressionName: string;
+  readonly currentExpressionFadeInSeconds?: number;
+  readonly activeExpressionName: string;
+  readonly activeExpressionFadeInSeconds?: number;
+  readonly pendingPausedMotion: {
+    readonly name: string;
+    readonly fadeInSeconds?: number;
+  } | null;
+  readonly pendingPausedExpression: {
+    readonly name: string;
+    readonly fadeInSeconds?: number;
+  } | null;
   /** Voice analyzers/PCM are forbidden by the snapshot safety proof. */
   readonly lipSync: Omit<LipSyncState, "sources" | "motionSyncPcm"> & {
     readonly sources: readonly [];
@@ -59,9 +79,17 @@ export interface AdvSeekCharacterSnapshot {
   readonly paused: boolean;
 }
 
-export interface AdvStorySceneSeekSnapshot
-  extends PortableAdvStorySceneSeekSnapshot {
+export interface AdvStorySceneSeekSnapshot extends PortableAdvStorySceneSeekSnapshot {
   readonly version: typeof STORY_SCENE_SEEK_SNAPSHOT_VERSION;
+  readonly rendererState: {
+    readonly kind: "three";
+    readonly version: 3;
+    readonly transforms: readonly {
+      readonly target: string;
+      readonly current: Readonly<Record<string, number>>;
+      readonly planned: Readonly<Record<string, number>>;
+    }[];
+  };
   readonly background: AdvBackgroundEntry | null;
   readonly still: AdvStillEntry | null;
   readonly stillAlpha: number;
@@ -73,10 +101,21 @@ export interface AdvStorySceneSeekSnapshot
   readonly frameOpacity: number;
   readonly frameSlide: number;
   readonly frameEntries: AdvPlayerState["frameEntries"];
+  readonly frameParticles?: Readonly<Record<string, AdvRainFrameSnapshot>>;
+  readonly stillLayers?: readonly CanvasStillSnapshot[];
   readonly stage: unknown;
+  readonly screenEffects?: readonly StoryScreenEffectSnapshot[];
+  readonly screenFilterState?: readonly { readonly target: string; readonly state: unknown }[];
   readonly stageEnv: AdvPlayerState["stageEnv"];
   readonly stageOffsets: readonly (readonly [number, Vec3])[];
   readonly cameraState: StoryCameraState;
+  readonly cameraShake: {
+    readonly enabled: boolean;
+    readonly strength: number;
+    readonly cycleSeconds: number;
+    readonly vibrato: number;
+    readonly randomness: number;
+  };
   readonly fieldRendererState: FieldRendererState;
   readonly postEffect: unknown;
   readonly commandVolumes: readonly {
@@ -108,6 +147,7 @@ export interface AdvStorySceneSeekSnapshot
   readonly lifecycle: {
     readonly characterLoadSequence: number;
     readonly characterLoadTokens: readonly (readonly [string, number])[];
+    readonly characterControllerIdentities: readonly (readonly [string, string])[];
     readonly pendingCharacters: PendingCharacterCommandsSnapshot;
     readonly characterPriorityOrder: readonly number[];
   };
@@ -118,14 +158,15 @@ export const isDetailedThreeStorySceneSeekSnapshot = (
 ): value is AdvStorySceneSeekSnapshot => {
   const candidate = value as Partial<AdvStorySceneSeekSnapshot>;
   return Boolean(
+    candidate.rendererState?.kind === "three" &&
+    candidate.rendererState.version === 3 &&
+    Array.isArray(candidate.rendererState.transforms) &&
     candidate.lifecycle &&
-      Array.isArray(candidate.lifecycle.characterLoadTokens) &&
-      Array.isArray(candidate.characters) &&
-      candidate.characters.every(
-        (character) =>
-          typeof character.identity === "string" &&
-          typeof character.controllerIdentity === "string",
-      ),
+    Array.isArray(candidate.lifecycle.characterLoadTokens) &&
+    Array.isArray(candidate.characters) &&
+    candidate.characters.every(
+      (character) => typeof character.identity === "string" && typeof character.controllerIdentity === "string",
+    ),
   );
 };
 
