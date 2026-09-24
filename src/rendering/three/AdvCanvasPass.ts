@@ -654,6 +654,7 @@ export class AdvCanvasPass {
     const texture = this.videoTexture;
     const video = texture?.image as HTMLVideoElement | undefined;
     if (
+      texture &&
       video &&
       video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
       Number.isFinite(video.currentTime)
