@@ -82,6 +82,7 @@ interface FrameView {
   animator?: StoryStillAnimator;
   ready?: Promise<FrameView>;
   operation: number;
+  elapsed: number;
 }
 export interface CanvasStillSnapshot {
   readonly key: string;
@@ -233,7 +234,8 @@ export class AdvCanvasPass {
     view.crop.set(0, 0, 1, 1);
     if (view.fit === "stretch") return;
     const source = texture.image as
-      { width?: number; height?: number; videoWidth?: number; videoHeight?: number } | undefined;
+      | { width?: number; height?: number; videoWidth?: number; videoHeight?: number }
+      | undefined;
     const width = source?.videoWidth || source?.width || 1,
       height = source?.videoHeight || source?.height || 1;
     const visible = view.rect.z / Math.max(1, view.rect.w) / (width / height);
@@ -294,6 +296,8 @@ export class AdvCanvasPass {
     this.opacity(this.video, 0);
     this.opacity(this.videoBackground, 0);
     if (!video) return;
+    for (const [key, frame] of this.frames)
+      if (finite(frame.frame.oneShotSeconds) > 0) this.setFrameOpacity(key, 0, frame.slide);
     const texture = new VideoTexture(video);
     texture.colorSpace = NoColorSpace;
     texture.needsUpdate = true;
@@ -343,6 +347,7 @@ export class AdvCanvasPass {
       slide: 0,
       disposed: false,
       operation: 0,
+      elapsed: 0,
     };
     collection.set(key, entry);
     this.pending.add(entry);
@@ -638,6 +643,13 @@ export class AdvCanvasPass {
   }
   update(deltaSeconds: number): void {
     for (const frame of this.frames.values()) frame.rain?.update(deltaSeconds);
+    if (!this.paused && deltaSeconds > 0)
+      for (const [key, frame] of this.frames) {
+        const lifetime = finite(frame.frame.oneShotSeconds);
+        if (lifetime <= 0 || frame.opacity <= 0) continue;
+        frame.elapsed += deltaSeconds;
+        if (frame.elapsed >= lifetime) this.setFrameOpacity(key, 0, frame.slide);
+      }
     if (!this.paused)
       for (const entry of this.stills.values())
         if (entry.group.visible && entry.animator) {
