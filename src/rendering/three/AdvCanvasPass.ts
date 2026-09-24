@@ -33,6 +33,7 @@ import {
   type StoryFrameNode,
 } from "@haneoka/vega/renderer-kit";
 import { AdvRainFrameRenderer, type AdvRainFrameSnapshot } from "./AdvRainFrameRenderer";
+import { NativeFrameAnimator } from "./NativeFrameAnimation";
 
 export interface CanvasTextureLease {
   readonly value: Texture;
@@ -80,6 +81,7 @@ interface FrameView {
   disposed: boolean;
   still?: AdvStillEntry;
   animator?: StoryStillAnimator;
+  frameAnimator?: NativeFrameAnimator;
   ready?: Promise<FrameView>;
   operation: number;
   elapsed: number;
@@ -362,6 +364,8 @@ export class AdvCanvasPass {
           : this.layouts?.resolve(frame);
       if (layout) {
         entry.layout = layout;
+        if (collection === this.frames && frame.animation)
+          entry.frameAnimator = new NativeFrameAnimator(layout, frame.animation);
         const loads: Promise<boolean>[] = [];
         for (const node of layout.nodes) {
           if (!node.image) continue;
@@ -417,6 +421,7 @@ export class AdvCanvasPass {
         if (!entry.disposed) this.opacity(image, entry.opacity);
       }
       if (!entry.disposed) {
+        if (entry.frameAnimator) entry.layout = entry.frameAnimator.sample(0);
         this.layoutFrame(entry);
         this.orderFrames();
       }
@@ -459,7 +464,9 @@ export class AdvCanvasPass {
         const [a, b, c, d, x, y] = placement.transform;
         image.transform.set(a, c, x, b, d, y, 0, 0, 1);
         image.rect.set(-placement.node.pivot[0] * w, -(1 - placement.node.pivot[1]) * h, w, h);
-        image.opacityFactor = placement.opacity * (placement.node.image?.color[3] ?? 1);
+        const tint = placement.node.image?.color;
+        if (tint) image.color.set(tint[0], tint[1], tint[2], image.color.w);
+        image.opacityFactor = placement.opacity * (tint?.[3] ?? 1);
         this.opacity(image, entry.opacity);
       }
     } else if (kind.includes("letterbox") || kind.includes("cinema")) {
@@ -645,10 +652,14 @@ export class AdvCanvasPass {
     for (const frame of this.frames.values()) frame.rain?.update(deltaSeconds);
     if (!this.paused && deltaSeconds > 0)
       for (const [key, frame] of this.frames) {
-        const lifetime = finite(frame.frame.oneShotSeconds);
-        if (lifetime <= 0 || frame.opacity <= 0) continue;
+        if (frame.opacity <= 0) continue;
         frame.elapsed += deltaSeconds;
-        if (frame.elapsed >= lifetime) this.setFrameOpacity(key, 0, frame.slide);
+        if (frame.frameAnimator) {
+          frame.layout = frame.frameAnimator.sample(frame.elapsed);
+          this.layoutFrame(frame);
+        }
+        const lifetime = finite(frame.frame.oneShotSeconds);
+        if (lifetime > 0 && frame.elapsed >= lifetime) this.setFrameOpacity(key, 0, frame.slide);
       }
     if (!this.paused)
       for (const entry of this.stills.values())
