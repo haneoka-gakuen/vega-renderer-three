@@ -182,6 +182,7 @@ export class StoryDomOverlay {
       objectFit: "cover",
     });
     this.video = video;
+    this.videoLayer.style.display = "block";
     this.videoLayer.style.opacity = "0";
     this.videoLayer.appendChild(video);
     try {
@@ -262,6 +263,7 @@ export class StoryDomOverlay {
     this.video = null;
     this.videoLayer.replaceChildren();
     this.videoLayer.style.opacity = "0";
+    this.videoLayer.style.display = "none";
   }
 
   setOffset(x: number, y: number): void {

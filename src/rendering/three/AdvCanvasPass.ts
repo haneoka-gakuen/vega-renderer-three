@@ -111,6 +111,7 @@ export class AdvCanvasPass {
   private readonly flash: ImageView;
   private readonly cover: ImageView;
   private videoTexture: VideoTexture | undefined;
+  private videoFrameTime = Number.NaN;
   private videoLayout: import("@haneoka/vega/renderer-kit").StoryVideoLayout | undefined;
   private paused = false;
   private disposed = false;
@@ -293,6 +294,7 @@ export class AdvCanvasPass {
   setVideo(video: HTMLVideoElement | null): void {
     this.videoTexture?.dispose();
     this.videoTexture = undefined;
+    this.videoFrameTime = Number.NaN;
     this.video.mesh.material.uniforms.uTexture!.value = null;
     this.video.mesh.material.uniforms.uTextured!.value = 0;
     this.opacity(this.video, 0);
@@ -649,6 +651,18 @@ export class AdvCanvasPass {
     entry.group.visible = visible;
   }
   update(deltaSeconds: number): void {
+    const texture = this.videoTexture;
+    const video = texture?.image as HTMLVideoElement | undefined;
+    if (
+      video &&
+      video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+      Number.isFinite(video.currentTime)
+    ) {
+      if (video.currentTime !== this.videoFrameTime) {
+        this.videoFrameTime = video.currentTime;
+        texture.needsUpdate = true;
+      }
+    }
     for (const frame of this.frames.values()) frame.rain?.update(deltaSeconds);
     if (!this.paused && deltaSeconds > 0)
       for (const [key, frame] of this.frames) {
