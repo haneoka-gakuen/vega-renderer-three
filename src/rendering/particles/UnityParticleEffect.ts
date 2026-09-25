@@ -760,6 +760,14 @@ export class UnityParticleSystemView {
     node.add(this.mesh);
   }
 
+  /** Authored Animator overrides for ParticleSystem module curves. */
+  readonly moduleOverrides: {
+    simulationSpeed?: number;
+    rateScale?: number;
+    lifetimeScale?: number;
+    colorTint?: { r: number; g: number; b: number };
+  } = {};
+
   play(simulationSpeed: number): void {
     this.clear();
     this.simulationSpeed = Math.max(0, finite(simulationSpeed, 1));
@@ -830,7 +838,8 @@ export class UnityParticleSystemView {
       particle.colorRandom = this.random.next();
       particle.lifetime = Math.max(
         0.0001,
-        sampleUnityMinMaxCurve(this.definition.initial.startLifetime, 0, particle.curveRandom),
+        sampleUnityMinMaxCurve(this.definition.initial.startLifetime, 0, particle.curveRandom) *
+          (this.moduleOverrides.lifetimeScale ?? 1),
       );
       particle.position.copy(shape.position);
       particle.baseVelocity
@@ -861,6 +870,12 @@ export class UnityParticleSystemView {
         particle.startColor,
         this.gradientColorScratch,
       );
+      const colorTint = this.moduleOverrides.colorTint;
+      if (colorTint) {
+        particle.startColor.r *= colorTint.r;
+        particle.startColor.g *= colorTint.g;
+        particle.startColor.b *= colorTint.b;
+      }
       const uv = this.definition.textureSheetAnimation;
       particle.flipU = Boolean(uv && this.random.next() < uv.flipU);
       particle.flipV = Boolean(uv && this.random.next() < uv.flipV);
@@ -879,7 +894,9 @@ export class UnityParticleSystemView {
     if (!emission || current < this.delay) return;
     const duration = Math.max(0.0001, this.definition.duration);
     const normalized = ((current - this.delay) % duration) / duration;
-    const rate = Math.max(0, sampleUnityMinMaxCurve(emission.rateOverTime, normalized, this.random.next()));
+    const rate =
+      Math.max(0, sampleUnityMinMaxCurve(emission.rateOverTime, normalized, this.random.next())) *
+      (this.moduleOverrides.rateScale ?? 1);
     this.rateRemainder += rate * Math.max(0, current - Math.max(previous, this.delay));
     const amount = Math.floor(this.rateRemainder);
     if (amount > 0) {
@@ -913,7 +930,11 @@ export class UnityParticleSystemView {
       this.mesh.geometry.instanceCount = 0;
       return;
     }
-    const delta = unityParticleSimulationDelta(deltaSeconds, this.simulationSpeed, this.definition.simulationSpeed);
+    const delta = unityParticleSimulationDelta(
+      deltaSeconds,
+      this.moduleOverrides.simulationSpeed ?? this.simulationSpeed,
+      this.definition.simulationSpeed,
+    );
     const previous = this.time;
     this.time += delta;
     if (this.emitting) {

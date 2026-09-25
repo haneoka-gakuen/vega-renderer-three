@@ -5,10 +5,13 @@ import {
   type StoryFrameLayout,
 } from "@haneoka/vega/renderer-kit";
 import { UnityParticleSystemView } from "../particles/UnityParticleEffect";
+import { evaluateUnityStreamedCurve } from "../particles/UnityParticleMath";
 import type { UnityEffectRuntimeDefinition } from "../particles/UnityParticleTypes";
 
 interface FrameParticleSlot {
   readonly view: UnityParticleSystemView;
+  readonly node: Object3D;
+  readonly pathHash: number;
   readonly layoutNode: string;
   placementOpacity: number;
 }
@@ -17,6 +20,28 @@ const finite = (value: unknown, fallback = 0): number =>
   typeof value === "number" && Number.isFinite(value) ? value : fallback;
 
 const stringId = (value: unknown): string => (typeof value === "string" ? value : "");
+
+/* CRC32 attribute hashes of the authored ParticleSystem module curves. */
+const ATTRIBUTE_SIMULATION_SPEED = 1451932078;
+const ATTRIBUTE_RATE_OVER_TIME = 2883525743;
+const ATTRIBUTE_START_LIFETIME = 3063797154;
+const ATTRIBUTE_START_COLOR_MAX_R = 4078873663;
+const ATTRIBUTE_START_COLOR_MAX_G = 2663598292;
+const ATTRIBUTE_START_COLOR_MAX_B = 4004101211;
+const ATTRIBUTE_START_COLOR_MIN_R = 4061279883;
+const ATTRIBUTE_START_COLOR_MIN_G = 2681197152;
+const ATTRIBUTE_START_COLOR_MIN_B = 4020578031;
+const ATTRIBUTE_IS_ACTIVE = 2086281974;
+
+/** CRC32 of the emitter's Animator-relative GameObject path. */
+function hashPath(path: string): number {
+  let hash = 0xffffffff;
+  for (let index = 0; index < path.length; index += 1) {
+    hash ^= path.charCodeAt(index);
+    hash = Math.imul(hash, 0xedb88320) >>> 0;
+  }
+  return (hash ^ 0xffffffff) >>> 0;
+}
 
 /** Same FNV-1a identity the opcode-54 effect controller seeds simulations with. */
 function hashSeed(value: string): number {
@@ -60,8 +85,11 @@ const clampZeroScaledNodes = (layout: StoryFrameLayout): StoryFrameLayout => {
 export class AdvFrameParticles {
   readonly group = new Group();
   private readonly slots: FrameParticleSlot[] = [];
+  private readonly slotsByPath = new Map<number, FrameParticleSlot[]>();
   private readonly baseLayout: StoryFrameLayout;
   private frameOpacity = 1;
+  private animation: UnityEffectRuntimeDefinition["animations"][number] | null = null;
+  private animationTime = 0;
 
   private constructor(layout: StoryFrameLayout) {
     this.baseLayout = layout;
@@ -113,12 +141,19 @@ export class AdvFrameParticles {
       view.mesh.renderOrder = renderer.sortingOrder;
       view.externalParticleScale = new Vector3();
       view.frameOpacity = 0;
-      result.slots.push({
+      const slot: FrameParticleSlot = {
         view,
+        node,
+        pathHash: hashPath(stringId(descriptor.path)),
         layoutNode: stringId(descriptor.layoutNode),
         placementOpacity: 0,
-      });
+      };
+      result.slots.push(slot);
+      const pathKey = slot.pathHash;
+      result.slotsByPath.set(pathKey, [...(result.slotsByPath.get(pathKey) ?? []), slot]);
     }
+    const animations = Array.isArray(runtime.animations) ? runtime.animations : [];
+    result.animation = animations[0] ?? null;
     return result;
   }
 
@@ -198,7 +233,72 @@ export class AdvFrameParticles {
 
   update(deltaSeconds: number): void {
     if (!this.group.visible) return;
-    for (const slot of this.slots) slot.view.update(Math.max(0, deltaSeconds));
+    const delta = Math.max(0, deltaSeconds);
+    this.advanceAnimation(delta);
+    for (const slot of this.slots) slot.view.update(delta);
+  }
+
+  /**
+   * Authored Animator clips drive ParticleSystem module curves per emitter
+   * path: simulation speed, emission rate, start lifetime and start-color
+   * tints, plus whole-node activation windows. Sampling matches the opcode-54
+   * effect runtime: streamed curves evaluated at the looping clip time.
+   */
+  private advanceAnimation(delta: number): void {
+    const animation = this.animation;
+    if (!animation) return;
+    this.animationTime += delta;
+    const duration = Math.max(0.0001, animation.stopTime - animation.startTime);
+    const time = animation.loop
+      ? animation.startTime + (this.animationTime % duration)
+      : Math.min(animation.stopTime, animation.startTime + this.animationTime);
+    for (const slot of this.slots) {
+      slot.view.moduleOverrides.simulationSpeed = undefined;
+      slot.view.moduleOverrides.rateScale = undefined;
+      slot.view.moduleOverrides.lifetimeScale = undefined;
+      slot.view.moduleOverrides.colorTint = undefined;
+    }
+    const byPath = this.slotsByPath;
+    for (const curve of animation.curves) {
+      const binding = curve.binding;
+      if (!binding || !curve.segments.length) continue;
+      const slots = byPath.get(binding.pathHash >>> 0);
+      if (!slots) continue;
+      const value = evaluateUnityStreamedCurve(curve.segments, time);
+      for (const slot of slots) this.applyModuleCurve(slot, binding.attributeHash >>> 0, value);
+    }
+  }
+
+  private applyModuleCurve(slot: FrameParticleSlot, attributeHash: number, value: number): void {
+    const overrides = slot.view.moduleOverrides;
+    switch (attributeHash) {
+      case ATTRIBUTE_SIMULATION_SPEED:
+        overrides.simulationSpeed = Math.max(0, value);
+        break;
+      case ATTRIBUTE_RATE_OVER_TIME:
+        overrides.rateScale = Math.max(0, value);
+        break;
+      case ATTRIBUTE_START_LIFETIME:
+        overrides.lifetimeScale = Math.max(0, value);
+        break;
+      case ATTRIBUTE_START_COLOR_MAX_R:
+      case ATTRIBUTE_START_COLOR_MIN_R:
+        (overrides.colorTint ??= { r: 1, g: 1, b: 1 }).r = value;
+        break;
+      case ATTRIBUTE_START_COLOR_MAX_G:
+      case ATTRIBUTE_START_COLOR_MIN_G:
+        (overrides.colorTint ??= { r: 1, g: 1, b: 1 }).g = value;
+        break;
+      case ATTRIBUTE_START_COLOR_MAX_B:
+      case ATTRIBUTE_START_COLOR_MIN_B:
+        (overrides.colorTint ??= { r: 1, g: 1, b: 1 }).b = value;
+        break;
+      case ATTRIBUTE_IS_ACTIVE:
+        slot.node.visible = value >= 0.5;
+        break;
+      default:
+        break;
+    }
   }
 
   setRenderOrder(order: number): void {
