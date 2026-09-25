@@ -576,13 +576,19 @@ function valueNoise(x: number, y: number, z: number, seed: number): number {
   return mixNumber(lower, upper, fz);
 }
 
-class UnityParticleSystemView {
+/**
+ * CPU simulation + instanced billboard draw for one serialized ParticleSystem.
+ *
+ * Exported for the ADV canvas overlay, which places frame ParticleSystems on
+ * the 2D reference canvas instead of the 3D effect scenes.
+ */
+export class UnityParticleSystemView {
   readonly mesh: Mesh<InstancedBufferGeometry, ShaderMaterial>;
   readonly node: Object3D;
-  private readonly definition: UnityParticleSystemDefinition;
-  private readonly renderer: UnityParticleRendererDefinition;
-  private readonly meshes: ReadonlyMap<string, UnityMeshDefinition>;
-  private readonly random: UnityRandom;
+  readonly definition: UnityParticleSystemDefinition;
+  readonly renderer: UnityParticleRendererDefinition;
+  readonly meshes: ReadonlyMap<string, UnityMeshDefinition>;
+  readonly random: UnityRandom;
   private readonly fallbackNoiseSeed: number;
   private readonly noiseFieldOffset = new Vector3();
   private readonly textureLease: SharedResourceLease<Texture> | null;
@@ -624,6 +630,15 @@ class UnityParticleSystemView {
   private simulationSpeed = 1;
   private burstEpoch = -1;
   private particleDelta = 0;
+  /**
+   * Canvas-overlay particle scale override, in draw-space units per local
+   * unit. When set it replaces both the local (scalingMode 1) and hierarchy
+   * (scalingMode 0) node-scale paths, because the ADV canvas overlay drives
+   * flattened placements whose node scale is not the authored emitter scale.
+   */
+  externalParticleScale: Vector3 | null = null;
+  /** Extra alpha multiplier applied on upload; ADV canvas overlays scale whole frames by opacity. */
+  frameOpacity = 1;
   private readonly retainParticle = (particle: Particle): boolean => this.updateParticle(particle, this.particleDelta);
 
   get usesHierarchyScale(): boolean {
@@ -1069,7 +1084,8 @@ class UnityParticleSystemView {
   }
 
   private upload(): void {
-    if (this.definition.scalingMode === 0) this.node.getWorldScale(this.particleScaleScratch);
+    if (this.externalParticleScale) this.particleScaleScratch.copy(this.externalParticleScale);
+    else if (this.definition.scalingMode === 0) this.node.getWorldScale(this.particleScaleScratch);
     else if (this.definition.scalingMode === 1) this.particleScaleScratch.copy(this.node.scale);
     else this.particleScaleScratch.set(1, 1, 1);
     this.particleScaleScratch.set(
@@ -1147,7 +1163,7 @@ class UnityParticleSystemView {
       this.colors[colorOffset] = outputColor.r;
       this.colors[colorOffset + 1] = outputColor.g;
       this.colors[colorOffset + 2] = outputColor.b;
-      this.colors[colorOffset + 3] = outputColor.a;
+      this.colors[colorOffset + 3] = outputColor.a * this.frameOpacity;
       const sheet = this.definition.textureSheetAnimation;
       if (sheet) {
         const columns = Math.max(1, sheet.tilesX);
@@ -1248,6 +1264,8 @@ export interface UnityParticleEffectPlayOptions {
   /** AdvEffectCommand.SetSortOrder is absolute, not an authored-order bias. */
   sortingOrderOverride?: number;
   targetScene?: Scene;
+  /** Attach the effect root to a transform instead of a scene root. */
+  parent?: Object3D | null;
 }
 
 export class UnityParticleEffect {
@@ -1627,7 +1645,8 @@ export class UnityParticleEffectController {
       return;
     }
     effect.play(options);
-    (options.targetScene ?? this.scene).add(effect.root);
+    if (options.parent) options.parent.add(effect.root);
+    else (options.targetScene ?? this.scene).add(effect.root);
     this.effects.set(key, { key, effect });
   }
 

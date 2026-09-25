@@ -33,6 +33,7 @@ import {
   type StoryFrameNode,
 } from "@haneoka/vega/renderer-kit";
 import { AdvRainFrameRenderer, type AdvRainFrameSnapshot } from "./AdvRainFrameRenderer";
+import { UnityParticleEffectController } from "../particles/UnityParticleEffect";
 import { NativeFrameAnimator } from "./NativeFrameAnimation";
 
 export interface CanvasTextureLease {
@@ -114,6 +115,8 @@ export class AdvCanvasPass {
   private videoFrameTime = Number.NaN;
   private videoLayout: import("@haneoka/vega/renderer-kit").StoryVideoLayout | undefined;
   private paused = false;
+  /** Authored frame ParticleSystem graphs, keyed like the frame layers. */
+  private readonly frameParticles = new UnityParticleEffectController({});
   private disposed = false;
   private offsetX = 0;
   private offsetY = 0;
@@ -392,6 +395,7 @@ export class AdvCanvasPass {
           if (source) loads.push(this.source(image, source));
         }
         await Promise.all(loads);
+        this.playFrameParticles(key, entry, frame);
       } else if (kind.includes("rain")) {
         const texture = String(frame.texture || "");
         if (!texture) throw new Error("Rain frame requires a particle texture");
@@ -506,10 +510,40 @@ export class AdvCanvasPass {
   clearFrame(key?: string): void {
     this.clearLayers(this.frames, key);
   }
+  /**
+   * Frames whose prefab carries ParticleSystems replay them through the
+   * shared opcode-54 Unity runtime, scaled from the authored 1920x1080
+   * canvas into the overlay pixel space. Static layout images still render
+   * underneath, matching the native composition.
+   */
+  private playFrameParticles(key: string, entry: FrameView, frame: AdvFrameEntry): void {
+    const runtime = frame.particleRuntime;
+    if (!runtime || typeof runtime !== "object") return;
+    const holder = new Group();
+    holder.name = "frame-particles";
+    this.sizeFrameParticleHolder(holder);
+    entry.group.add(holder);
+    void this.frameParticles
+      .play(`frame:${key}`, runtime as never, { parent: holder, sortingOrderOverride: 0 })
+      .catch((error: unknown) => {
+        if (!entry.disposed) console.warn(`Frame particle playback failed: ${key}`, error);
+      })
+      .finally(() => {
+        if (entry.disposed) this.frameParticles.stop(`frame:${key}`);
+      });
+  }
+
+  private sizeFrameParticleHolder(holder: Group): void {
+    const { x: width, y: height } = this.viewport;
+    holder.position.set(width / 2, height / 2, 0);
+    holder.scale.set(width / 1920, height / 1080, 1);
+  }
+
   private clearLayers(collection: Map<string, FrameView>, key?: string): void {
     const entries = key ? (collection.has(key) ? ([[key, collection.get(key)!]] as const) : []) : [...collection];
     for (const [id, entry] of entries) {
       entry.disposed = true;
+      if (collection === this.frames) this.frameParticles.stop(id);
       entry.rain?.destroy();
       entry.group.removeFromParent();
       for (const image of entry.images) this.removeImage(image);
@@ -665,6 +699,7 @@ export class AdvCanvasPass {
       }
     }
     for (const frame of this.frames.values()) frame.rain?.update(deltaSeconds);
+    if (!this.paused) this.frameParticles.update(deltaSeconds);
     if (!this.paused && deltaSeconds > 0)
       for (const [key, frame] of this.frames) {
         if (frame.opacity <= 0) continue;
@@ -719,6 +754,7 @@ export class AdvCanvasPass {
     this.clearFrame();
     this.clearStills();
     for (const view of this.views) this.removeImage(view);
+    this.frameParticles.dispose();
     this.videoTexture?.dispose();
     this.geometry.dispose();
   }
