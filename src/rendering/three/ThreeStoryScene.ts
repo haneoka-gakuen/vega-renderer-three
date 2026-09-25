@@ -995,6 +995,30 @@ export class ThreeStoryScene implements StorySceneBackend {
   private contextLost = false;
   private contextRestoreGeneration = 0;
   private contextRestoreController: ContextRestoreController | null = null;
+  private contextRestoreWatchdog: ReturnType<typeof setTimeout> | undefined;
+
+  /**
+   * A restore whose model rebuild never settles would leave the controller
+   * set forever; the character update loop breaks on it every frame, so every
+   * character turns into a permanent static image while the rest of the scene
+   * keeps rendering. Complete a stale restore so characters can recover.
+   */
+  private armContextRestoreWatchdog(controller: ContextRestoreController): void {
+    this.clearContextRestoreWatchdog();
+    this.contextRestoreWatchdog = setTimeout(() => {
+      this.contextRestoreWatchdog = undefined;
+      if (this.destroyed || this.contextRestoreController !== controller) return;
+      console.error("[ThreeStoryScene] WebGL context restore did not complete; releasing the character gate");
+      this.completeContextRestore(controller);
+    }, 30_000);
+  }
+
+  private clearContextRestoreWatchdog(): void {
+    if (this.contextRestoreWatchdog !== undefined) {
+      clearTimeout(this.contextRestoreWatchdog);
+      this.contextRestoreWatchdog = undefined;
+    }
+  }
   private contextRestoreRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly contextReadyWaiters = new Set<(ready: boolean) => void>();
   private readonly characterModelRecoveryStates = new Map<StoryCharacter, CharacterModelRecoveryState>();
@@ -1317,6 +1341,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       detach: this.bindControllerToSignal(controller, this.lifecycleController.signal),
     };
     this.contextRestoreController = restoreController;
+    this.armContextRestoreWatchdog(restoreController);
     void (async () => {
       let ownedItems: readonly StoryCharacter[] = [];
       let failures: readonly CharacterGraphicsRestoreFailure[] = [];
@@ -1431,6 +1456,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   private completeContextRestore(active: ContextRestoreController): void {
+    this.clearContextRestoreWatchdog();
     active.detach();
     if (this.contextRestoreController === active) this.contextRestoreController = null;
   }
