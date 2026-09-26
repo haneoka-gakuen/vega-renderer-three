@@ -115,7 +115,11 @@ import { resolveAdvEffectRoute, type AdvEffectRoute } from "../particles/AdvEffe
 import { AdvRuleTransitionController } from "./transitions/AdvRuleTransition";
 import { AdvRuleTransitionPass } from "./transitions/AdvRuleTransitionPass";
 import { sampleVoiceMotionSyncInput, voiceRmsMouthOpening } from "./VoiceMotionSync";
-import { SharedTextureResourceCache, type SharedTextureLease } from "./SharedTextureResourceCache";
+import {
+  SharedTextureResourceCache,
+  type SharedTextureCacheStats,
+  type SharedTextureLease,
+} from "./SharedTextureResourceCache";
 import { StoryDomOverlay } from "./StoryDomOverlay";
 import { UnityTargetFrameClock } from "./UnityTargetFrameClock";
 import { computeAdvCharacterHeadWorldPosition, computeAdvLookTarget } from "./AdvLookTarget";
@@ -138,6 +142,7 @@ import {
 import { advanceAdvHoldOpenPseudoLipSync, advanceAdvPseudoLipSync } from "../CharacterLipSyncMath";
 import type {
   FieldRendererState,
+  LipSyncState,
   StoryCharacterEntry,
   StoryCameraState,
   Vec2,
@@ -147,10 +152,24 @@ import type {
 import {
   STORY_SCENE_SEEK_SNAPSHOT_VERSION,
   isDetailedThreeStorySceneSeekSnapshot,
+  type AdvSeekCharacterSnapshot,
   type AdvCharacterPresentationEvent,
   type AdvStorySceneSeekSnapshot,
   type SeekSnapshotSafety,
 } from "./StorySceneSnapshot";
+
+type MutableAdvSeekCharacterSnapshot = {
+  -readonly [Key in keyof AdvSeekCharacterSnapshot]: AdvSeekCharacterSnapshot[Key];
+};
+
+/**
+ * Model-free controller state used while the core builds seek checkpoints.
+ * The shape deliberately follows the portable Three snapshot contract so
+ * compilation and restore cannot drift into a second presentation schema.
+ */
+type LogicalCharacterState = Omit<MutableAdvSeekCharacterSnapshot, "lipSync"> & {
+  lipSync: LipSyncState;
+};
 
 type BackgroundMesh = Mesh<PlaneGeometry, MeshBasicMaterial>;
 type UnknownRecord = Record<string, unknown>;
@@ -266,10 +285,20 @@ async function loadPngTexture(url: string, resources?: StoryResourceResolver, si
   return texture;
 }
 
+function textureByteSize(texture: Texture): number {
+  const source = record(texture.source);
+  const image = record(texture.image || source.data);
+  const width = positiveFinite(image.naturalWidth ?? image.videoWidth ?? image.width);
+  const height = positiveFinite(image.naturalHeight ?? image.videoHeight ?? image.height);
+  return width && height ? Math.ceil(width) * Math.ceil(height) * 4 : 0;
+}
+
 const defaultSharedTextureCache = new SharedTextureResourceCache<string, Texture>(
   (url, signal) => loadPngTexture(url, undefined, signal),
   (texture) => texture.dispose(),
   48,
+  Number.POSITIVE_INFINITY,
+  textureByteSize,
 );
 const resolverTextureCaches = new WeakMap<StoryResourceResolver, SharedTextureResourceCache<string, Texture>>();
 
@@ -281,6 +310,8 @@ const textureCacheFor = (resources?: StoryResourceResolver): SharedTextureResour
       (url, signal) => loadPngTexture(url, resources, signal),
       (texture) => texture.dispose(),
       48,
+      Number.POSITIVE_INFINITY,
+      textureByteSize,
     );
     resolverTextureCaches.set(resources, cache);
   }
@@ -819,9 +850,9 @@ export class ThreeStoryScene implements StorySceneBackend {
   private readonly characterPreloads = new Map<string, CharacterPreloadState>();
   /** Controllers made ready ahead of, but not yet consumed by, their first In. */
   private readonly speculativeCharacterControllers = new Map<string, StoryCharacter>();
-  private readonly speculativeCharacterCommandIndices = new Map<string, number>();
+  /** One bounded logical record per authored TargetName+AssetIndex controller. */
+  private readonly logicalCharacterStates = new Map<string, LogicalCharacterState>();
   private readonly discardedCharacterPreloadIdentities = new Set<string>();
-  private readonly characterPreloadCapacityWaiters = new Set<() => void>();
   private readonly characterRenderPrimes = new Map<StoryCharacter, CharacterRenderPrimeState>();
   private readonly sortedCharacterItems: StoryCharacter[] = [];
   private readonly characterRenderGroupPool: CharacterRenderGroup[] = [];
@@ -1037,16 +1068,18 @@ export class ThreeStoryScene implements StorySceneBackend {
   // replacement clears the map while an older provider load is still resolving.
   private characterLoadSequence = 0;
   private readonly characterLoadTokens = new Map<string, number>();
+  private episodeCharacterControllerCap: number | undefined;
   private readonly pendingCharacterCommands = new PendingCharacterCommands();
   private readonly context: StorySceneBackendContext;
   private readonly resources: StoryResourceResolver;
   private readonly textureCache: SharedTextureResourceCache<string, Texture>;
-  private readonly episodeTextureLeases = new Map<string, SharedTextureLease<Texture>>();
   private readonly episodeVideoRenderables = new Map<string, { readonly url: string; readonly release: () => void }>();
   private readonly episodeVideoRenderableLoads = new Map<
     string,
     Promise<{ readonly url: string; readonly release: () => void }>
   >();
+  /** Resolver leases held by an in-flight preload or show operation. */
+  private readonly pendingVideoSources = new Map<string, number>();
   private readonly characterProviders: readonly ThreeCharacterProvider[];
   private readonly characterModelDisposers = new WeakMap<ThreeStoryCharacterModel, () => Promise<void>>();
   private readonly disposedCharacterModels = new WeakSet<ThreeStoryCharacterModel>();
@@ -1130,7 +1163,10 @@ export class ThreeStoryScene implements StorySceneBackend {
       signal: this.lifecycleController.signal,
     });
     this.textureCache = textureCacheFor(this.resources);
-    this.textureCache.configure(Math.max(8, Math.trunc(finite(this.runtime.textureCacheEntryMax, 48))));
+    this.textureCache.configure(
+      Math.max(8, Math.trunc(finite(this.runtime.textureCacheEntryMax, 48))),
+      Math.max(0, finite(this.runtime.textureCacheMegabytes, 384)) * 1024 * 1024,
+    );
     this.characterProviders = [...(context.characterProviders ?? [])] as unknown as readonly ThreeCharacterProvider[];
     this.staticPortraitFallback = options.staticPortraitFallback ?? true;
     this.colorGradingMode = options.colorGradingMode ?? "ldr";
@@ -1226,6 +1262,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       this.renderer,
       (source) => this.acquireTexture(source),
       this.context.rendererExtensions?.service(STORY_FRAME_LAYOUT_PROVIDER),
+      { onVideoResidencyReleased: (source) => this.releaseEpisodeVideoRenderable(source) },
     );
     this.overlay.canvasPass.setStillSpeed(this.playbackSpeedRate);
     this.ruleTransitionPass = new AdvRuleTransitionPass(this.renderer);
@@ -1662,6 +1699,10 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.resizeObserver = null;
     this.cancelBackgroundBlurTween();
     this.clearCharacters();
+    const pendingParticleCreations = Promise.all([
+      this.commandEffects.waitForPending(),
+      this.stageEffects.waitForPending(),
+    ]);
     this.commandEffects.dispose();
     this.stageEffects.dispose();
     this.stopRendererExtensionEffects("scene destroy");
@@ -1679,6 +1720,15 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.backgroundBaseMaterial.dispose();
     this.backgroundCaptureBaseMaterial.dispose();
     this.backgroundGeometry.dispose();
+    // Character providers and renderer extensions are allowed to release
+    // GPU-owned resources asynchronously. Drain all work initiated by the
+    // teardown before disposing the pipeline or losing the context; the final
+    // drain below still covers late races that resolve after this boundary.
+    await Promise.all([
+      pendingParticleCreations,
+      Promise.all([...this.pendingCharacterDisposals]),
+      Promise.all([...this.pendingRendererEffectOperations]),
+    ]);
     this.pipeline?.dispose();
     this.screenFilterRunner?.dispose();
     this.screenFilterRunner = undefined;
@@ -1691,7 +1741,6 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.overlay?.destroy();
     this.overlay = null;
     this.releaseEpisodeVideoRenderables();
-    this.releaseEpisodeTextureLeases();
     const renderer = this.renderer;
     const canvas = renderer?.domElement;
     canvas?.removeEventListener("webglcontextlost", this.handleContextLost, false);
@@ -1751,6 +1800,9 @@ export class ThreeStoryScene implements StorySceneBackend {
     const pixelCountMax = Math.max(1, finite(this.runtime.rendererPixelCountMax, 10_000_000));
     const pixelLimitedDpr = Math.sqrt(pixelCountMax / Math.max(1, width * height));
     const dpr = Math.max(0.5, Math.min(requestedDpr, pixelLimitedDpr));
+    const previousFramebufferWidth = this.pipeline.framebufferWidth;
+    const previousFramebufferHeight = this.pipeline.framebufferHeight;
+    const previousCameraAspect = this.camera.aspect;
     this.renderer.setPixelRatio(dpr);
     this.renderer.setSize(width, height, false);
     Object.assign(this.renderer.domElement.style, {
@@ -1764,6 +1816,13 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.overlay?.setViewport(x, y, width, height);
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
+    if (
+      previousFramebufferWidth !== this.pipeline.framebufferWidth ||
+      previousFramebufferHeight !== this.pipeline.framebufferHeight ||
+      Math.abs(previousCameraAspect - this.camera.aspect) > 0.000001
+    ) {
+      this.pipeline.resetTemporalHistory();
+    }
     Object.assign(this.state.viewport, {
       x,
       y,
@@ -1777,33 +1836,37 @@ export class ThreeStoryScene implements StorySceneBackend {
   reservePreloadedTextures(count: number): void {
     this.textureCache.configure(
       Math.max(8, Math.trunc(finite(this.runtime.textureCacheEntryMax, 48)), Math.trunc(finite(count))),
+      Math.max(0, finite(this.runtime.textureCacheMegabytes, 384)) * 1024 * 1024,
     );
   }
 
+  get textureCacheStats(): SharedTextureCacheStats {
+    return this.textureCache.stats;
+  }
+
   async preloadTexture(url: string, signal?: AbortSignal): Promise<Texture> {
-    const resident = this.episodeTextureLeases.get(url);
-    if (resident) return resident.value;
-    const lease = await this.acquireTexture(url, signal);
+    // Episode preload warms the GPU cache briefly, but never becomes an
+    // episode-wide active owner. Backgrounds, stills and transitions acquire
+    // their own active leases and therefore survive warm-entry eviction.
+    const lease = await this.acquireTexture(url, signal, "warm");
     try {
       await this.uploadPreloadedTexture(lease.value, signal);
-      const existing = this.episodeTextureLeases.get(url);
-      if (existing) {
-        lease.release();
-        return existing.value;
-      }
-      this.episodeTextureLeases.set(url, lease);
       return lease.value;
-    } catch (error) {
+    } finally {
       lease.release();
-      throw error;
     }
   }
 
   async preloadVideo(url: string, signal?: AbortSignal): Promise<void> {
     const overlay = this.overlay;
     if (!overlay) throw sceneAbortError("Video preload overlay is unavailable");
-    const renderable = await this.resolveEpisodeVideoRenderable(url, signal);
-    await overlay.preloadVideo(url, renderable.url, signal);
+    this.retainPendingVideoSource(url);
+    try {
+      const renderable = await this.resolveEpisodeVideoRenderable(url, signal);
+      await overlay.preloadVideo(url, renderable.url, signal);
+    } finally {
+      this.releasePendingVideoSource(url);
+    }
   }
 
   async preloadResource(url: string, signal?: AbortSignal): Promise<boolean> {
@@ -1817,11 +1880,14 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   async preloadCharacter(request: StoryCharacterPreloadRequest, signal?: AbortSignal): Promise<boolean> {
+    if (this.seekIndexCompilationActive) return false;
     const cmd = request.command;
     const target = firstString(cmd.targetName, cmd.targets?.[0]?.target, cmd.characterKey);
     const entry = cmd.characterModel as StoryCharacterEntry | undefined;
     if (!target || !entry) return false;
     const identity = firstString(record(cmd).controllerIdentity, `${target}\u0000${Number(cmd.targetAssetIndex) || 0}`);
+    const episodeControllerCount = Math.floor(finite(request.episodeControllerCount, 0));
+    if (episodeControllerCount > 0) this.episodeCharacterControllerCap = episodeControllerCount;
     // CharacterIn synchronously registers its pending ownership before its
     // first await. Do not start a competing speculative construction in the
     // small interval between the loader pump and the command-owned load.
@@ -1833,24 +1899,11 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (active) {
       return Boolean(await active.promise);
     }
-    // Resident Cubism models dominate story memory (multi-page 4096px atlases
-    // per model). Episodes that register many characters and swap costumes
-    // all story long used to keep every authored controller resident, which
-    // froze heavy desktops and jetsam-killed iOS WebContent during loading.
-    // Cap total residents; overflow defers to on-demand creation at In.
-    // Resident preloads are bounded; overflow defers instantly to on-demand
-    // creation at the authored In. Waiting here wedged the loader pump: the
-    // pump drains every warmup serially, so one capacity wait stalls all
-    // remaining tasks behind owners that may never release.
-    const cacheCap = Math.max(
-      1,
-      Math.min(
-        Math.floor(finite(this.runtime.characterPreloadCacheMax, 6)),
-        Math.floor(finite(request.episodeControllerCount, 6)),
-      ),
-    );
+    // Overflow is handled on demand at In. Waiting for an idle controller
+    // here would block the episode preload pump behind visible owners.
+    const cacheCap = this.characterCacheLimit();
     if (this.cachedCharacterControllers.size + this.characterPreloads.size >= cacheCap) {
-      this.evictIdleResidentControllers(identity);
+      this.trimIdleResidentControllers(identity);
       if (this.cachedCharacterControllers.size + this.characterPreloads.size >= cacheCap) {
         console.info("[ThreeStoryScene] character preload deferred at capacity:", identity);
         return true;
@@ -1875,14 +1928,13 @@ export class ThreeStoryScene implements StorySceneBackend {
       request.positionType,
       request.motions,
       request.expressions,
-      request.commandIndex,
       controller.signal,
     ).finally(() => {
       detach();
       if (this.characterPreloads.get(identity) === state) {
         this.characterPreloads.delete(identity);
-        this.notifyCharacterPreloadCapacity();
       }
+      this.trimIdleResidentControllers(identity);
     });
     state = {
       controller,
@@ -1895,44 +1947,11 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   advanceCharacterPreload(_commandIndex: number, _retainBehindCommands: number): readonly string[] {
-    // Episode preload reserves every authored controller until the episode is
-    // disposed. Playback position must not evict later or previously hidden
-    // controllers; this method only reports lifecycle losses (for example a
-    // WebGL context reset) so Vega can rebuild them immediately.
+    // Only lifecycle losses require a preload repair. Capacity evictions stay
+    // deferred until In; feeding them back to the loader would cycle the LRU.
     const discarded = [...this.discardedCharacterPreloadIdentities];
     this.discardedCharacterPreloadIdentities.clear();
     return discarded;
-  }
-
-  private waitForCharacterPreloadCapacity(signal?: AbortSignal): Promise<void> {
-    if (this.destroyed || signal?.aborted || this.lifecycleController.signal.aborted) {
-      return Promise.reject(sceneAbortError("Character preload capacity wait was aborted"));
-    }
-    return new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const finish = (error?: Error): void => {
-        if (settled) return;
-        settled = true;
-        this.characterPreloadCapacityWaiters.delete(available);
-        signal?.removeEventListener("abort", aborted);
-        this.lifecycleController.signal.removeEventListener("abort", aborted);
-        if (error) reject(error);
-        else resolve();
-      };
-      const available = () => finish();
-      const aborted = () => finish(sceneAbortError("Character preload capacity wait was aborted"));
-      this.characterPreloadCapacityWaiters.add(available);
-      signal?.addEventListener("abort", aborted, { once: true });
-      this.lifecycleController.signal.addEventListener("abort", aborted, {
-        once: true,
-      });
-    });
-  }
-
-  private notifyCharacterPreloadCapacity(): void {
-    const waiters = [...this.characterPreloadCapacityWaiters];
-    this.characterPreloadCapacityWaiters.clear();
-    for (const available of waiters) available();
   }
 
   async loadTexture(url: string, signal?: AbortSignal): Promise<Texture> {
@@ -1941,10 +1960,16 @@ export class ThreeStoryScene implements StorySceneBackend {
     return this.withTextureRequestSignal(signal, (requestSignal) => this.textureCache.warm(url, requestSignal));
   }
 
-  private acquireTexture(url: string, signal?: AbortSignal): Promise<SharedTextureLease<Texture>> {
+  private acquireTexture(
+    url: string,
+    signal?: AbortSignal,
+    kind: "active" | "warm" = "active",
+  ): Promise<SharedTextureLease<Texture>> {
     if (!url) return Promise.reject(new Error("Cannot load an empty ADV texture URL"));
     this.textureCacheKeys.add(url);
-    return this.withTextureRequestSignal(signal, (requestSignal) => this.textureCache.acquire(url, requestSignal));
+    return this.withTextureRequestSignal(signal, (requestSignal) =>
+      this.textureCache.acquire(url, requestSignal, kind),
+    );
   }
 
   private async uploadPreloadedTexture(texture: Texture, signal?: AbortSignal): Promise<void> {
@@ -1982,11 +2007,6 @@ export class ThreeStoryScene implements StorySceneBackend {
     }
   }
 
-  private releaseEpisodeTextureLeases(): void {
-    for (const lease of this.episodeTextureLeases.values()) lease.release();
-    this.episodeTextureLeases.clear();
-  }
-
   private async resolveEpisodeVideoRenderable(
     source: string,
     signal?: AbortSignal,
@@ -2011,16 +2031,56 @@ export class ThreeStoryScene implements StorySceneBackend {
           renderable.release();
           return existing;
         }
+        if (!this.hasVideoSourceOwner(source)) {
+          renderable.release();
+          throw sceneAbortError("Video preload was superseded");
+        }
         this.episodeVideoRenderables.set(source, renderable);
         return renderable;
       })
       .finally(() => {
         if (this.episodeVideoRenderableLoads.get(source) === load) {
           this.episodeVideoRenderableLoads.delete(source);
+          this.releaseEpisodeVideoRenderable(source);
         }
       });
     this.episodeVideoRenderableLoads.set(source, load);
     return waitForScenePromise(load, signal, "Video preload was aborted");
+  }
+
+  private retainPendingVideoSource(source: string): void {
+    if (!source) return;
+    this.pendingVideoSources.set(source, (this.pendingVideoSources.get(source) || 0) + 1);
+  }
+
+  private releasePendingVideoSource(source: string): void {
+    if (!source) return;
+    const count = this.pendingVideoSources.get(source) || 0;
+    if (count <= 1) this.pendingVideoSources.delete(source);
+    else this.pendingVideoSources.set(source, count - 1);
+    this.releaseEpisodeVideoRenderable(source);
+  }
+
+  private activeVideoSource(): string {
+    return firstString(this.overlay?.videoElement?.dataset.vegaSource);
+  }
+
+  private hasVideoSourceOwner(source: string): boolean {
+    return Boolean(
+      source &&
+      (this.pendingVideoSources.has(source) ||
+        this.activeVideoSource() === source ||
+        this.overlay?.ownsVideoSource(source)),
+    );
+  }
+
+  private releaseEpisodeVideoRenderable(source: string): void {
+    if (!source || this.hasVideoSourceOwner(source)) return;
+    if (this.episodeVideoRenderableLoads.has(source)) return;
+    const renderable = this.episodeVideoRenderables.get(source);
+    if (!renderable) return;
+    this.episodeVideoRenderables.delete(source);
+    renderable.release();
   }
 
   private releaseEpisodeVideoRenderables(): void {
@@ -2029,6 +2089,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     }
     this.episodeVideoRenderables.clear();
     this.episodeVideoRenderableLoads.clear();
+    this.pendingVideoSources.clear();
   }
 
   private withTextureRequestSignal<Value>(
@@ -2056,6 +2117,16 @@ export class ThreeStoryScene implements StorySceneBackend {
   setSeekIndexCompilationActive(active: boolean): void {
     if (this.seekIndexCompilationActive === Boolean(active)) return;
     this.seekIndexCompilationActive = Boolean(active);
+    if (active) {
+      for (const preload of this.characterPreloads.values()) {
+        preload.detach();
+        preload.controller.abort();
+      }
+      this.characterPreloads.clear();
+      this.logicalCharacterStates.clear();
+      this.characterControllerIdentities.clear();
+      this.characterLoadTokens.clear();
+    }
   }
 
   setDeterministicReplayActive(active: boolean): void {
@@ -3263,6 +3334,212 @@ export class ThreeStoryScene implements StorySceneBackend {
     };
   }
 
+  private logicalCharacterByTarget(target: string, expectedIdentity?: string): LogicalCharacterState | null {
+    const identity = expectedIdentity || this.characterControllerIdentities.get(target);
+    return identity ? this.logicalCharacterStates.get(identity) || null : null;
+  }
+
+  private logicalCharacterAtPosition(positionType: number): LogicalCharacterState | null {
+    for (const state of this.logicalCharacterStates.values()) {
+      if (state.visible && state.positionType === positionType) return state;
+    }
+    return null;
+  }
+
+  private logicalCharacterPresentationDefaults(
+    entry: StoryCharacterEntry,
+    cmd: AdvCommand,
+  ): {
+    motionName: string;
+    expressionName: string;
+    fadeInSeconds: number;
+  } {
+    return {
+      motionName: firstString(
+        cmd.characterPresentation?.motionName,
+        cmd.motionName,
+        entry.profile?.defaultMotionName,
+        record(entry.runtime).defaultMotionName,
+      ),
+      expressionName: firstString(
+        cmd.characterPresentation?.expressionName,
+        cmd.expressionName,
+        entry.profile?.defaultExpressionName,
+        record(entry.runtime).defaultExpressionName,
+      ),
+      fadeInSeconds: finite(
+        cmd.characterPresentation?.fadeInSeconds,
+        finite(entry.profile?.presentationFadeInSeconds, finite(record(entry.runtime).presentationFadeInSeconds)),
+      ),
+    };
+  }
+
+  private newLogicalCharacterState(
+    cmd: AdvCommand,
+    target: string,
+    identity: string,
+    positionType: number,
+  ): LogicalCharacterState {
+    const entry = cmd.characterModel as StoryCharacterEntry;
+    const defaults = this.logicalCharacterPresentationDefaults(entry, cmd);
+    const initialWorldPosition =
+      worldPosition(cmd.characterWorldTransition?.from) ??
+      worldPosition(cmd.characterWorldPosition) ??
+      worldPosition(cmd.characterWorldTransition?.to);
+    const presentation: AdvCharacterPresentationEvent[] = [];
+    if (defaults.motionName) presentation.push({ kind: "motion", name: defaults.motionName });
+    if (defaults.expressionName) presentation.push({ kind: "expression", name: defaults.expressionName });
+    return {
+      target,
+      identity,
+      controllerIdentity: identity,
+      characterKey: String(cmd.characterKey || ""),
+      visible: true,
+      speculative: false,
+      entry,
+      positionType,
+      worldPosition: initialWorldPosition ? { ...initialWorldPosition } : null,
+      offset: { x: 0, y: 0, z: 0 },
+      alpha: 1,
+      brightness: 1,
+      facing: 1,
+      roleAngle: 0,
+      angle: 0,
+      bodyAngle: 0,
+      angleOverride: false,
+      lookX: 0,
+      lookY: 0,
+      lookOriginalX: 0,
+      lookOriginalY: 0,
+      lookOverride: false,
+      blurIntensity: positionType === this.cameraState.focusPositionType ? 0 : this.fieldRendererState.characterBlur,
+      sortingOrder: Number.isFinite(Number(cmd.characterRenderOrder)) ? Number(cmd.characterRenderOrder) : 0,
+      rimLight: {
+        enabled: false,
+        color: { r: 1, g: 1, b: 1, a: 1 },
+        shadowIntensity: 0.8,
+      },
+      presentation,
+      currentMotionName: defaults.motionName,
+      currentMotionFadeInSeconds: defaults.motionName ? defaults.fadeInSeconds : undefined,
+      currentExpressionName: defaults.expressionName,
+      currentExpressionFadeInSeconds: defaults.expressionName ? defaults.fadeInSeconds : undefined,
+      activeExpressionName: defaults.expressionName,
+      activeExpressionFadeInSeconds: defaults.expressionName ? defaults.fadeInSeconds : undefined,
+      pendingPausedMotion: null,
+      pendingPausedExpression: null,
+      lipSync: {
+        enabled: false,
+        source: "none",
+        timedMode: "oscillating",
+        holdOpenLevel: 0,
+        timedRemaining: 0,
+        voiceRemaining: 0,
+        voiceSpeed: 1,
+        voiceMultiplier: 1,
+        voiceExpiresAtSeconds: 0,
+        stopRemaining: 0,
+        speed: 1,
+        multiplier: 1,
+        timer: 0,
+        openScale: 0,
+        isOpen: false,
+        beforeLevel: 0,
+        mouthOpenY: 0,
+        mouthForm: 0,
+        motionSyncPcm: null,
+        dampVelocity: { value: 0 },
+        randomSeed: { value: hashSeed(`${cmd.characterKey || ""}:${target}`) },
+        sources: [],
+      },
+      paused: false,
+    };
+  }
+
+  private resetLogicalCharacterForShow(
+    state: LogicalCharacterState,
+    cmd: AdvCommand,
+    target: string,
+    positionType: number,
+  ): void {
+    const defaults = this.logicalCharacterPresentationDefaults(state.entry, cmd);
+    const initialWorldPosition =
+      worldPosition(cmd.characterWorldTransition?.from) ??
+      worldPosition(cmd.characterWorldPosition) ??
+      worldPosition(cmd.characterWorldTransition?.to);
+    state.target = target;
+    state.characterKey = String(cmd.characterKey || state.characterKey);
+    state.entry = cmd.characterModel as StoryCharacterEntry;
+    state.visible = true;
+    state.positionType = positionType;
+    state.worldPosition = initialWorldPosition ? { ...initialWorldPosition } : null;
+    state.alpha = 1;
+    state.angle = 0;
+    state.bodyAngle = 0;
+    state.angleOverride = false;
+    state.lookX = 0;
+    state.lookY = 0;
+    state.lookOriginalX = 0;
+    state.lookOriginalY = 0;
+    state.lookOverride = false;
+    state.currentMotionName = defaults.motionName;
+    state.currentMotionFadeInSeconds = defaults.motionName ? defaults.fadeInSeconds : undefined;
+    state.currentExpressionName = defaults.expressionName;
+    state.currentExpressionFadeInSeconds = defaults.expressionName ? defaults.fadeInSeconds : undefined;
+    state.activeExpressionName = defaults.expressionName;
+    state.activeExpressionFadeInSeconds = defaults.expressionName ? defaults.fadeInSeconds : undefined;
+    delete state.modelState;
+    state.pendingPausedMotion = null;
+    state.pendingPausedExpression = null;
+    state.paused = false;
+    state.presentation = [
+      ...(defaults.motionName ? [{ kind: "motion" as const, name: defaults.motionName }] : []),
+      ...(defaults.expressionName ? [{ kind: "expression" as const, name: defaults.expressionName }] : []),
+    ];
+    state.blurIntensity =
+      positionType === this.cameraState.focusPositionType ? 0 : this.fieldRendererState.characterBlur;
+  }
+
+  private logicalPresentationEvent(state: LogicalCharacterState, event: AdvCharacterPresentationEvent): void {
+    state.presentation = [...state.presentation, { ...event }];
+  }
+
+  private logicalCharacterSnapshot(state: LogicalCharacterState): AdvSeekCharacterSnapshot {
+    return {
+      ...state,
+      entry: state.entry,
+      offset: { ...state.offset },
+      worldPosition: state.worldPosition ? { ...state.worldPosition } : null,
+      rimLight: clonePlain(state.rimLight),
+      presentation: state.presentation.map((event) => ({ ...event })),
+      lipSync: {
+        ...state.lipSync,
+        motionSyncPcm: null,
+        sources: [],
+        dampVelocity: { ...state.lipSync.dampVelocity },
+        randomSeed: { ...state.lipSync.randomSeed },
+      },
+    };
+  }
+
+  private restoreLogicalCharacterState(snapshot: AdvSeekCharacterSnapshot): LogicalCharacterState {
+    return {
+      ...snapshot,
+      entry: snapshot.entry,
+      offset: { ...snapshot.offset },
+      worldPosition: snapshot.worldPosition ? { ...snapshot.worldPosition } : null,
+      presentation: snapshot.presentation.map((event) => ({ ...event })),
+      rimLight: clonePlain(snapshot.rimLight),
+      lipSync: {
+        ...snapshot.lipSync,
+        motionSyncPcm: null,
+        sources: [],
+        dampVelocity: { ...snapshot.lipSync.dampVelocity },
+        randomSeed: { ...snapshot.lipSync.randomSeed },
+      },
+    };
+  }
+
   private beginCharacterLoad(target: string, cmd: AdvCommand): { scene: number; target: number; signal: AbortSignal } {
     this.cancelCharacterOwnedTweens(target);
     this.cancelPendingAngleWait(target);
@@ -3354,11 +3631,11 @@ export class ThreeStoryScene implements StorySceneBackend {
       // the live pending presentation, so it wins; dispose the never-visible
       // speculative duplicate before replacing the cache entry.
       this.speculativeCharacterControllers.delete(resolvedIdentity);
-      this.speculativeCharacterCommandIndices.delete(resolvedIdentity);
       this.cachedCharacterControllers.delete(resolvedIdentity);
       this.releaseUnownedPreloadedCharacter(existing, "speculative character superseded by CharacterIn");
     }
     this.cachedCharacterControllers.set(resolvedIdentity, item);
+    this.trimIdleResidentControllers(resolvedIdentity);
     this.completePendingCharacterLoadController(target, token);
     return true;
   }
@@ -3392,8 +3669,6 @@ export class ThreeStoryScene implements StorySceneBackend {
     // CharacterIn cannot race pool bookkeeping.
     if (item) {
       this.speculativeCharacterControllers.delete(identity);
-      this.speculativeCharacterCommandIndices.delete(identity);
-      this.notifyCharacterPreloadCapacity();
     }
     return item;
   }
@@ -3401,12 +3676,10 @@ export class ThreeStoryScene implements StorySceneBackend {
   private discardSpeculativeCharacter(identity: string, item: StoryCharacter, reason: string): void {
     if (this.speculativeCharacterControllers.get(identity) !== item) return;
     this.speculativeCharacterControllers.delete(identity);
-    this.speculativeCharacterCommandIndices.delete(identity);
     if (this.cachedCharacterControllers.get(identity) === item) {
       this.cachedCharacterControllers.delete(identity);
     }
     this.discardedCharacterPreloadIdentities.add(identity);
-    this.notifyCharacterPreloadCapacity();
     this.cancelCharacterModelRecovery(item);
     item.angleTweenController?.abort();
     item.lookTweenController?.abort();
@@ -3422,40 +3695,57 @@ export class ThreeStoryScene implements StorySceneBackend {
     void this.releaseCharacterModelSafely(item, reason);
   }
 
-  /**
-   * Release cached controllers that are neither on stage, staged for entry,
-   * pending a placement, in recovery, nor the currently selected variant of
-   * their target — typically superseded costume variants after a Costume
-   * switch. Reported as discarded so Vega rebuilds them if a later command
-   * addresses them again.
-   */
-  /**
-   * Dispose textures that only an evicted/removed model references. Character
-   * atlases dominate VRAM; without this, costume swaps accumulated every
-   * variant's texture pages for the whole episode.
-   */
-  private evictIdleResidentControllers(keepIdentity: string): void {
+  private characterCacheLimit(): number {
+    const configured = Math.max(1, Math.floor(finite(this.runtime.characterPreloadCacheMax, 8)));
+    const episodeLimit = this.episodeCharacterControllerCap;
+    return episodeLimit == null ? configured : Math.max(1, Math.min(configured, episodeLimit));
+  }
+
+  private isProtectedCharacterController(identity: string, item: StoryCharacter, keepIdentity?: string): boolean {
+    if (identity === keepIdentity) return true;
+    if ([...this.characterItems.values()].some((visible) => visible === item)) return true;
+    if (this.characterControllerIdentities.get(item.target) === identity) return true;
+    if (this.stagedCharacterItems.get(item.target)?.item === item) return true;
+    for (const pending of this.pendingCharacterPlacements.values()) {
+      if (pending.identity === identity) return true;
+    }
+    return this.characterModelRecoveryStates.has(item);
+  }
+
+  /** Keep one total resident-controller budget for speculative and command In ownership. */
+  private trimIdleResidentControllers(keepIdentity?: string): void {
+    let overflow = this.cachedCharacterControllers.size + this.characterPreloads.size - this.characterCacheLimit();
+    if (overflow <= 0) return;
     for (const [identity, item] of [...this.cachedCharacterControllers]) {
-      if (identity === keepIdentity) continue;
-      if (this.characterItems.get(item.target) === item) continue;
-      if (this.characterControllerIdentities.get(item.target) === identity) continue;
-      if (this.stagedCharacterItems.get(item.target)?.item === item) continue;
-      let placed = false;
-      for (const pending of this.pendingCharacterPlacements.values()) {
-        if (pending.identity === identity) {
-          placed = true;
-          break;
-        }
-      }
-      if (placed) continue;
-      if (this.characterModelRecoveryStates.has(item)) continue;
+      if (overflow <= 0) break;
+      if (this.isProtectedCharacterController(identity, item, keepIdentity)) continue;
       this.cachedCharacterControllers.delete(identity);
       this.speculativeCharacterControllers.delete(identity);
-      this.speculativeCharacterCommandIndices.delete(identity);
-      this.discardedCharacterPreloadIdentities.add(identity);
       this.releaseUnownedPreloadedCharacter(item, "character cache pressure");
+      overflow -= 1;
     }
-    this.notifyCharacterPreloadCapacity();
+  }
+
+  get characterCacheStats(): {
+    readonly configuredCap: number;
+    readonly residentControllers: number;
+    readonly inFlightPreloads: number;
+    readonly visibleControllers: number;
+    readonly protectedControllers: number;
+    readonly idleControllers: number;
+  } {
+    let protectedControllers = 0;
+    for (const [identity, item] of this.cachedCharacterControllers) {
+      if (this.isProtectedCharacterController(identity, item)) protectedControllers += 1;
+    }
+    return {
+      configuredCap: this.characterCacheLimit(),
+      residentControllers: this.cachedCharacterControllers.size,
+      inFlightPreloads: this.characterPreloads.size,
+      visibleControllers: this.characterItems.size,
+      protectedControllers,
+      idleControllers: this.cachedCharacterControllers.size - protectedControllers,
+    };
   }
 
   private discardAllSpeculativeCharacters(reason: string): void {
@@ -3516,7 +3806,13 @@ export class ThreeStoryScene implements StorySceneBackend {
   selectCharacterAssetIndex(target: string, assetIndex: number): void {
     const name = String(target || "");
     if (!name) return;
-    this.characterControllerIdentities.set(name, `${name}\u0000${Number(assetIndex) || 0}`);
+    const previousIdentity = this.characterControllerIdentities.get(name);
+    const nextIdentity = `${name}\u0000${Number(assetIndex) || 0}`;
+    if (this.seekIndexCompilationActive && previousIdentity && previousIdentity !== nextIdentity) {
+      const previous = this.logicalCharacterStates.get(previousIdentity);
+      if (previous) previous.visible = false;
+    }
+    this.characterControllerIdentities.set(name, nextIdentity);
   }
 
   private cancelPendingLookWait(target: string): void {
@@ -3734,7 +4030,6 @@ export class ThreeStoryScene implements StorySceneBackend {
     positionType: number,
     motions: readonly string[],
     expressions: readonly string[],
-    commandIndex: number,
     signal: AbortSignal,
   ): Promise<StoryCharacter | null> {
     const entry = cmd.characterModel as StoryCharacterEntry | undefined;
@@ -3757,6 +4052,7 @@ export class ThreeStoryScene implements StorySceneBackend {
 
     while (!this.destroyed && !signal.aborted) {
       if (!(await this.waitForRenderableContext(signal))) return null;
+      if (this.seekIndexCompilationActive || signal.aborted) return null;
       const contextGeneration = this.contextRestoreGeneration;
       let model: ThreeStoryCharacterModel | null = null;
       let item: StoryCharacter | null = null;
@@ -3880,7 +4176,6 @@ export class ThreeStoryScene implements StorySceneBackend {
         }
         this.cachedCharacterControllers.set(identity, item);
         this.speculativeCharacterControllers.set(identity, item);
-        this.speculativeCharacterCommandIndices.set(identity, Math.max(0, Math.floor(finite(commandIndex))));
         return item;
       } catch (error) {
         if (item) {
@@ -4042,16 +4337,35 @@ export class ThreeStoryScene implements StorySceneBackend {
   async placeCharacter(cmd: AdvCommand, positionType: number, duration = 0, _noWait = false): Promise<void> {
     const target = String(cmd.targetName || cmd.targets?.[0]?.target || "");
     if (!target) return;
-    // Background seek-index compilation only needs the logical identity →
-    // position → presentation mapping for checkpoints. Creating GPU models
-    // here loaded every authored character on top of the playback set and
-    // jetsam-killed iOS / froze desktops mid-episode through VRAM pressure.
+    // Background seek-index compilation must not allocate GPU models. Keep a
+    // complete controller record keyed by the same TargetName+AssetIndex
+    // identity used by the renderer cache, including hidden Out controllers.
     if (this.seekIndexCompilationActive) {
+      const entry = cmd.characterModel as StoryCharacterEntry | undefined;
+      // The normal renderer treats a missing loader variant as a no-op. Index
+      // compilation must preserve that decision; it cannot invent a logical
+      // controller for a descriptor the loader did not resolve.
+      if (!entry) return;
       const compileIdentity = firstString(
         record(cmd).controllerIdentity,
         `${target}\u0000${Number(cmd.targetAssetIndex) || 0}`,
       );
+      const previousIdentity = this.characterControllerIdentities.get(target);
+      if (previousIdentity && previousIdentity !== compileIdentity) {
+        const previous = this.logicalCharacterStates.get(previousIdentity);
+        if (previous) previous.visible = false;
+      }
       this.characterControllerIdentities.set(target, compileIdentity);
+      this.characterLoadTokens.set(target, ++this.characterLoadSequence);
+      const existing = this.logicalCharacterStates.get(compileIdentity);
+      if (existing) {
+        this.resetLogicalCharacterForShow(existing, cmd, target, Number(positionType) || 5);
+      } else {
+        this.logicalCharacterStates.set(
+          compileIdentity,
+          this.newLogicalCharacterState(cmd, target, compileIdentity, Number(positionType) || 5),
+        );
+      }
       return;
     }
     const alphaOperationAtStart = this.characterAlphaOperations.get(target);
@@ -4482,8 +4796,28 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   async removeCharacter(target: string, duration = 0): Promise<boolean> {
-    if (this.seekIndexCompilationActive) return true;
+    if (this.seekIndexCompilationActive) {
+      const item = this.logicalCharacterByTarget(target);
+      if (!item) return false;
+      item.visible = false;
+      item.alpha = 0;
+      item.paused = false;
+      item.pendingPausedMotion = null;
+      item.pendingPausedExpression = null;
+      if (item.entry.profile?.preservePresentationOnHide !== true) {
+        item.activeExpressionName = "";
+        item.activeExpressionFadeInSeconds = undefined;
+      }
+      this.characterPresentationHistory.delete(target);
+      this.characterLoadTokens.set(target, ++this.characterLoadSequence);
+      return true;
+    }
     const wasPending = this.pendingCharacterPlacements.has(target) || this.stagedCharacterItems.has(target);
+    const logicalShadow = this.logicalCharacterByTarget(target);
+    if (logicalShadow) {
+      logicalShadow.visible = false;
+      logicalShadow.alpha = 0;
+    }
     this.invalidateCharacterLoad(target);
     this.characterPresentationHistory.delete(target);
     const item = this.characterItems.get(target);
@@ -4525,6 +4859,11 @@ export class ThreeStoryScene implements StorySceneBackend {
     const seconds = Math.max(0, finite(duration));
     const operationId = ++this.characterAlphaOperationSequence;
     this.characterAlphaOperations.set(target, operationId);
+    if (this.seekIndexCompilationActive) {
+      const item = this.logicalCharacterByTarget(target);
+      if (item) item.alpha = targetAlpha;
+      return;
+    }
     const item = this.cachedCharacterController(target);
     if (item) {
       await this.fadeCharacterLifecycle(item, item.alpha, targetAlpha, seconds);
@@ -4607,6 +4946,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.pendingCharacterCommands.clear();
     this.pendingCharacterPlacements.clear();
     this.pendingCharacterWorldPositions.clear();
+    this.logicalCharacterStates.clear();
     for (const controller of this.pendingAngleWaitControllers.values()) controller.abort();
     this.pendingAngleWaitControllers.clear();
     for (const controller of this.pendingLookWaitControllers.values()) controller.abort();
@@ -4617,7 +4957,6 @@ export class ThreeStoryScene implements StorySceneBackend {
     }
     this.characterItems.clear();
     this.speculativeCharacterControllers.clear();
-    this.speculativeCharacterCommandIndices.clear();
     this.characterControllerIdentities.clear();
     this.sortedCharacterItems.length = 0;
     for (const group of this.characterRenderGroupPool) group.items.length = 0;
@@ -4632,7 +4971,6 @@ export class ThreeStoryScene implements StorySceneBackend {
       preload.controller.abort();
     }
     this.characterPreloads.clear();
-    this.notifyCharacterPreloadCapacity();
     for (const prime of [...this.characterRenderPrimes.values()]) {
       this.settleCharacterRenderPrime(prime, sceneAbortError(`Character ${prime.item.target} preload was cleared`));
     }
@@ -4646,6 +4984,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.pendingCharacterCommands.clear();
     this.pendingCharacterPlacements.clear();
     this.pendingCharacterWorldPositions.clear();
+    this.logicalCharacterStates.clear();
     for (const controller of this.pendingAngleWaitControllers.values()) controller.abort();
     this.pendingAngleWaitControllers.clear();
     for (const controller of this.pendingLookWaitControllers.values()) controller.abort();
@@ -4669,14 +5008,26 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.characterItems.clear();
     this.cachedCharacterControllers.clear();
     this.speculativeCharacterControllers.clear();
-    this.speculativeCharacterCommandIndices.clear();
-    this.notifyCharacterPreloadCapacity();
     this.characterControllerIdentities.clear();
+    this.episodeCharacterControllerCap = undefined;
     this.sortedCharacterItems.length = 0;
     for (const group of this.characterRenderGroupPool) group.items.length = 0;
   }
 
   playMotionForTarget(target: string, motionName = "", motionFadeIn = -1, expectedIdentity?: string): void {
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(target, expectedIdentity);
+      if (!logical || !this.hasCharacterPresentationResource(logical.entry, "motions", motionName)) return;
+      if (logical.paused) {
+        this.logicalPresentationEvent(logical, { kind: "motion", name: motionName });
+        logical.pendingPausedMotion = { name: motionName, fadeInSeconds: motionFadeIn };
+        return;
+      }
+      this.logicalPresentationEvent(logical, { kind: "motion", name: motionName });
+      logical.currentMotionName = motionName;
+      logical.currentMotionFadeInSeconds = motionFadeIn;
+      return;
+    }
     const item = expectedIdentity
       ? this.cachedCharacterControllerByIdentity(expectedIdentity)
       : this.cachedCharacterController(target);
@@ -4726,6 +5077,26 @@ export class ThreeStoryScene implements StorySceneBackend {
     fadeInSeconds?: number,
     expectedIdentity?: string,
   ): void {
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(target, expectedIdentity);
+      const entry = logical?.entry;
+      const resolvedName = firstString(
+        expressionName,
+        entry?.profile?.defaultExpressionName,
+        record(entry?.runtime).defaultExpressionName,
+      );
+      if (!logical || !this.hasCharacterPresentationResource(entry, "expressions", resolvedName)) return;
+      this.logicalPresentationEvent(logical, { kind: "expression", name: resolvedName });
+      logical.currentExpressionName = resolvedName;
+      logical.currentExpressionFadeInSeconds = fadeInSeconds;
+      if (logical.paused) {
+        logical.pendingPausedExpression = { name: resolvedName, fadeInSeconds };
+      } else {
+        logical.activeExpressionName = resolvedName;
+        logical.activeExpressionFadeInSeconds = fadeInSeconds;
+      }
+      return;
+    }
     const item = expectedIdentity
       ? this.cachedCharacterControllerByIdentity(expectedIdentity)
       : this.cachedCharacterController(target);
@@ -4807,6 +5178,26 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   setCharacterPaused(target: string, paused: boolean): void {
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(target);
+      if (!logical) return;
+      logical.paused = paused;
+      if (!paused) {
+        if (logical.pendingPausedMotion) {
+          logical.currentMotionName = logical.pendingPausedMotion.name;
+          logical.currentMotionFadeInSeconds = logical.pendingPausedMotion.fadeInSeconds;
+          logical.pendingPausedMotion = null;
+        }
+        if (logical.pendingPausedExpression) {
+          logical.activeExpressionName = logical.pendingPausedExpression.name;
+          logical.activeExpressionFadeInSeconds = logical.pendingPausedExpression.fadeInSeconds;
+          logical.currentExpressionName = logical.activeExpressionName;
+          logical.currentExpressionFadeInSeconds = logical.activeExpressionFadeInSeconds;
+          logical.pendingPausedExpression = null;
+        }
+      }
+      return;
+    }
     const item = this.cachedCharacterController(target);
     if (item) {
       item.paused = paused;
@@ -4845,16 +5236,21 @@ export class ThreeStoryScene implements StorySceneBackend {
     for (const [target, pending] of this.pendingCharacterPlacements) {
       if (this.characterLoadTokens.get(target) === pending.token) targets.add(target);
     }
+    if (this.seekIndexCompilationActive) {
+      for (const item of this.logicalCharacterStates.values()) if (item.visible) targets.add(item.target);
+    }
     return [...targets];
   }
 
   characterMotionIdentity(target: string): string | null {
+    if (this.seekIndexCompilationActive) return this.logicalCharacterByTarget(target)?.controllerIdentity || null;
     const pending = this.pendingCharacterPlacements.get(target);
     const identity = this.characterControllerIdentities.get(target);
     if (pending && identity === pending.identity && this.characterLoadTokens.get(target) === pending.token) {
       return identity;
     }
     if (identity && this.cachedCharacterControllers.has(identity)) return identity;
+    if (identity && this.logicalCharacterStates.has(identity)) return identity;
     return null;
   }
 
@@ -4864,11 +5260,16 @@ export class ThreeStoryScene implements StorySceneBackend {
     const pending = this.pendingCharacterPlacements.get(target);
     return Boolean(
       this.cachedCharacterController(target) ||
-      (identity && pending?.identity === identity && this.characterLoadTokens.get(target) === pending.token),
+      (identity && pending?.identity === identity && this.characterLoadTokens.get(target) === pending.token) ||
+      Boolean(identity && this.logicalCharacterStates.has(identity)),
     );
   }
 
   isCharacterShowing(target: string, expectedIdentity?: string): boolean {
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(target, expectedIdentity);
+      return Boolean(logical?.visible && (!expectedIdentity || logical.controllerIdentity === expectedIdentity));
+    }
     const identity = this.characterMotionIdentity(target);
     const pending = this.pendingCharacterPlacements.get(target);
     const pendingShowing = Boolean(
@@ -4894,6 +5295,13 @@ export class ThreeStoryScene implements StorySceneBackend {
     }
     this.playbackSpeedRate = next;
     this.overlay?.canvasPass.setStillSpeed(next);
+    const video = this.overlay?.videoElement;
+    if (video) {
+      // Keep the HTML media element in the same policy as showVideo(): native
+      // playback rates below 0.1 are not portable across WebKit builds.
+      video.playbackRate = Math.max(0.1, next);
+      this.state.video.playbackRate = video.playbackRate;
+    }
     const controllers = new Set<StoryCharacter>(this.cachedCharacterControllers.values());
     for (const { item } of this.stagedCharacterItems.values()) controllers.add(item);
     for (const item of controllers) {
@@ -4912,6 +5320,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     // Compilation replays thousands of stage swaps; loading each texture
     // here burned VRAM on backgrounds the player never sees.
     if (this.seekIndexCompilationActive) {
+      if (background?.stage != null) this.applyLogicalStage(background.stage);
       this.state.background = background ?? null;
       return true;
     }
@@ -5072,7 +5481,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.pendingStageCapture = null;
   }
 
-  private applyStage(stageValue: unknown, focusGroupIndex = 0, reset = true): void {
+  private applyStageMetadata(stageValue: unknown, focusGroupIndex = 0): UnknownRecord {
     const stage = record(stageValue);
     this.state.stage = stageValue || null;
     const stageUpdate = { ...this.runtime.stage } as AdvRuntimeConfig["stage"] & UnknownRecord;
@@ -5093,6 +5502,10 @@ export class ThreeStoryScene implements StorySceneBackend {
     ]) {
       if (stage[key] != null) stageUpdate[key] = stage[key];
     }
+    if (stage.positions && typeof stage.positions === "object")
+      stageUpdate.positions = stage.positions as AdvRuntimeConfig["stage"]["positions"];
+    if (stage.focusAnchors && typeof stage.focusAnchors === "object")
+      stageUpdate.focusAnchors = stage.focusAnchors as AdvRuntimeConfig["stage"]["focusAnchors"];
     const backgroundSprite = record(stage.backgroundSprite);
     if (stage.backgroundSize || backgroundSprite.worldSize) {
       stageUpdate.backgroundSize = (stage.backgroundSize || backgroundSprite.worldSize) as {
@@ -5115,6 +5528,45 @@ export class ThreeStoryScene implements StorySceneBackend {
     }
     this.runtime = { ...this.runtime, stage: stageUpdate };
     this.focusDataSettingsKey = String(stage.usingFocusDataSettingsKey || this.focusDataSettingsKey);
+    return stage;
+  }
+
+  private applyLogicalStage(stageValue: unknown): void {
+    const stage = this.applyStageMetadata(stageValue, 0);
+    this.stageOffsets.clear();
+    const initialPosition = vec3(stage.initialCameraPosition ?? this.runtime.stage.initialCameraPosition, ZERO_VEC3);
+    const initialRotation = vec3(stage.initialCameraRotation ?? this.runtime.stage.initialCameraRotation, ZERO_VEC3);
+    const positionMagnitude = initialPosition.x ** 2 + initialPosition.y ** 2 + initialPosition.z ** 2;
+    const rotationMagnitude = initialRotation.x ** 2 + initialRotation.y ** 2 + initialRotation.z ** 2;
+    if (positionMagnitude >= 9.99999944e-11) {
+      this.cameraState.baseX = initialPosition.x;
+      this.cameraState.baseY = initialPosition.y;
+      this.cameraState.baseZ = initialPosition.z;
+    } else {
+      this.cameraState.baseX = 0;
+      this.cameraState.baseY = 0;
+      this.cameraState.baseZ = 0;
+    }
+    if (rotationMagnitude >= 9.99999944e-11) {
+      this.cameraState.rotationX = -initialRotation.x;
+      this.cameraState.rotationY = initialRotation.y;
+      this.cameraState.angle = initialRotation.z;
+    } else {
+      this.cameraState.rotationX = 0;
+      this.cameraState.rotationY = 0;
+      this.cameraState.angle = 0;
+    }
+    this.cameraState.fieldRotationY = 0;
+    this.cameraState.stageRotationY = 0;
+    this.cameraState.zoomRatio = 1;
+    this.cameraState.panOffsetX = 0;
+    this.cameraState.panOffsetY = 0;
+    this.cameraState.focusPositionType = 5;
+    this.cameraState.focusTargetName = "";
+  }
+
+  private applyStage(stageValue: unknown, focusGroupIndex = 0, reset = true): void {
+    const stage = this.applyStageMetadata(stageValue, focusGroupIndex);
     if (!reset) {
       this.applyTransforms();
       return;
@@ -5230,18 +5682,20 @@ export class ThreeStoryScene implements StorySceneBackend {
     const additional = packUnityUrpAdditionalLights(
       lights
         .filter((light) => light !== directional)
-        .map((light): UnityCharacterAdditionalLightLike => ({
-          active: true,
-          type: finite(light.type, -1),
-          position: vec3(light.worldPosition, { x: 0, y: 0, z: 0 }),
-          forward: vec3(light.worldForward, { x: 0, y: 0, z: 1 }),
-          rotation: lightQuaternion(light.worldRotation),
-          color: lightColor(light.color),
-          intensity: finite(light.intensity, 1),
-          range: finite(light.range, 10),
-          spotAngle: finite(light.spotAngle, 30),
-          innerSpotAngle: Number.isFinite(Number(light.innerSpotAngle)) ? Number(light.innerSpotAngle) : undefined,
-        })),
+        .map(
+          (light): UnityCharacterAdditionalLightLike => ({
+            active: true,
+            type: finite(light.type, -1),
+            position: vec3(light.worldPosition, { x: 0, y: 0, z: 0 }),
+            forward: vec3(light.worldForward, { x: 0, y: 0, z: 1 }),
+            rotation: lightQuaternion(light.worldRotation),
+            color: lightColor(light.color),
+            intensity: finite(light.intensity, 1),
+            range: finite(light.range, 10),
+            spotAngle: finite(light.spotAngle, 30),
+            innerSpotAngle: Number.isFinite(Number(light.innerSpotAngle)) ? Number(light.innerSpotAngle) : undefined,
+          }),
+        ),
     );
     const enabled = this.qualityConfig.isUnityLightingEnabled() && lights.length > 0;
     this.characterLightingState = {
@@ -5569,25 +6023,37 @@ export class ThreeStoryScene implements StorySceneBackend {
   ): Promise<void> {
     const generation = this.sceneGeneration;
     const overlay = this.overlay;
+    const previousSource = this.activeVideoSource();
     const source =
       typeof videoInfo === "string" ? videoInfo : firstString(videoInfo.playableUrl, videoInfo.src, videoInfo.url);
     overlay?.canvasPass.setVideoLayout(this.state.video.layout);
-    const renderable = source ? await this.resolveEpisodeVideoRenderable(source, signal) : undefined;
-    const video = await overlay?.showVideo(videoInfo, playbackRate, signal, renderable?.url);
-    if (this.destroyed || generation !== this.sceneGeneration || signal?.aborted || this.overlay !== overlay) return;
-    if (!video) return;
-    Object.assign(this.state.video, {
-      visible: true,
-      src: source,
-      alpha: fadeIn > 0 ? 0 : clamp(targetAlpha),
-      playbackRate,
-      playing: true,
-      ended: false,
-    });
-    this.overlay?.setVideoAlpha(fadeIn > 0 ? 0 : clamp(targetAlpha));
-    if (fadeIn > 0) {
-      await this.fadeVideo(targetAlpha, fadeIn);
+    if (source) this.retainPendingVideoSource(source);
+    try {
+      const renderable = source ? await this.resolveEpisodeVideoRenderable(source, signal) : undefined;
+      const video = await overlay?.showVideo(videoInfo, playbackRate, signal, renderable?.url);
       if (this.destroyed || generation !== this.sceneGeneration || signal?.aborted || this.overlay !== overlay) return;
+      if (!video) return;
+      Object.assign(this.state.video, {
+        visible: true,
+        src: source,
+        alpha: fadeIn > 0 ? 0 : clamp(targetAlpha),
+        playbackRate: video.playbackRate,
+        playing: true,
+        ended: false,
+      });
+      this.overlay?.setVideoAlpha(fadeIn > 0 ? 0 : clamp(targetAlpha));
+      if (fadeIn > 0) {
+        await this.fadeVideo(targetAlpha, fadeIn);
+        if (this.destroyed || generation !== this.sceneGeneration || signal?.aborted || this.overlay !== overlay)
+          return;
+      }
+    } finally {
+      if (source) this.releasePendingVideoSource(source);
+      // clearVideo(false) deliberately suppresses a residency callback while
+      // replacing a playing element. Once the replacement has settled, the
+      // old source is no longer an active/pending owner and its resolver lease
+      // can be released safely. Re-showing the same source keeps its lease.
+      if (previousSource && previousSource !== source) this.releaseEpisodeVideoRenderable(previousSource);
     }
   }
 
@@ -6003,6 +6469,13 @@ export class ThreeStoryScene implements StorySceneBackend {
         return { safe: false, reason: `character-lip-active:${item.target}` };
       }
     }
+    if (this.seekIndexCompilationActive) {
+      for (const item of this.logicalCharacterStates.values()) {
+        if (item.lipSync.enabled || item.lipSync.motionSyncPcm || item.lipSync.sources.length) {
+          return { safe: false, reason: `logical-character-lip-active:${item.target}` };
+        }
+      }
+    }
     return { safe: true };
   }
 
@@ -6010,56 +6483,58 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (!this.screenEffects.ready) return null;
     if (this.overlay && !this.overlay.canvasPass.ready) return null;
     if (!this.seekSnapshotSafety().safe) return null;
-    const characters = [...this.cachedCharacterControllers.entries()].map(([controllerIdentity, item]) => ({
-      target: item.target,
-      characterKey: item.characterKey,
-      identity: controllerIdentity,
-      controllerIdentity,
-      visible: this.characterItems.get(item.target) === item,
-      speculative: this.speculativeCharacterControllers.get(controllerIdentity) === item,
-      entry: item.entry,
-      positionType: item.positionType,
-      worldPosition: item.worldPosition ? { ...item.worldPosition } : null,
-      offset: { ...item.offset },
-      ...(item.model.createSnapshot ? { modelState: item.model.createSnapshot() } : {}),
-      alpha: item.alpha,
-      brightness: item.brightness,
-      facing: item.facing,
-      roleAngle: item.roleAngle,
-      angle: item.angle,
-      bodyAngle: item.bodyAngle,
-      angleOverride: item.angleOverride,
-      lookX: item.lookX,
-      lookY: item.lookY,
-      lookOriginalX: item.lookOriginalX,
-      lookOriginalY: item.lookOriginalY,
-      lookOverride: item.lookOverride,
-      blurIntensity: item.blurIntensity,
-      sortingOrder: item.sortingOrder,
-      rimLight: clonePlain(item.rimLight),
-      presentation: [
-        ...(item.currentMotionName ? [{ kind: "motion" as const, name: item.currentMotionName }] : []),
-        ...(item.activeExpressionName ? [{ kind: "expression" as const, name: item.activeExpressionName }] : []),
-      ],
-      currentMotionName: item.currentMotionName,
-      currentMotionFadeInSeconds: item.currentMotionFadeInSeconds,
-      currentExpressionName: item.currentExpressionName,
-      currentExpressionFadeInSeconds: item.currentExpressionFadeInSeconds,
-      activeExpressionName: item.activeExpressionName,
-      activeExpressionFadeInSeconds: item.activeExpressionFadeInSeconds,
-      pendingPausedMotion: item.pendingPausedMotion ? { ...item.pendingPausedMotion } : null,
-      pendingPausedExpression: item.pendingPausedExpression ? { ...item.pendingPausedExpression } : null,
-      // Active lip states are rejected by seekSnapshotSafety; retain the
-      // normalized idle values without serializing browser audio objects.
-      lipSync: {
-        ...item.lipSync,
-        motionSyncPcm: null,
-        sources: [] as const,
-        dampVelocity: { ...item.lipSync.dampVelocity },
-        randomSeed: { ...item.lipSync.randomSeed },
-      },
-      paused: item.paused,
-    }));
+    const characters = this.seekIndexCompilationActive
+      ? [...this.logicalCharacterStates.values()].map((item) => this.logicalCharacterSnapshot(item))
+      : [...this.cachedCharacterControllers.entries()].map(([controllerIdentity, item]) => ({
+          target: item.target,
+          characterKey: item.characterKey,
+          identity: controllerIdentity,
+          controllerIdentity,
+          visible: this.characterItems.get(item.target) === item,
+          speculative: this.speculativeCharacterControllers.get(controllerIdentity) === item,
+          entry: item.entry,
+          positionType: item.positionType,
+          worldPosition: item.worldPosition ? { ...item.worldPosition } : null,
+          offset: { ...item.offset },
+          ...(item.model.createSnapshot ? { modelState: item.model.createSnapshot() } : {}),
+          alpha: item.alpha,
+          brightness: item.brightness,
+          facing: item.facing,
+          roleAngle: item.roleAngle,
+          angle: item.angle,
+          bodyAngle: item.bodyAngle,
+          angleOverride: item.angleOverride,
+          lookX: item.lookX,
+          lookY: item.lookY,
+          lookOriginalX: item.lookOriginalX,
+          lookOriginalY: item.lookOriginalY,
+          lookOverride: item.lookOverride,
+          blurIntensity: item.blurIntensity,
+          sortingOrder: item.sortingOrder,
+          rimLight: clonePlain(item.rimLight),
+          presentation: [
+            ...(item.currentMotionName ? [{ kind: "motion" as const, name: item.currentMotionName }] : []),
+            ...(item.activeExpressionName ? [{ kind: "expression" as const, name: item.activeExpressionName }] : []),
+          ],
+          currentMotionName: item.currentMotionName,
+          currentMotionFadeInSeconds: item.currentMotionFadeInSeconds,
+          currentExpressionName: item.currentExpressionName,
+          currentExpressionFadeInSeconds: item.currentExpressionFadeInSeconds,
+          activeExpressionName: item.activeExpressionName,
+          activeExpressionFadeInSeconds: item.activeExpressionFadeInSeconds,
+          pendingPausedMotion: item.pendingPausedMotion ? { ...item.pendingPausedMotion } : null,
+          pendingPausedExpression: item.pendingPausedExpression ? { ...item.pendingPausedExpression } : null,
+          // Active lip states are rejected by seekSnapshotSafety; retain the
+          // normalized idle values without serializing browser audio objects.
+          lipSync: {
+            ...item.lipSync,
+            motionSyncPcm: null,
+            sources: [] as const,
+            dampVelocity: { ...item.lipSync.dampVelocity },
+            randomSeed: { ...item.lipSync.randomSeed },
+          },
+          paused: item.paused,
+        }));
     return {
       version: STORY_SCENE_SEEK_SNAPSHOT_VERSION,
       rendererState: {
@@ -6165,6 +6640,9 @@ export class ThreeStoryScene implements StorySceneBackend {
     await this.hideVideo(0);
     if (signal?.aborted || this.destroyed) return;
     this.prepareCharactersForSeekRestore();
+    for (const character of snapshot.characters) {
+      this.logicalCharacterStates.set(character.controllerIdentity, this.restoreLogicalCharacterState(character));
+    }
     this.clearFrameOverlay();
 
     await this.setBackground(snapshot.background, 0);
@@ -6211,7 +6689,6 @@ export class ThreeStoryScene implements StorySceneBackend {
     for (const [identity, item] of this.cachedCharacterControllers) {
       if (snapshotControllerIdentities.has(identity)) continue;
       this.speculativeCharacterControllers.set(identity, item);
-      this.speculativeCharacterCommandIndices.set(identity, 0);
       this.resetLipSync(item);
       item.paused = false;
       item.pendingPausedMotion = null;
@@ -6225,7 +6702,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     for (const character of orderedCharacters) {
       if (signal?.aborted || this.destroyed) return;
       let item = this.cachedCharacterControllers.get(character.controllerIdentity);
-      if (!item) {
+      if (!item && character.visible) {
         await this.placeCharacter(
           {
             targetName: character.target,
@@ -6234,6 +6711,13 @@ export class ThreeStoryScene implements StorySceneBackend {
             characterKey: character.characterKey,
             controllerIdentity: character.controllerIdentity,
             characterWorldPosition: character.worldPosition || undefined,
+            characterPresentation: {
+              motionName: character.currentMotionName,
+              expressionName: character.activeExpressionName || character.currentExpressionName,
+              fadeInSeconds: character.currentMotionFadeInSeconds,
+            },
+            motionName: character.currentMotionName,
+            expressionName: character.activeExpressionName || character.currentExpressionName,
           },
           character.positionType,
           0,
@@ -6243,7 +6727,8 @@ export class ThreeStoryScene implements StorySceneBackend {
         item = this.cachedCharacterControllers.get(character.controllerIdentity);
       }
       if (!item) {
-        throw new Error(`ADV seek could not restore character ${character.target}`);
+        if (!character.visible) continue;
+        throw new Error(`ADV seek could not restore visible character ${character.target}`);
       }
       item.positionType = character.positionType;
       item.worldPosition = character.worldPosition ? { ...character.worldPosition } : null;
@@ -6282,6 +6767,15 @@ export class ThreeStoryScene implements StorySceneBackend {
         randomSeed: { ...character.lipSync.randomSeed },
       };
       item.paused = character.paused;
+      const restoreMotion = character.pendingPausedMotion?.name;
+      const restoreExpression = character.pendingPausedExpression?.name;
+      const prepared = await Promise.all([
+        restoreMotion && item.model.prepareMotion ? item.model.prepareMotion(restoreMotion) : true,
+        restoreExpression && item.model.prepareExpression ? item.model.prepareExpression(restoreExpression) : true,
+      ]);
+      if (prepared.some((result) => result === false)) {
+        throw new Error(`ADV seek could not prepare paused presentation for character ${character.target}`);
+      }
       this.invokeCharacterModel(item, "restore seek presentation", undefined, (model) => {
         model.setPaused(false);
         model.stopMotions();
@@ -6307,7 +6801,6 @@ export class ThreeStoryScene implements StorySceneBackend {
       if (character.visible) this.registerVisibleCharacter(character.target, item);
       if (character.speculative) {
         this.speculativeCharacterControllers.set(character.controllerIdentity, item);
-        this.speculativeCharacterCommandIndices.set(character.controllerIdentity, 0);
       }
     }
 
@@ -6396,6 +6889,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.syncPostPipeline();
     this.refreshStageNodes();
     this.applyTransforms();
+    this.trimIdleResidentControllers();
   }
 
   focusPoint(positionType: unknown): Vec3 {
@@ -6407,6 +6901,8 @@ export class ThreeStoryScene implements StorySceneBackend {
     for (const item of this.characterItems.values()) {
       if (item.positionType === key) return item;
     }
+    const logical = this.logicalCharacterAtPosition(key);
+    if (logical) return { target: logical.target, positionType: logical.positionType } as StoryCharacter;
     return null;
   }
 
@@ -6433,6 +6929,16 @@ export class ThreeStoryScene implements StorySceneBackend {
     duration = 0,
     enabled = true,
   ): (() => Promise<void>) | null {
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(target);
+      if (!logical) return null;
+      if (enabled && !logical.lookOverride) {
+        logical.lookOriginalX = logical.lookX;
+        logical.lookOriginalY = logical.lookY;
+        logical.lookOverride = true;
+      }
+      return async () => this.setLook(target, lookX, lookY, duration, enabled);
+    }
     const expectedItem = this.cachedCharacterController(target);
     const loadToken = expectedItem ? null : this.selectedPendingCharacterToken(target);
     if (!expectedItem && loadToken == null) return null;
@@ -6483,10 +6989,13 @@ export class ThreeStoryScene implements StorySceneBackend {
   ): (() => Promise<void>) | null {
     if (!enabled) return this.prepareLook(target, 0, 0, duration, false);
 
-    const sourceCharacter = this.cachedCharacterController(target);
+    const sourceCharacter = this.seekIndexCompilationActive ? null : this.cachedCharacterController(target);
+    const sourceLogical = this.logicalCharacterByTarget(target);
     const sourceHead = sourceCharacter
       ? (this.applyTransforms(), this.characterHeadWorldPosition(sourceCharacter))
-      : this.pendingCharacterHeadWorldPosition(target);
+      : sourceLogical
+        ? this.logicalCharacterHeadWorldPosition(sourceLogical)
+        : this.pendingCharacterHeadWorldPosition(target);
     const targetHead = this.characterHeadWorldPositionAtPosition(targetPositionType, lookTargetName);
     // Native exits immediately when either controller cannot be resolved;
     // DelaySeconds is not entered on this path.
@@ -6499,6 +7008,26 @@ export class ThreeStoryScene implements StorySceneBackend {
     // RefreshLookCancellationToken cancels the preceding Look/Stop task before
     // either the loaded or Web-staged path starts the new linear tween.
     this.cancelPendingLookWait(target);
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(target);
+      if (!logical) return;
+      if (enabled) {
+        if (!logical.lookOverride) {
+          logical.lookOriginalX = logical.lookX;
+          logical.lookOriginalY = logical.lookY;
+        }
+        logical.lookOverride = true;
+        logical.lookX = finite(lookX);
+        logical.lookY = finite(lookY);
+      } else {
+        logical.lookX = logical.lookOriginalX;
+        logical.lookY = logical.lookOriginalY;
+        logical.lookOriginalX = 0;
+        logical.lookOriginalY = 0;
+        logical.lookOverride = false;
+      }
+      return;
+    }
     const item = this.cachedCharacterController(target);
     if (!item) {
       const token = this.selectedPendingCharacterToken(target);
@@ -6626,6 +7155,19 @@ export class ThreeStoryScene implements StorySceneBackend {
     lookTargetName?: string,
   ): Promise<void> {
     this.cancelPendingLookWait(target);
+    if (this.seekIndexCompilationActive) {
+      if (!enabled) {
+        await this.setLook(target, 0, 0, duration, false);
+        return;
+      }
+      const source = this.logicalCharacterByTarget(target);
+      const sourceHead = source ? this.logicalCharacterHeadWorldPosition(source) : null;
+      const targetHead = this.characterHeadWorldPositionAtPosition(targetPositionType, lookTargetName);
+      if (!sourceHead || !targetHead) return;
+      const look = computeAdvLookTarget(sourceHead, targetHead);
+      await this.setLook(target, look.x, look.y, duration, true);
+      return;
+    }
     const sourceCharacter = this.cachedCharacterController(target);
     if (!sourceCharacter) {
       if (!enabled) {
@@ -6732,6 +7274,12 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   prepareCharacterAngle(target: string, angle: number, bodyAngle: number, duration = 0): (() => Promise<void>) | null {
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(target);
+      if (!logical) return null;
+      logical.angleOverride = true;
+      return async () => this.setCharacterAngle(target, angle, bodyAngle, duration);
+    }
     const expectedItem = this.cachedCharacterController(target);
     const loadToken = expectedItem ? null : this.selectedPendingCharacterToken(target);
     if (!expectedItem && loadToken == null) return null;
@@ -6757,6 +7305,14 @@ export class ThreeStoryScene implements StorySceneBackend {
     // SmoothRotateToAngle. Keep that ownership while the Web-only lazy load is
     // pending as well, so an obsolete blocking command is released promptly.
     this.cancelPendingAngleWait(target);
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(target);
+      if (!logical) return;
+      logical.angleOverride = true;
+      logical.angle = finite(angle);
+      logical.bodyAngle = finite(bodyAngle);
+      return;
+    }
     const item = this.cachedCharacterController(target);
     const resolvedDuration = Math.max(0, finite(duration));
     if (!item) {
@@ -6919,6 +7475,13 @@ export class ThreeStoryScene implements StorySceneBackend {
   ): Promise<void> {
     const destination = worldPosition(position);
     if (!destination) return Promise.resolve();
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(target);
+      if (!logical) return Promise.resolve();
+      logical.worldPosition = { ...destination };
+      logical.positionType = Number(positionType) || logical.positionType || 5;
+      return Promise.resolve();
+    }
     const item = this.characterItems.get(target) || this.cachedCharacterController(target);
     if (!item) {
       const pending = this.pendingCharacterPlacements.get(target);
@@ -6975,6 +7538,11 @@ export class ThreeStoryScene implements StorySceneBackend {
     duration = 0,
     positionType = 0,
   ): Promise<void> {
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(targetName);
+      if (logical) logical.brightness = clamp(value);
+      return;
+    }
     const entryPosition = Number(positionType) || this.characterItems.get(targetName)?.positionType || 0;
     const ownershipKey = `entry:${entryPosition}`;
     const item = this.characterItems.get(targetName);
@@ -7038,6 +7606,11 @@ export class ThreeStoryScene implements StorySceneBackend {
   async setBrightness(targetName: string, value: number, duration = 0): Promise<void> {
     const target = clamp(value);
     const seconds = Math.max(0, finite(duration));
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(targetName);
+      if (logical) logical.brightness = target;
+      return;
+    }
     const item = this.cachedCharacterController(targetName);
     if (!item) {
       const token = this.selectedPendingCharacterToken(targetName);
@@ -7097,7 +7670,7 @@ export class ThreeStoryScene implements StorySceneBackend {
           if (raw >= 1) renderer = null;
           else renderer.nextFrameSeconds += frameSeconds;
         }
-        for (let index = 0; index < direct.length;) {
+        for (let index = 0; index < direct.length; ) {
           const entry = direct[index];
           if (entry.nextFrameSeconds > nextSeconds) {
             index += 1;
@@ -7218,6 +7791,11 @@ export class ThreeStoryScene implements StorySceneBackend {
     signal?: AbortSignal,
   ): Promise<void> {
     if (!this.qualityConfig.isCharacterBlurEnabled()) return;
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(targetName);
+      if (logical) logical.blurIntensity = clamp(intensity);
+      return;
+    }
     const item = this.characterItems.get(targetName);
     if (!item) {
       const token = this.characterLoadTokens.get(targetName);
@@ -7247,6 +7825,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   cancelPendingCharacterDoF(targetName: string): void {
+    if (this.seekIndexCompilationActive) return;
     const token = this.characterLoadTokens.get(targetName);
     if (token != null) {
       this.pendingCharacterCommands.queueDoFCancel(targetName, token, this.monotonicSeconds());
@@ -7365,11 +7944,22 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   setRimLight(targetName: string, colorValue: unknown, shadowIntensity: number): Promise<void> {
-    const item = this.cachedCharacterController(targetName);
     const event: PendingCharacterRimLightEvent = {
       color: unityHtmlColor(colorValue),
       shadowIntensity: finite(shadowIntensity),
     };
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(targetName);
+      if (logical) {
+        logical.rimLight = {
+          enabled: !logical.rimLight.enabled,
+          color: { ...event.color },
+          shadowIntensity: event.shadowIntensity,
+        };
+      }
+      return Promise.resolve();
+    }
+    const item = this.cachedCharacterController(targetName);
     if (!item) {
       const token = this.selectedPendingCharacterToken(targetName);
       if (token != null) this.pendingCharacterCommands.queueRimLight(targetName, token, event);
@@ -7381,6 +7971,43 @@ export class ThreeStoryScene implements StorySceneBackend {
       shadowIntensity: event.shadowIntensity,
     };
     return Promise.resolve();
+  }
+
+  private applyLogicalTimedLipSync(
+    state: LogicalCharacterState,
+    seconds: number,
+    speed: number,
+    multiplier: number,
+    timedMode: "oscillating" | "hold-open" = "oscillating",
+    holdOpenLevel = 0,
+  ): void {
+    state.lipSync = {
+      ...state.lipSync,
+      enabled: true,
+      source: "timed",
+      timedMode,
+      holdOpenLevel,
+      timedRemaining: Math.max(0, finite(seconds)),
+      stopRemaining: 0,
+      speed: Math.max(0.001, finite(speed, 1)),
+      multiplier: Math.max(0, finite(multiplier, 1)),
+      mouthForm: 0,
+      motionSyncPcm: null,
+      sources: [],
+    };
+  }
+
+  private resetLogicalLipSync(state: LogicalCharacterState): void {
+    state.lipSync = {
+      ...state.lipSync,
+      enabled: false,
+      source: "none",
+      timedRemaining: 0,
+      voiceRemaining: 0,
+      stopRemaining: 0,
+      motionSyncPcm: null,
+      sources: [],
+    };
   }
 
   startTimedPseudoLipSync(targets: string[] | string, talkLength: number, speed = 1, multiplier = 1): void {
@@ -7403,6 +8030,12 @@ export class ThreeStoryScene implements StorySceneBackend {
     const resolvedMouthOpening = finite(mouthOpening, 1) || 1;
     const queuedAtSeconds = this.monotonicSeconds();
     for (const target of Array.isArray(targets) ? targets : [targets]) {
+      if (this.seekIndexCompilationActive) {
+        const logical = this.logicalCharacterByTarget(target);
+        if (logical)
+          this.applyLogicalTimedLipSync(logical, durationSeconds, resolvedSpeed, 1, "hold-open", resolvedMouthOpening);
+        continue;
+      }
       const item = this.cachedCharacterController(target);
       if (item) {
         this.applyTimedLipSync(item, durationSeconds, resolvedSpeed, 1, "hold-open", resolvedMouthOpening);
@@ -7429,6 +8062,11 @@ export class ThreeStoryScene implements StorySceneBackend {
     const resolvedMultiplier = Math.max(0, finite(multiplier, 1));
     const queuedAtSeconds = this.monotonicSeconds();
     for (const target of Array.isArray(targets) ? targets : [targets]) {
+      if (this.seekIndexCompilationActive) {
+        const logical = this.logicalCharacterByTarget(target);
+        if (logical) this.applyLogicalTimedLipSync(logical, durationSeconds, resolvedSpeed, resolvedMultiplier);
+        continue;
+      }
       const item = this.cachedCharacterController(target);
       if (item) {
         this.applyTimedLipSync(item, durationSeconds, resolvedSpeed, resolvedMultiplier);
@@ -7463,6 +8101,26 @@ export class ThreeStoryScene implements StorySceneBackend {
     const queuedAtSeconds = this.monotonicSeconds();
     let started = false;
     for (const target of Array.isArray(targets) ? targets : [targets]) {
+      if (this.seekIndexCompilationActive) {
+        const logical = this.logicalCharacterByTarget(target);
+        if (logical) {
+          logical.lipSync = {
+            ...logical.lipSync,
+            enabled: true,
+            source: "voice",
+            voiceRemaining: durationSeconds,
+            voiceSpeed: resolvedSpeed,
+            voiceMultiplier: resolvedMultiplier,
+            voiceExpiresAtSeconds: queuedAtSeconds + durationSeconds / resolvedSpeed,
+            speed: resolvedSpeed,
+            multiplier: resolvedMultiplier,
+            sources,
+            motionSyncPcm: null,
+          };
+          started = true;
+        }
+        continue;
+      }
       const item = this.cachedCharacterController(target);
       if (item) {
         this.applyVoiceLipSync(item, sources, durationSeconds, resolvedSpeed, resolvedMultiplier);
@@ -7630,6 +8288,11 @@ export class ThreeStoryScene implements StorySceneBackend {
 
   stopTimedPseudoLipSync(targets: string[] | string): void {
     for (const target of Array.isArray(targets) ? targets : [targets]) {
+      if (this.seekIndexCompilationActive) {
+        const logical = this.logicalCharacterByTarget(target);
+        if (logical && logical.lipSync.source === "timed") this.resetLogicalLipSync(logical);
+        continue;
+      }
       const token = this.selectedPendingCharacterToken(target);
       if (token != null) this.pendingCharacterCommands.clearTimedLipSync(target, token);
       const item = this.cachedCharacterController(target);
@@ -7644,6 +8307,12 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   stopAllTimedPseudoLipSync(): void {
+    if (this.seekIndexCompilationActive) {
+      for (const logical of this.logicalCharacterStates.values()) {
+        if (logical.lipSync.source === "timed") this.resetLogicalLipSync(logical);
+      }
+      return;
+    }
     this.pendingCharacterCommands.clearAllTimedLipSync();
     for (const item of new Set(this.cachedCharacterControllers.values())) {
       if (item.lipSync.source === "timed") this.stopTimedLipSyncNow(item);
@@ -7673,6 +8342,11 @@ export class ThreeStoryScene implements StorySceneBackend {
 
   stopSpeaking(targets: string[] | string): void {
     for (const target of Array.isArray(targets) ? targets : [targets]) {
+      if (this.seekIndexCompilationActive) {
+        const logical = this.logicalCharacterByTarget(target);
+        if (logical) this.resetLogicalLipSync(logical);
+        continue;
+      }
       const token = this.selectedPendingCharacterToken(target);
       if (token != null) this.pendingCharacterCommands.clearLipSync(target, token);
       const item = this.cachedCharacterController(target);
@@ -7681,6 +8355,10 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   stopAllSpeaking(): void {
+    if (this.seekIndexCompilationActive) {
+      for (const logical of this.logicalCharacterStates.values()) this.resetLogicalLipSync(logical);
+      return;
+    }
     this.pendingCharacterCommands.clearAllLipSync();
     for (const item of new Set(this.cachedCharacterControllers.values())) this.resetLipSync(item);
   }
@@ -7723,7 +8401,36 @@ export class ThreeStoryScene implements StorySceneBackend {
     });
   }
 
+  private logicalCharacterHeadWorldPosition(state: LogicalCharacterState): Vec3 | null {
+    const head = state.entry.profile?.anchors?.head?.position;
+    if (!head) return null;
+    const stage = this.stageNode(state.positionType);
+    this.applyTransforms();
+    const node = new Object3D();
+    const profile = state.entry.profile || {};
+    const basePosition = vec3(profile.basePosition, { x: 0, y: -0.41, z: 0 });
+    const scale = Math.max(0.001, finite(profile.baseScale, 1.6));
+    if (state.worldPosition) {
+      const fieldPosition = this.fieldPosition("character", { x: 0, y: 0, z: 0 });
+      const stagePosition = this.stagePoint(state.positionType);
+      const fieldScale = this.fieldScale("character");
+      basePosition.x = (state.worldPosition.x - fieldPosition.x - stagePosition.x) / fieldScale;
+      basePosition.y = (state.worldPosition.y - fieldPosition.y - stagePosition.y) / fieldScale;
+      basePosition.z = (state.worldPosition.z - fieldPosition.z - stagePosition.z) / fieldScale;
+    }
+    unityVector3(basePosition, node.position);
+    node.scale.setScalar(scale);
+    stage.add(node);
+    try {
+      return computeAdvCharacterHeadWorldPosition(node, vec3(head, { x: 0, y: 0, z: 0 }));
+    } finally {
+      node.removeFromParent();
+    }
+  }
+
   private pendingCharacterHeadWorldPosition(target: string): Vec3 | null {
+    const logical = this.logicalCharacterByTarget(target);
+    if (logical) return this.logicalCharacterHeadWorldPosition(logical);
     const staged = this.stagedCharacterItems.get(target);
     if (staged && staged.token === this.characterLoadTokens.get(target)) {
       this.applyTransforms();
@@ -7783,6 +8490,8 @@ export class ThreeStoryScene implements StorySceneBackend {
       this.applyTransforms();
       return this.characterHeadWorldPosition(cached);
     }
+    const logical = this.logicalCharacterAtPosition(positionType);
+    if (logical) return this.logicalCharacterHeadWorldPosition(logical);
     const item = this.characterAtPosition(positionType);
     if (item) {
       this.applyTransforms();
@@ -7893,6 +8602,15 @@ export class ThreeStoryScene implements StorySceneBackend {
         to: item.positionType === position ? 0 : rendererTarget.characterBlur,
       };
     });
+    const logicalCharacterBlurTweens = this.seekIndexCompilationActive
+      ? [...this.logicalCharacterStates.values()]
+          .filter((item) => item.visible)
+          .map((item) => ({
+            item,
+            from: item.blurIntensity,
+            to: item.positionType === position ? 0 : rendererTarget.characterBlur,
+          }))
+      : [];
     const token = this.beginCameraTween([
       "focusMeta",
       "baseX",
@@ -7961,6 +8679,9 @@ export class ThreeStoryScene implements StorySceneBackend {
         }
         for (const blur of characterBlurTweens) {
           if (blur.version !== this.characterBlurTweenVersions.get(blur.item.target)) continue;
+          blur.item.blurIntensity = lerp(blur.from, blur.to, progress);
+        }
+        for (const blur of logicalCharacterBlurTweens) {
           blur.item.blurIntensity = lerp(blur.from, blur.to, progress);
         }
         this.syncFieldPostEffects();
