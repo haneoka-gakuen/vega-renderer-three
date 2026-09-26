@@ -995,6 +995,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   private contextLost = false;
   private contextRestoreGeneration = 0;
   private contextRestoreController: ContextRestoreController | null = null;
+  private seekIndexCompilationActive = false;
   private contextRestoreWatchdog: ReturnType<typeof setTimeout> | undefined;
 
   /**
@@ -2049,6 +2050,11 @@ export class ThreeStoryScene implements StorySceneBackend {
         callerSignal.removeEventListener("abort", abort);
         lifecycleSignal.removeEventListener("abort", abort);
       });
+  }
+
+  setSeekIndexCompilationActive(active: boolean): void {
+    if (this.seekIndexCompilationActive === Boolean(active)) return;
+    this.seekIndexCompilationActive = Boolean(active);
   }
 
   setDeterministicReplayActive(active: boolean): void {
@@ -3422,6 +3428,11 @@ export class ThreeStoryScene implements StorySceneBackend {
    * switch. Reported as discarded so Vega rebuilds them if a later command
    * addresses them again.
    */
+  /**
+   * Dispose textures that only an evicted/removed model references. Character
+   * atlases dominate VRAM; without this, costume swaps accumulated every
+   * variant's texture pages for the whole episode.
+   */
   private evictIdleResidentControllers(keepIdentity: string): void {
     for (const [identity, item] of [...this.cachedCharacterControllers]) {
       if (identity === keepIdentity) continue;
@@ -4030,6 +4041,18 @@ export class ThreeStoryScene implements StorySceneBackend {
   async placeCharacter(cmd: AdvCommand, positionType: number, duration = 0, _noWait = false): Promise<void> {
     const target = String(cmd.targetName || cmd.targets?.[0]?.target || "");
     if (!target) return;
+    // Background seek-index compilation only needs the logical identity →
+    // position → presentation mapping for checkpoints. Creating GPU models
+    // here loaded every authored character on top of the playback set and
+    // jetsam-killed iOS / froze desktops mid-episode through VRAM pressure.
+    if (this.seekIndexCompilationActive) {
+      const compileIdentity = firstString(
+        record(cmd).controllerIdentity,
+        `${target}\u0000${Number(cmd.targetAssetIndex) || 0}`,
+      );
+      this.characterControllerIdentities.set(target, compileIdentity);
+      return;
+    }
     const alphaOperationAtStart = this.characterAlphaOperations.get(target);
     const transitionFrom = worldPosition(cmd.characterWorldTransition?.from);
     const transitionTo = worldPosition(cmd.characterWorldTransition?.to);
@@ -4458,6 +4481,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   async removeCharacter(target: string, duration = 0): Promise<boolean> {
+    if (this.seekIndexCompilationActive) return true;
     const wasPending = this.pendingCharacterPlacements.has(target) || this.stagedCharacterItems.has(target);
     this.invalidateCharacterLoad(target);
     this.characterPresentationHistory.delete(target);
@@ -4884,6 +4908,12 @@ export class ThreeStoryScene implements StorySceneBackend {
     stageCaptureOwner?: number,
     signal?: AbortSignal,
   ): Promise<boolean> {
+    // Compilation replays thousands of stage swaps; loading each texture
+    // here burned VRAM on backgrounds the player never sees.
+    if (this.seekIndexCompilationActive) {
+      this.state.background = background ?? null;
+      return true;
+    }
     const ownsCapture = (): boolean =>
       !signal?.aborted && (stageCaptureOwner == null || stageCaptureOwner === this.stageCaptureGeneration);
     if (!ownsCapture()) return false;
