@@ -1839,7 +1839,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     const cacheCap = Math.max(
       1,
       Math.min(
-        Math.floor(finite(this.runtime.characterPreloadCacheMax, 8)),
+        Math.floor(finite(this.runtime.characterPreloadCacheMax, 6)),
         Math.floor(finite(request.episodeControllerCount, 8)),
       ),
     );
