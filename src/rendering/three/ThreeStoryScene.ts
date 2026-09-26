@@ -1229,10 +1229,11 @@ export class ThreeStoryScene implements StorySceneBackend {
     );
     this.overlay.canvasPass.setStillSpeed(this.playbackSpeedRate);
     this.ruleTransitionPass = new AdvRuleTransitionPass(this.renderer);
-    if (this.runtime.viewportFollowOnResolutionChanged) {
-      this.resizeObserver = new ResizeObserver(() => this.resize());
-      this.resizeObserver.observe(mount);
-    }
+    // Always observe: fullscreen, rotation, and mobile browser chrome
+    // changes resize the mount. Without this the WebGL canvas keeps its
+    // pre-change dimensions and renders a black surface on Android.
+    this.resizeObserver = new ResizeObserver(() => this.resize());
+    this.resizeObserver.observe(mount);
     this.resize();
     this.previousFrameTime = performance.now();
     this.targetFrameClock.reset();
