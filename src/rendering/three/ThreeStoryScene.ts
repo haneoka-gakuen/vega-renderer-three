@@ -1843,13 +1843,14 @@ export class ThreeStoryScene implements StorySceneBackend {
         Math.floor(finite(request.episodeControllerCount, 8)),
       ),
     );
-    let capacityWaited = false;
     while (this.cachedCharacterControllers.size + this.characterPreloads.size >= cacheCap) {
       this.evictIdleResidentControllers(identity);
       if (this.cachedCharacterControllers.size + this.characterPreloads.size < cacheCap) break;
-      if (this.characterPreloads.size === 0 && capacityWaited) {
-        // Every resident is on stage or the active variant of its target.
-        // Overshoot by one instead of deadlocking the episode preload.
+      if (this.characterPreloads.size === 0) {
+        // Nothing in flight can free capacity, and every resident survived
+        // eviction (on stage, staged, pending, or the active variant of its
+        // target). Defer to on-demand creation at the authored In instead of
+        // waiting forever: no completion notification would ever arrive.
         console.warn(
           "[ThreeStoryScene] character cache at capacity with all residents active; deferring preload",
           identity,
@@ -1857,7 +1858,6 @@ export class ThreeStoryScene implements StorySceneBackend {
         return true;
       }
       await this.waitForCharacterPreloadCapacity(signal);
-      capacityWaited = true;
       if (this.destroyed || signal?.aborted) return false;
       for (const pending of this.pendingCharacterPlacements.values()) {
         if (pending.identity === identity) return false;
