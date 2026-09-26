@@ -1836,35 +1836,26 @@ export class ThreeStoryScene implements StorySceneBackend {
     // all story long used to keep every authored controller resident, which
     // froze heavy desktops and jetsam-killed iOS WebContent during loading.
     // Cap total residents; overflow defers to on-demand creation at In.
+    // Resident preloads are bounded; overflow defers instantly to on-demand
+    // creation at the authored In. Waiting here wedged the loader pump: the
+    // pump drains every warmup serially, so one capacity wait stalls all
+    // remaining tasks behind owners that may never release.
     const cacheCap = Math.max(
       1,
       Math.min(
         Math.floor(finite(this.runtime.characterPreloadCacheMax, 6)),
-        Math.floor(finite(request.episodeControllerCount, 8)),
+        Math.floor(finite(request.episodeControllerCount, 6)),
       ),
     );
-    while (this.cachedCharacterControllers.size + this.characterPreloads.size >= cacheCap) {
+    if (this.cachedCharacterControllers.size + this.characterPreloads.size >= cacheCap) {
       this.evictIdleResidentControllers(identity);
-      if (this.cachedCharacterControllers.size + this.characterPreloads.size < cacheCap) break;
-      if (this.characterPreloads.size === 0) {
-        // Nothing in flight can free capacity, and every resident survived
-        // eviction (on stage, staged, pending, or the active variant of its
-        // target). Defer to on-demand creation at the authored In instead of
-        // waiting forever: no completion notification would ever arrive.
-        console.warn(
-          "[ThreeStoryScene] character cache at capacity with all residents active; deferring preload",
-          identity,
-        );
+      if (this.cachedCharacterControllers.size + this.characterPreloads.size >= cacheCap) {
+        console.info("[ThreeStoryScene] character preload deferred at capacity:", identity);
         return true;
       }
-      await this.waitForCharacterPreloadCapacity(signal);
-      if (this.destroyed || signal?.aborted) return false;
-      for (const pending of this.pendingCharacterPlacements.values()) {
-        if (pending.identity === identity) return false;
-      }
-      if (this.cachedCharacterControllers.has(identity)) return true;
-      active = this.characterPreloads.get(identity);
-      if (active) return Boolean(await active.promise);
+    }
+    for (const pending of this.pendingCharacterPlacements.values()) {
+      if (pending.identity === identity) return false;
     }
 
     const controller = new AbortController();
