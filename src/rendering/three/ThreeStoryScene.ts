@@ -1831,14 +1831,33 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (active) {
       return Boolean(await active.promise);
     }
-    const speculativeLimit = Math.max(
+    // Resident Cubism models dominate story memory (multi-page 4096px atlases
+    // per model). Episodes that register many characters and swap costumes
+    // all story long used to keep every authored controller resident, which
+    // froze heavy desktops and jetsam-killed iOS WebContent during loading.
+    // Cap total residents; overflow defers to on-demand creation at In.
+    const cacheCap = Math.max(
       1,
-      Math.floor(finite(this.runtime.characterPreloadInitialCount, 6)),
-      Math.floor(finite(this.runtime.characterPreloadCacheMax, 8)),
-      Math.floor(finite(request.episodeControllerCount)),
+      Math.min(
+        Math.floor(finite(this.runtime.characterPreloadCacheMax, 8)),
+        Math.floor(finite(request.episodeControllerCount, 8)),
+      ),
     );
-    while (this.speculativeCharacterControllers.size + this.characterPreloads.size >= speculativeLimit) {
+    let capacityWaited = false;
+    while (this.cachedCharacterControllers.size + this.characterPreloads.size >= cacheCap) {
+      this.evictIdleResidentControllers(identity);
+      if (this.cachedCharacterControllers.size + this.characterPreloads.size < cacheCap) break;
+      if (this.characterPreloads.size === 0 && capacityWaited) {
+        // Every resident is on stage or the active variant of its target.
+        // Overshoot by one instead of deadlocking the episode preload.
+        console.warn(
+          "[ThreeStoryScene] character cache at capacity with all residents active; deferring preload",
+          identity,
+        );
+        return true;
+      }
       await this.waitForCharacterPreloadCapacity(signal);
+      capacityWaited = true;
       if (this.destroyed || signal?.aborted) return false;
       for (const pending of this.pendingCharacterPlacements.values()) {
         if (pending.identity === identity) return false;
@@ -3403,6 +3422,37 @@ export class ThreeStoryScene implements StorySceneBackend {
     item.lookTweenController?.abort();
     item.node.removeFromParent();
     void this.releaseCharacterModelSafely(item, reason);
+  }
+
+  /**
+   * Release cached controllers that are neither on stage, staged for entry,
+   * pending a placement, in recovery, nor the currently selected variant of
+   * their target — typically superseded costume variants after a Costume
+   * switch. Reported as discarded so Vega rebuilds them if a later command
+   * addresses them again.
+   */
+  private evictIdleResidentControllers(keepIdentity: string): void {
+    for (const [identity, item] of [...this.cachedCharacterControllers]) {
+      if (identity === keepIdentity) continue;
+      if (this.characterItems.get(item.target) === item) continue;
+      if (this.characterControllerIdentities.get(item.target) === identity) continue;
+      if (this.stagedCharacterItems.get(item.target)?.item === item) continue;
+      let placed = false;
+      for (const pending of this.pendingCharacterPlacements.values()) {
+        if (pending.identity === identity) {
+          placed = true;
+          break;
+        }
+      }
+      if (placed) continue;
+      if (this.characterModelRecoveryStates.has(item)) continue;
+      this.cachedCharacterControllers.delete(identity);
+      this.speculativeCharacterControllers.delete(identity);
+      this.speculativeCharacterCommandIndices.delete(identity);
+      this.discardedCharacterPreloadIdentities.add(identity);
+      this.releaseUnownedPreloadedCharacter(item, "character cache pressure");
+    }
+    this.notifyCharacterPreloadCapacity();
   }
 
   private discardAllSpeculativeCharacters(reason: string): void {
