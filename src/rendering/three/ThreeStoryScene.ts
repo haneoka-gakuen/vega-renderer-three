@@ -2156,6 +2156,9 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   cancelTransitionsForSeek(): void {
+    // Rule fades advance on the scene clock, which is suspended during seek.
+    // Settle that command before the playback loop waits to restore its target.
+    this.clearRuleTransition();
     this.stillGeneration++;
     this.overlay?.canvasPass.cancelStillLoad();
     this.stillOperations.clear();
@@ -5971,7 +5974,12 @@ export class ThreeStoryScene implements StorySceneBackend {
     const source = firstString(rule.texture, rule.maskTexture);
     if (!source) return;
     const version = ++this.ruleTransitionVersion;
-    const textureLease = await this.acquireTexture(source);
+    const signal = this.transitionController.signal;
+    const textureLease = await this.acquireTexture(source, signal).catch((error) => {
+      if (this.destroyed || signal.aborted || version !== this.ruleTransitionVersion) return null;
+      throw error;
+    });
+    if (!textureLease) return;
     if (this.destroyed || version !== this.ruleTransitionVersion) {
       textureLease.release();
       return;
