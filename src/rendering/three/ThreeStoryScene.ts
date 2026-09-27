@@ -1260,7 +1260,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.overlay = new StoryDomOverlay(
       mount,
       this.renderer,
-      (source) => this.acquireTexture(source),
+      (source, signal) => this.acquireTexture(source, signal),
       this.context.rendererExtensions?.service(STORY_FRAME_LAYOUT_PROVIDER),
       { onVideoResidencyReleased: (source) => this.releaseEpisodeVideoRenderable(source) },
     );
@@ -5828,27 +5828,32 @@ export class ThreeStoryScene implements StorySceneBackend {
     });
   }
 
-  async setStill(still: AdvStillEntry | null | undefined, alpha = 1, duration = 0): Promise<void> {
+  async setStill(
+    still: AdvStillEntry | null | undefined,
+    alpha = 1,
+    duration = 0,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const generation = ++this.stillGeneration,
       pass = this.overlay?.canvasPass;
     this.stillOperations.clear();
     if (!pass) return;
     if (!still?.url) {
       await this.fadeStill(0, duration);
-      if (generation !== this.stillGeneration || this.destroyed) return;
+      if (generation !== this.stillGeneration || this.destroyed || signal?.aborted) return;
       pass.clearStills();
-      await this.overlay?.setStill("", 0);
+      await pass.setStill("", 0, signal);
       this.overlay?.setStillViewAlpha(0, 0);
       this.state.still = null;
       return;
     }
-    pass.clearStills();
     const key = this.stillKey(still),
       operation = ++this.stillOperationSerial;
     this.stillOperations.set(key, operation);
     const presentation = this.context.rendererExtensions?.service(STORY_STILL_PRESENTATION_PROVIDER)?.resolve(still);
-    await pass.showStill(key, still, duration > 0 ? 0 : alpha, presentation, 0);
-    if (generation !== this.stillGeneration || this.destroyed) return;
+    await pass.showStill(key, still, duration > 0 ? 0 : alpha, presentation, 0, signal);
+    if (generation !== this.stillGeneration || this.destroyed || signal?.aborted) return;
+    pass.clearStills(key);
     await this.fadeStillLayer(key, alpha, duration, operation);
     if (generation !== this.stillGeneration || this.destroyed) return;
     this.overlay?.setStillViewAlpha(1, 0);
@@ -5933,9 +5938,9 @@ export class ThreeStoryScene implements StorySceneBackend {
     await this.setStill(null, 0, duration);
   }
 
-  async setFrameOverlay(frame: AdvFrameEntry, alpha = 1, key = ""): Promise<void> {
+  async setFrameOverlay(frame: AdvFrameEntry, alpha = 1, key = "", signal?: AbortSignal): Promise<void> {
     const resolvedKey = key || String(frame.name || frame.source || "frame");
-    await this.overlay?.setFrame(resolvedKey, frame, alpha);
+    await this.overlay?.canvasPass.setFrame(resolvedKey, frame, alpha, signal);
   }
 
   setFrameOpacity(alpha: number, slide = 0, key = ""): void {
@@ -6636,6 +6641,12 @@ export class ThreeStoryScene implements StorySceneBackend {
       throw new Error("ADV seek snapshot contains a pending character load");
     }
 
+    // Background replacement already has an acquire-then-swap lifetime. Do it
+    // before clearing any seek-owned state and keep the request signal attached
+    // so an abandoned seek releases only its newly acquired lease.
+    await this.setBackground(snapshot.background, 0, undefined, signal);
+    if (signal?.aborted || this.destroyed) return;
+
     // Clear transient offsets first. Persistent CameraShake is restored from
     // its logical enabled/configuration state below and starts a fresh cycle.
     this.resetShakeState();
@@ -6651,10 +6662,6 @@ export class ThreeStoryScene implements StorySceneBackend {
     for (const character of snapshot.characters) {
       this.logicalCharacterStates.set(character.controllerIdentity, this.restoreLogicalCharacterState(character));
     }
-    this.clearFrameOverlay();
-
-    await this.setBackground(snapshot.background, 0);
-    if (signal?.aborted || this.destroyed) return;
     const stageEnv = snapshot.stageEnv;
     this.state.stage = snapshot.stage;
     this.state.pluginState = clonePlain(snapshot.pluginState ?? {});
@@ -6842,20 +6849,74 @@ export class ThreeStoryScene implements StorySceneBackend {
       if (signal?.aborted || this.destroyed) return;
     }
     const canvas = this.overlay?.canvasPass;
-    if (canvas && snapshot.stillLayers) {
-      ++this.stillGeneration;
-      this.stillOperations.clear();
-      canvas.clearStills();
-      for (const layer of snapshot.stillLayers) {
-        const presentation = this.context.rendererExtensions
-          ?.service(STORY_STILL_PRESENTATION_PROVIDER)
-          ?.resolve(layer.still);
-        await canvas.showStill(layer.key, layer.still, layer.opacity, presentation, 0);
-        if (signal?.aborted || this.destroyed) return;
-        canvas.restoreStillAnimation(layer.key, layer.animation, layer.visible);
+    const layerTransaction = canvas?.beginLayerTransaction();
+    const targetStillKeys = new Set<string>();
+    const targetFrameKeys = new Set<string>();
+    const targetFrameEntries = clonePlain(snapshot.frameEntries);
+    try {
+      if (canvas && snapshot.stillLayers) {
+        ++this.stillGeneration;
+        this.stillOperations.clear();
+        for (const layer of snapshot.stillLayers) {
+          const presentation = this.context.rendererExtensions
+            ?.service(STORY_STILL_PRESENTATION_PROVIDER)
+            ?.resolve(layer.still);
+          if (
+            !(await canvas.stageStill(
+              layerTransaction!,
+              layer.key,
+              layer.still,
+              layer.opacity,
+              presentation,
+              0,
+              signal,
+            ))
+          ) {
+            if (signal?.aborted || this.destroyed) {
+              canvas.discardLayerTransaction(layerTransaction!);
+              return;
+            }
+            throw new Error(`ADV seek could not stage still ${layer.key}`);
+          }
+          targetStillKeys.add(layer.key);
+        }
+      } else if (canvas) {
+        await canvas.setStill(String(snapshot.still?.url || ""), snapshot.stillAlpha, signal);
       }
-      this.state.still = canvas.topStill;
-    } else await this.setStill(snapshot.still, snapshot.stillAlpha, 0);
+      if (canvas && layerTransaction) {
+        for (const [key, value] of Object.entries(targetFrameEntries)) {
+          if (!value.frame || value.opacity <= 0.001) continue;
+          if (!(await canvas.stageFrame(layerTransaction, key, value.frame, value.opacity, signal))) {
+            if (signal?.aborted || this.destroyed) {
+              canvas.discardLayerTransaction(layerTransaction);
+              return;
+            }
+            throw new Error(`ADV seek could not stage frame ${key}`);
+          }
+          targetFrameKeys.add(key);
+        }
+      }
+      if (signal?.aborted || this.destroyed) {
+        if (canvas && layerTransaction) canvas.discardLayerTransaction(layerTransaction);
+        return;
+      }
+      if (canvas && layerTransaction) {
+        canvas.commitLayerTransaction(layerTransaction);
+        if (snapshot.stillLayers) {
+          canvas.clearStills(targetStillKeys);
+          for (const layer of snapshot.stillLayers)
+            canvas.restoreStillAnimation(layer.key, layer.animation, layer.visible);
+          this.state.still = canvas.topStill;
+        } else {
+          canvas.clearStills();
+          this.state.still = snapshot.still ?? null;
+        }
+        canvas.clearFramesExcept(targetFrameKeys);
+      }
+    } catch (error) {
+      if (canvas && layerTransaction) canvas.discardLayerTransaction(layerTransaction);
+      throw error;
+    }
     if (signal?.aborted || this.destroyed) return;
     this.overlay?.setStillViewAlpha(snapshot.stillBackgroundAlpha, snapshot.stillOverlayAlpha);
     this.overlay?.setStillAnimationIndex(snapshot.stillAnimationIndex);
@@ -6863,11 +6924,9 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.state.frameName = snapshot.frameName;
     this.state.frameOpacity = snapshot.frameOpacity;
     this.state.frameSlide = snapshot.frameSlide;
-    this.state.frameEntries = clonePlain(snapshot.frameEntries);
-    for (const [key, value] of Object.entries(this.state.frameEntries)) {
+    this.state.frameEntries = targetFrameEntries;
+    for (const [key, value] of Object.entries(targetFrameEntries)) {
       if (!value.frame || value.opacity <= 0.001) continue;
-      await this.setFrameOverlay(value.frame, value.opacity, key);
-      if (signal?.aborted || this.destroyed) return;
       this.setFrameOpacity(value.opacity, value.slide, key);
     }
     this.overlay?.restoreFrameParticles(snapshot.frameParticles ?? {});

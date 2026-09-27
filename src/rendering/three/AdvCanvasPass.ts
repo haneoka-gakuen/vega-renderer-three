@@ -40,7 +40,11 @@ export interface CanvasTextureLease {
   readonly value: Texture;
   release(): void;
 }
-export type CanvasTextureLoader = (source: string) => Promise<CanvasTextureLease>;
+export type CanvasTextureLoader = (source: string, signal?: AbortSignal) => Promise<CanvasTextureLease>;
+/** Opaque batch used to prepare canvas layers without disturbing the live set. */
+export interface CanvasLayerTransaction {
+  readonly id: number;
+}
 const vertex = `precision highp float;
 attribute vec3 position; attribute vec2 uv;
 uniform vec2 uViewport; uniform vec4 uRect; uniform vec4 uCrop; uniform vec2 uOffset;
@@ -88,6 +92,19 @@ interface FrameView {
   operation: number;
   elapsed: number;
 }
+
+interface LayerTransactionEntry {
+  readonly collection: Map<string, FrameView>;
+  readonly key: string;
+  readonly entry: FrameView;
+  readonly previous: FrameView | undefined;
+  readonly operation: number;
+}
+
+interface LayerTransactionState {
+  readonly entries: LayerTransactionEntry[];
+  closed: boolean;
+}
 export interface CanvasStillSnapshot {
   readonly key: string;
   readonly still: AdvStillEntry;
@@ -105,6 +122,10 @@ export class AdvCanvasPass {
   private readonly frames = new Map<string, FrameView>();
   private readonly stills = new Map<string, FrameView>();
   private readonly pending = new Set<FrameView>();
+  private readonly layerTransactions = new Map<CanvasLayerTransaction, LayerTransactionState>();
+  private readonly layerOperations = new WeakMap<Map<string, FrameView>, Map<string, number>>();
+  private readonly pendingLayers = new WeakMap<Map<string, FrameView>, Map<string, Set<FrameView>>>();
+  private nextLayerTransactionId = 0;
   private readonly video: ImageView;
   private readonly videoBackground: ImageView;
   private readonly stillBackground: ImageView;
@@ -201,7 +222,7 @@ export class AdvCanvasPass {
     view.color.w = alpha(value) * view.opacityFactor;
     view.mesh.visible = view.color.w > 0;
   }
-  private async source(view: ImageView, source: string): Promise<boolean> {
+  private async source(view: ImageView, source: string, signal?: AbortSignal): Promise<boolean> {
     if (view.source === source && view.leaseSource === source && view.lease) return true;
     const generation = ++view.generation;
     view.source = source;
@@ -217,14 +238,19 @@ export class AdvCanvasPass {
     }
     let lease: CanvasTextureLease;
     try {
-      lease = await this.loadTexture(source);
+      lease = await this.loadTexture(source, signal);
     } catch (error) {
       if (this.disposed || !this.views.has(view) || generation !== view.generation) return false;
+      if (signal?.aborted) {
+        view.source = view.leaseSource;
+        return false;
+      }
       view.source = view.leaseSource;
       throw error;
     }
-    if (this.disposed || !this.views.has(view) || generation !== view.generation) {
+    if (this.disposed || !this.views.has(view) || generation !== view.generation || signal?.aborted) {
       lease.release();
+      if (signal?.aborted && this.views.has(view) && generation === view.generation) view.source = view.leaseSource;
       return false;
     }
     view.lease?.release();
@@ -257,8 +283,9 @@ export class AdvCanvasPass {
     if (visible < 1) view.crop.set((1 - visible) / 2, 0, visible, 1);
     else view.crop.set(0, (1 - 1 / visible) / 2, 1, 1 / visible);
   }
-  async setStill(source: string, opacity: number): Promise<void> {
-    if (await this.source(this.still, source)) this.opacity(this.still, source ? opacity : 0);
+  async setStill(source: string, opacity: number, signal?: AbortSignal): Promise<void> {
+    if ((await this.source(this.still, source, signal)) && !signal?.aborted)
+      this.opacity(this.still, source ? opacity : 0);
   }
   cancelStillLoad(): void {
     this.still.generation++;
@@ -334,16 +361,92 @@ export class AdvCanvasPass {
     this.opacity(this.video, value);
     this.opacity(this.videoBackground, this.videoLayout?.background && this.videoTexture ? value : 0);
   }
-  async setFrame(key: string, frame: AdvFrameEntry, value: number): Promise<void> {
-    await this.createLayer(this.frames, key, frame, value);
+  async setFrame(key: string, frame: AdvFrameEntry, value: number, signal?: AbortSignal): Promise<void> {
+    await this.createLayer(this.frames, key, frame, value, signal);
+  }
+  beginLayerTransaction(): CanvasLayerTransaction {
+    const transaction = { id: ++this.nextLayerTransactionId };
+    this.layerTransactions.set(transaction, { entries: [], closed: false });
+    return transaction;
+  }
+  async stageFrame(
+    transaction: CanvasLayerTransaction,
+    key: string,
+    frame: AdvFrameEntry,
+    value: number,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    return Boolean(await this.createLayer(this.frames, key, frame, value, signal, transaction));
+  }
+  async stageStill(
+    transaction: CanvasLayerTransaction,
+    key: string,
+    still: AdvStillEntry,
+    opacity: number,
+    presentation: StoryStillPresentation | undefined,
+    animationIndex: number,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const frame: AdvFrameEntry = {
+      texture: String(still.url || ""),
+      ...(presentation ? { layout: presentation.layout, textures: { still: String(still.url || "") } } : {}),
+    };
+    const entry = await this.createLayer(this.stills, key, frame, opacity, signal, transaction);
+    if (!entry) return false;
+    entry.still = still;
+    if (presentation) entry.animator = new StoryStillAnimator(presentation);
+    entry.operation = animationIndex;
+    return true;
+  }
+  commitLayerTransaction(transaction: CanvasLayerTransaction): void {
+    const state = this.layerTransactions.get(transaction);
+    if (!state || state.closed) return;
+    const valid = state.entries.every((item) => {
+      const operations = this.layerOperations.get(item.collection);
+      return (
+        !item.entry.disposed &&
+        item.collection.get(item.key) === item.previous &&
+        operations?.get(item.key) === item.operation
+      );
+    });
+    if (!valid) {
+      state.closed = true;
+      for (const item of state.entries) this.disposeEntry(item.entry);
+      this.layerTransactions.delete(transaction);
+      throw new Error("Canvas layer transaction was superseded or cleared");
+    }
+    state.closed = true;
+    const replaced = new Set<FrameView>();
+    for (const item of state.entries) {
+      item.collection.set(item.key, item.entry);
+      item.entry.group.visible = true;
+      if (item.previous) replaced.add(item.previous);
+    }
+    for (const entry of replaced) this.disposeEntry(entry);
+    this.orderFrames();
+    this.layerTransactions.delete(transaction);
+  }
+  discardLayerTransaction(transaction: CanvasLayerTransaction): void {
+    const state = this.layerTransactions.get(transaction);
+    if (!state || state.closed) return;
+    state.closed = true;
+    for (const item of state.entries) this.disposeEntry(item.entry);
+    this.layerTransactions.delete(transaction);
   }
   private async createLayer(
     collection: Map<string, FrameView>,
     key: string,
     frame: AdvFrameEntry,
     value: number,
-  ): Promise<FrameView> {
-    this.clearLayers(collection, key);
+    signal?: AbortSignal,
+    transaction?: CanvasLayerTransaction,
+  ): Promise<FrameView | null> {
+    if (signal?.aborted || this.disposed) return null;
+    const previous = collection.get(key);
+    const operations = this.layerOperations.get(collection) ?? new Map<string, number>();
+    this.layerOperations.set(collection, operations);
+    const operation = (operations.get(key) ?? 0) + 1;
+    operations.set(key, operation);
     const entry: FrameView = {
       frame,
       group: new Group(),
@@ -355,9 +458,14 @@ export class AdvCanvasPass {
       operation: 0,
       elapsed: 0,
     };
-    collection.set(key, entry);
     this.pending.add(entry);
+    const pendingByKey = this.pendingLayers.get(collection) ?? new Map<string, Set<FrameView>>();
+    this.pendingLayers.set(collection, pendingByKey);
+    const pending = pendingByKey.get(key) ?? new Set<FrameView>();
+    pendingByKey.set(key, pending);
+    pending.add(entry);
     this.scene.add(entry.group);
+    entry.group.visible = false;
     this.orderFrames();
     const kind = String(frame.type || frame.name || frame.source || "").toLowerCase();
     try {
@@ -391,17 +499,17 @@ export class AdvCanvasPass {
             node.image.texture || (node.image.textureKey ? frame.textures?.[node.image.textureKey] : undefined);
           if (!source && (node.image.textureKey || node.image.texture))
             throw new Error(`Frame image texture is missing: ${node.id}`);
-          if (source) loads.push(this.source(image, source));
+          if (source) loads.push(this.source(image, source, signal));
         }
         await Promise.all(loads);
         if (collection === this.frames) await this.createFrameParticles(key, entry, frame, layout);
       } else if (kind.includes("rain")) {
         const texture = String(frame.texture || "");
         if (!texture) throw new Error("Rain frame requires a particle texture");
-        const lease = await this.loadTexture(texture);
+        const lease = await this.loadTexture(texture, signal);
         if (entry.disposed) {
           lease.release();
-          return entry;
+          return null;
         }
         entry.releases.push(() => lease.release());
         entry.rain = new AdvRainFrameRenderer(frame, lease.value);
@@ -421,22 +529,48 @@ export class AdvCanvasPass {
         const source = frame.texture || textures[0] || frame.elements?.[0]?.texture || frame.edges?.[0]?.texture;
         const image = this.image(0, entry.group);
         entry.images.push(image);
-        if (source) await this.source(image, source);
+        if (source) await this.source(image, source, signal);
         else this.setColor(image, frame.color || "#000000");
         if (!entry.disposed) this.opacity(image, entry.opacity);
+      }
+      if (entry.disposed) return null;
+      if (signal?.aborted || this.disposed) {
+        this.disposeEntry(entry);
+        return null;
       }
       if (!entry.disposed) {
         if (entry.frameAnimator) entry.layout = entry.frameAnimator.sample(0);
         this.layoutFrame(entry);
         this.orderFrames();
       }
+      if (transaction) {
+        const state = this.layerTransactions.get(transaction);
+        if (!state || state.closed) {
+          this.disposeEntry(entry);
+          return null;
+        }
+        state.entries.push({ collection, key, entry, previous, operation });
+      } else if (operations.get(key) === operation) {
+        collection.set(key, entry);
+        entry.group.visible = true;
+        if (previous) this.disposeEntry(previous);
+        this.orderFrames();
+      } else {
+        this.disposeEntry(entry);
+        return null;
+      }
       return entry;
     } catch (error) {
-      if (entry.disposed) return entry;
-      if (collection.get(key) === entry) this.clearLayers(collection, key);
+      if (entry.disposed) return null;
+      this.disposeEntry(entry);
+      if (signal?.aborted) return null;
       throw error;
     } finally {
       this.pending.delete(entry);
+      const pendingByKey = this.pendingLayers.get(collection);
+      const pending = pendingByKey?.get(key);
+      pending?.delete(entry);
+      if (pending?.size === 0) pendingByKey?.delete(key);
     }
   }
   setFrameOpacity(key: string, value: number, slide: number): void {
@@ -549,18 +683,40 @@ export class AdvCanvasPass {
   }
 
   private clearLayers(collection: Map<string, FrameView>, key?: string): void {
-    const entries = key ? (collection.has(key) ? ([[key, collection.get(key)!]] as const) : []) : [...collection];
-    for (const [id, entry] of entries) {
-      entry.disposed = true;
-      entry.rain?.destroy();
-      entry.particles?.dispose();
-      entry.particles = undefined;
-      entry.group.removeFromParent();
-      for (const image of entry.images) this.removeImage(image);
-      for (const release of entry.releases) release();
+    const pendingByKey = this.pendingLayers.get(collection);
+    const keys = key ? new Set([key]) : this.layerKeys(collection);
+    const operations = this.layerOperations.get(collection) ?? new Map<string, number>();
+    this.layerOperations.set(collection, operations);
+    for (const id of keys) {
+      operations.set(id, (operations.get(id) ?? 0) + 1);
+      const entries = new Set<FrameView>();
+      const current = collection.get(id);
+      if (current) entries.add(current);
+      for (const entry of pendingByKey?.get(id) ?? []) entries.add(entry);
+      for (const transaction of this.layerTransactions.values())
+        for (const item of transaction.entries)
+          if (item.collection === collection && item.key === id) entries.add(item.entry);
+      for (const entry of entries) this.disposeEntry(entry);
       collection.delete(id);
-      this.pending.delete(entry);
+      pendingByKey?.delete(id);
     }
+  }
+  private layerKeys(collection: Map<string, FrameView>): Set<string> {
+    const keys = new Set([...collection.keys(), ...(this.pendingLayers.get(collection)?.keys() ?? [])]);
+    for (const transaction of this.layerTransactions.values())
+      for (const item of transaction.entries) if (item.collection === collection) keys.add(item.key);
+    return keys;
+  }
+  private disposeEntry(entry: FrameView): void {
+    if (entry.disposed) return;
+    entry.disposed = true;
+    entry.rain?.destroy();
+    entry.particles?.dispose();
+    entry.particles = undefined;
+    entry.group.removeFromParent();
+    for (const image of entry.images) this.removeImage(image);
+    for (const release of entry.releases) release();
+    this.pending.delete(entry);
   }
   private removeImage(view: ImageView): void {
     view.generation++;
@@ -613,6 +769,7 @@ export class AdvCanvasPass {
     opacity: number,
     presentation: StoryStillPresentation | undefined,
     animationIndex: number,
+    signal?: AbortSignal,
   ): Promise<void> {
     let entry = this.stills.get(key);
     if (!entry) {
@@ -620,15 +777,14 @@ export class AdvCanvasPass {
         texture: String(still.url || ""),
         ...(presentation ? { layout: presentation.layout, textures: { still: String(still.url || "") } } : {}),
       };
-      const ready = this.createLayer(this.stills, key, frame, opacity);
-      entry = this.stills.get(key)!;
-      entry.ready = ready;
+      entry = (await this.createLayer(this.stills, key, frame, opacity, signal)) ?? undefined;
+      if (!entry) return;
       entry.still = still;
       if (presentation) entry.animator = new StoryStillAnimator(presentation);
     }
     const operation = ++entry.operation;
     entry.group.visible = true;
-    await entry.ready;
+    if (signal?.aborted) return;
     if (entry.disposed || entry.operation !== operation) return;
     entry.group.visible = true;
     entry.opacity = alpha(opacity);
@@ -664,11 +820,22 @@ export class AdvCanvasPass {
     entry.animator?.stop();
     this.setStillOpacity(key, 0);
   }
-  clearStills(): void {
-    this.clearLayers(this.stills);
+  clearStills(keep?: string | ReadonlySet<string>): void {
+    const keepKeys = typeof keep === "string" ? new Set([keep]) : keep;
+    for (const key of this.layerKeys(this.stills)) if (!keepKeys?.has(key)) this.clearLayers(this.stills, key);
+  }
+  clearFramesExcept(keep: ReadonlySet<string>): void {
+    for (const key of this.layerKeys(this.frames)) if (!keep.has(key)) this.clearLayers(this.frames, key);
   }
   cancelPendingStills(): void {
-    for (const [key, entry] of this.stills) if (this.pending.has(entry)) this.clearLayers(this.stills, key);
+    const pendingByKey = this.pendingLayers.get(this.stills);
+    const operations = this.layerOperations.get(this.stills) ?? new Map<string, number>();
+    this.layerOperations.set(this.stills, operations);
+    for (const [key, entries] of pendingByKey ?? []) {
+      operations.set(key, (operations.get(key) ?? 0) + 1);
+      for (const entry of entries) this.disposeEntry(entry);
+      pendingByKey?.delete(key);
+    }
   }
   setStillSpeed(value: number): void {
     this.stillSpeed = Math.max(0, finite(value, 1));
@@ -767,6 +934,7 @@ export class AdvCanvasPass {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    for (const transaction of this.layerTransactions.keys()) this.discardLayerTransaction(transaction);
     this.clearFrame();
     this.clearStills();
     for (const view of this.views) this.removeImage(view);
