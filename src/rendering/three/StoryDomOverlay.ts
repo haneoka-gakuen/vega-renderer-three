@@ -223,6 +223,7 @@ export class StoryDomOverlay {
     playbackRate: number,
     signal?: AbortSignal,
     playableUrl?: string,
+    startSeconds = 0,
   ): Promise<HTMLVideoElement> {
     if (this.destroyed) throw videoAbortError("Story overlay was destroyed");
     // Replacing a current video is a show transition, not a hide. Do not put
@@ -274,6 +275,22 @@ export class StoryDomOverlay {
       );
       if (this.destroyed || this.video !== video || loadController.signal.aborted) {
         throw videoAbortError("Video load was cancelled");
+      }
+      if (startSeconds > 0) {
+        const duration = Number.isFinite(video.duration) ? video.duration : Infinity;
+        const seeked = new Promise<void>((resolve) => {
+          const done = () => {
+            clearTimeout(timer);
+            video.removeEventListener("seeked", done);
+            loadController.signal.removeEventListener("abort", done);
+            resolve();
+          };
+          const timer = setTimeout(done, VIDEO_SHOW_TIMEOUT_MILLISECONDS);
+          video.addEventListener("seeked", done, { once: true });
+          loadController.signal.addEventListener("abort", done, { once: true });
+        });
+        video.currentTime = Math.min(startSeconds, Math.max(0, duration - 0.001));
+        await seeked;
       }
       this.canvasPass.setVideo(video);
       await playVideoWithTimeout(video, loadController.signal, VIDEO_SHOW_TIMEOUT_MILLISECONDS);

@@ -113,6 +113,19 @@ export interface ThreeStoryCharacterModel extends StoryCharacterRendererModel {
   playMotion(name: string, fadeInSeconds?: number): boolean;
   playExpression(name: string, fadeInSeconds?: number): boolean;
   /**
+   * Opcode 68 playback: loop the clip with its parameters faded in from the
+   * current pose until stopParameterLoopMotion. Unsupported formats return
+   * `false` and leave playback untouched.
+   */
+  playParameterLoopMotion?(name: string, fadeInSeconds?: number): boolean;
+  /** Ends a parameter loop started by playParameterLoopMotion, easing its parameters home over the clip's fade-out. */
+  stopParameterLoopMotion?(fadeSeconds?: number): void;
+  /**
+   * Opcode 69: stops auto eye blink (the running cycle completes so the eyes
+   * settle open) or resumes it. Models without auto blink ignore this.
+   */
+  setEyeBlinkStopped?(stopped: boolean, transitionSeconds?: number): void;
+  /**
    * Resolve only a known animation's asynchronous dependencies. `true` means
    * an immediate `play*` call performs no resource I/O. `false` never counts
    * as warmed: it may mean unknown/unsupported, while a key known through the

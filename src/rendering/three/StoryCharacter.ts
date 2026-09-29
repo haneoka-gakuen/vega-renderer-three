@@ -38,6 +38,10 @@ export class StoryCharacter implements StoryCharacterItem {
   /** Motion currently owned by the model, distinct from the pause queue. */
   currentMotionName = "";
   currentMotionFadeInSeconds: number | undefined;
+  /** Opcode 68 loop clip currently looping (empty when stopped). */
+  parameterLoopName = "";
+  /** Opcode 69 stop state of the auto eye blink. */
+  eyeBlinkStopped = false;
   /** Provider model's logical expression channel head. */
   currentExpressionName = "";
   currentExpressionFadeInSeconds: number | undefined;

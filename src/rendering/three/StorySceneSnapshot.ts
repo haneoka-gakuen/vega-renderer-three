@@ -15,8 +15,10 @@ import type { FieldRendererState, LipSyncState, StoryCameraState, StoryCharacter
 export const STORY_SCENE_SEEK_SNAPSHOT_VERSION = 1 as const;
 
 export interface AdvCharacterPresentationEvent {
-  readonly kind: "motion" | "expression";
+  readonly kind: "motion" | "expression" | "motionLoop" | "eyeBlinkStopped";
   readonly name: string;
+  /** Only for "eyeBlinkStopped": the auto-blink stopped state. */
+  readonly stopped?: boolean;
 }
 
 export interface AdvSeekCharacterSnapshot {
@@ -59,6 +61,8 @@ export interface AdvSeekCharacterSnapshot {
   readonly presentation: readonly AdvCharacterPresentationEvent[];
   readonly currentMotionName: string;
   readonly currentMotionFadeInSeconds?: number;
+  readonly parameterLoopName?: string;
+  readonly eyeBlinkStopped?: boolean;
   readonly currentExpressionName: string;
   readonly currentExpressionFadeInSeconds?: number;
   readonly activeExpressionName: string;

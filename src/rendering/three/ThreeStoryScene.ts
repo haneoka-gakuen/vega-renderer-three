@@ -1661,6 +1661,8 @@ export class ThreeStoryScene implements StorySceneBackend {
     const currentMotionName = firstString(item.currentMotionName, prepared.motionName);
     const activeExpressionName = firstString(item.activeExpressionName, prepared.expressionName);
     if (currentMotionName) replacement.playMotion(currentMotionName, item.currentMotionFadeInSeconds ?? 0);
+    if (item.parameterLoopName) replacement.playParameterLoopMotion?.(item.parameterLoopName, 0);
+    replacement.setEyeBlinkStopped?.(item.eyeBlinkStopped, 0);
     if (activeExpressionName) {
       replacement.playExpression(activeExpressionName, item.activeExpressionFadeInSeconds ?? 0);
     }
@@ -5155,6 +5157,77 @@ export class ThreeStoryScene implements StorySceneBackend {
     );
   }
 
+  playParameterLoopForTarget(target: string, motionName: string, fadeIn = 0, expectedIdentity?: string): void {
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(target, expectedIdentity);
+      if (!logical || !this.hasCharacterPresentationResource(logical.entry, "motions", motionName)) return;
+      this.logicalPresentationEvent(logical, { kind: "motionLoop", name: motionName });
+      logical.parameterLoopName = motionName;
+      return;
+    }
+    const item = expectedIdentity
+      ? this.cachedCharacterControllerByIdentity(expectedIdentity)
+      : this.cachedCharacterController(target);
+    if (!item) {
+      // Before CharacterIn produces a controller: keep the loop reachable
+      // through the presentation history, like a queued motion.
+      if (!this.hasCharacterPresentationResource(this.pendingCharacterPlacements.get(target)?.entry, "motions", motionName))
+        return;
+      this.recordCharacterPresentation(target, { kind: "motionLoop", name: motionName });
+      return;
+    }
+    if (!this.hasCharacterPresentationResource(item.entry, "motions", motionName)) return;
+    this.recordCharacterPresentation(target, { kind: "motionLoop", name: motionName });
+    item.parameterLoopName = motionName;
+    if (item.paused) {
+      item.pendingPausedMotion = { name: motionName, fadeInSeconds: fadeIn };
+      return;
+    }
+    this.invokeCharacterModel(item, `play parameter loop ${motionName}`, false, (model) =>
+      model.playParameterLoopMotion?.(motionName, fadeIn) ?? false,
+    );
+  }
+
+  stopParameterLoopForTarget(target: string, fadeOut?: number, expectedIdentity?: string): void {
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(target, expectedIdentity);
+      if (!logical) return;
+      this.logicalPresentationEvent(logical, { kind: "motionLoop", name: "" });
+      logical.parameterLoopName = "";
+      return;
+    }
+    const item = expectedIdentity
+      ? this.cachedCharacterControllerByIdentity(expectedIdentity)
+      : this.cachedCharacterController(target);
+    if (!item) return;
+    this.recordCharacterPresentation(target, { kind: "motionLoop", name: "" });
+    item.parameterLoopName = "";
+    this.invokeCharacterModel(item, "stop parameter loop", false, (model) => {
+      model.stopParameterLoopMotion?.(fadeOut);
+      return true;
+    });
+  }
+
+  setEyeBlinkStoppedForTarget(target: string, stopped: boolean, transitionSeconds = 0, expectedIdentity?: string): void {
+    if (this.seekIndexCompilationActive) {
+      const logical = this.logicalCharacterByTarget(target, expectedIdentity);
+      if (!logical) return;
+      this.logicalPresentationEvent(logical, { kind: "eyeBlinkStopped", name: "", stopped });
+      logical.eyeBlinkStopped = stopped;
+      return;
+    }
+    const item = expectedIdentity
+      ? this.cachedCharacterControllerByIdentity(expectedIdentity)
+      : this.cachedCharacterController(target);
+    if (!item) return;
+    this.recordCharacterPresentation(target, { kind: "eyeBlinkStopped", name: "", stopped });
+    item.eyeBlinkStopped = stopped;
+    this.invokeCharacterModel(item, `set eye blink stopped ${stopped}`, false, (model) => {
+      model.setEyeBlinkStopped?.(stopped, transitionSeconds);
+      return true;
+    });
+  }
+
   setCharacterForward(positionType: number): void {
     const index = this.characterStageIndex(positionType);
     if (index < 0) return;
@@ -6029,7 +6102,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   async showVideo(
     videoInfo: AdvVideoEntry | string,
     fadeIn = 0,
-    _readyTimeout = 0,
+    startSeconds = 0,
     playbackRate = 1,
     signal?: AbortSignal,
     targetAlpha = 1,
@@ -6043,7 +6116,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (source) this.retainPendingVideoSource(source);
     try {
       const renderable = source ? await this.resolveEpisodeVideoRenderable(source, signal) : undefined;
-      const video = await overlay?.showVideo(videoInfo, playbackRate, signal, renderable?.url);
+      const video = await overlay?.showVideo(videoInfo, playbackRate, signal, renderable?.url, startSeconds);
       if (this.destroyed || generation !== this.sceneGeneration || signal?.aborted || this.overlay !== overlay) return;
       if (!video) return;
       Object.assign(this.state.video, {
@@ -6055,11 +6128,9 @@ export class ThreeStoryScene implements StorySceneBackend {
         ended: false,
       });
       this.overlay?.setVideoAlpha(fadeIn > 0 ? 0 : clamp(targetAlpha));
-      if (fadeIn > 0) {
-        await this.fadeVideo(targetAlpha, fadeIn);
-        if (this.destroyed || generation !== this.sceneGeneration || signal?.aborted || this.overlay !== overlay)
-          return;
-      }
+      // AdvClipCommand.PlayClip forgets its fade: the script (and the clip's
+      // Delay timeline) continues from the first played frame.
+      if (fadeIn > 0) void this.fadeVideo(targetAlpha, fadeIn).catch(() => {});
     } finally {
       if (source) this.releasePendingVideoSource(source);
       // clearVideo(false) deliberately suppresses a residency callback while
@@ -6097,6 +6168,12 @@ export class ThreeStoryScene implements StorySceneBackend {
       duration: 0,
       progress: 0,
     });
+  }
+
+  videoClock(): { mediaTime: number; paused: boolean; ended: boolean; failed: boolean } | undefined {
+    const video = this.overlay?.videoElement;
+    if (!video || !this.state.video.src) return undefined;
+    return { mediaTime: video.currentTime, paused: video.paused, ended: video.ended, failed: Boolean(video.error) };
   }
 
   skipVideo(): boolean {
@@ -6531,6 +6608,8 @@ export class ThreeStoryScene implements StorySceneBackend {
           ],
           currentMotionName: item.currentMotionName,
           currentMotionFadeInSeconds: item.currentMotionFadeInSeconds,
+          parameterLoopName: item.parameterLoopName,
+          eyeBlinkStopped: item.eyeBlinkStopped,
           currentExpressionName: item.currentExpressionName,
           currentExpressionFadeInSeconds: item.currentExpressionFadeInSeconds,
           activeExpressionName: item.activeExpressionName,
@@ -6765,6 +6844,8 @@ export class ThreeStoryScene implements StorySceneBackend {
       item.rimLight = clonePlain(character.rimLight);
       item.currentMotionName = character.currentMotionName;
       item.currentMotionFadeInSeconds = character.currentMotionFadeInSeconds;
+      item.parameterLoopName = character.parameterLoopName ?? "";
+      item.eyeBlinkStopped = character.eyeBlinkStopped ?? false;
       item.currentExpressionName = character.currentExpressionName;
       item.currentExpressionFadeInSeconds = character.currentExpressionFadeInSeconds;
       item.activeExpressionName = character.activeExpressionName;
@@ -6796,7 +6877,9 @@ export class ThreeStoryScene implements StorySceneBackend {
         model.stopMotions();
         model.resetExpressionParametersToDefault();
         if (item.currentMotionName) model.playMotion(item.currentMotionName, 0);
+        if (item.parameterLoopName) model.playParameterLoopMotion?.(item.parameterLoopName, 0);
         if (item.activeExpressionName) model.playExpression(item.activeExpressionName, 0);
+        model.setEyeBlinkStopped?.(item.eyeBlinkStopped, 0);
         model.setMotionSpeed(this.playbackSpeedRate);
         if (item.paused) model.setPaused(true);
         model.primeInitialFrame(this.characterParameterFrame(item));
