@@ -909,6 +909,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   private renderer: WebGLRenderer | null = null;
   private pipeline: AdvPostPipeline | null = null;
   private overlay: StoryDomOverlay | null = null;
+  private videoPlaybackFailed = false;
   private ruleTransitionPass: AdvRuleTransitionPass | null = null;
   private mount: HTMLElement | null = null;
   private resizeObserver: ResizeObserver | null = null;
@@ -5171,7 +5172,13 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (!item) {
       // Before CharacterIn produces a controller: keep the loop reachable
       // through the presentation history, like a queued motion.
-      if (!this.hasCharacterPresentationResource(this.pendingCharacterPlacements.get(target)?.entry, "motions", motionName))
+      if (
+        !this.hasCharacterPresentationResource(
+          this.pendingCharacterPlacements.get(target)?.entry,
+          "motions",
+          motionName,
+        )
+      )
         return;
       this.recordCharacterPresentation(target, { kind: "motionLoop", name: motionName });
       return;
@@ -5183,8 +5190,11 @@ export class ThreeStoryScene implements StorySceneBackend {
       item.pendingPausedMotion = { name: motionName, fadeInSeconds: fadeIn };
       return;
     }
-    this.invokeCharacterModel(item, `play parameter loop ${motionName}`, false, (model) =>
-      model.playParameterLoopMotion?.(motionName, fadeIn) ?? false,
+    this.invokeCharacterModel(
+      item,
+      `play parameter loop ${motionName}`,
+      false,
+      (model) => model.playParameterLoopMotion?.(motionName, fadeIn) ?? false,
     );
   }
 
@@ -5208,7 +5218,12 @@ export class ThreeStoryScene implements StorySceneBackend {
     });
   }
 
-  setEyeBlinkStoppedForTarget(target: string, stopped: boolean, transitionSeconds = 0, expectedIdentity?: string): void {
+  setEyeBlinkStoppedForTarget(
+    target: string,
+    stopped: boolean,
+    transitionSeconds = 0,
+    expectedIdentity?: string,
+  ): void {
     if (this.seekIndexCompilationActive) {
       const logical = this.logicalCharacterByTarget(target, expectedIdentity);
       if (!logical) return;
@@ -5758,20 +5773,18 @@ export class ThreeStoryScene implements StorySceneBackend {
     const additional = packUnityUrpAdditionalLights(
       lights
         .filter((light) => light !== directional)
-        .map(
-          (light): UnityCharacterAdditionalLightLike => ({
-            active: true,
-            type: finite(light.type, -1),
-            position: vec3(light.worldPosition, { x: 0, y: 0, z: 0 }),
-            forward: vec3(light.worldForward, { x: 0, y: 0, z: 1 }),
-            rotation: lightQuaternion(light.worldRotation),
-            color: lightColor(light.color),
-            intensity: finite(light.intensity, 1),
-            range: finite(light.range, 10),
-            spotAngle: finite(light.spotAngle, 30),
-            innerSpotAngle: Number.isFinite(Number(light.innerSpotAngle)) ? Number(light.innerSpotAngle) : undefined,
-          }),
-        ),
+        .map((light): UnityCharacterAdditionalLightLike => ({
+          active: true,
+          type: finite(light.type, -1),
+          position: vec3(light.worldPosition, { x: 0, y: 0, z: 0 }),
+          forward: vec3(light.worldForward, { x: 0, y: 0, z: 1 }),
+          rotation: lightQuaternion(light.worldRotation),
+          color: lightColor(light.color),
+          intensity: finite(light.intensity, 1),
+          range: finite(light.range, 10),
+          spotAngle: finite(light.spotAngle, 30),
+          innerSpotAngle: Number.isFinite(Number(light.innerSpotAngle)) ? Number(light.innerSpotAngle) : undefined,
+        })),
     );
     const enabled = this.qualityConfig.isUnityLightingEnabled() && lights.length > 0;
     this.characterLightingState = {
@@ -6107,6 +6120,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     signal?: AbortSignal,
     targetAlpha = 1,
   ): Promise<void> {
+    this.videoPlaybackFailed = false;
     const generation = this.sceneGeneration;
     const overlay = this.overlay;
     const previousSource = this.activeVideoSource();
@@ -6119,12 +6133,13 @@ export class ThreeStoryScene implements StorySceneBackend {
       const video = await overlay?.showVideo(videoInfo, playbackRate, signal, renderable?.url, startSeconds);
       if (this.destroyed || generation !== this.sceneGeneration || signal?.aborted || this.overlay !== overlay) return;
       if (!video) return;
+      if (this.state.paused) video.pause();
       Object.assign(this.state.video, {
         visible: true,
         src: source,
         alpha: fadeIn > 0 ? 0 : clamp(targetAlpha),
         playbackRate: video.playbackRate,
-        playing: true,
+        playing: !video.paused,
         ended: false,
       });
       this.overlay?.setVideoAlpha(fadeIn > 0 ? 0 : clamp(targetAlpha));
@@ -6158,6 +6173,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   async hideVideo(fadeOut = 0): Promise<void> {
     if (fadeOut > 0) await this.fadeVideo(0, fadeOut);
     this.overlay?.clearVideo();
+    this.videoPlaybackFailed = false;
     Object.assign(this.state.video, {
       visible: false,
       src: "",
@@ -6173,7 +6189,28 @@ export class ThreeStoryScene implements StorySceneBackend {
   videoClock(): { mediaTime: number; paused: boolean; ended: boolean; failed: boolean } | undefined {
     const video = this.overlay?.videoElement;
     if (!video || !this.state.video.src) return undefined;
-    return { mediaTime: video.currentTime, paused: video.paused, ended: video.ended, failed: Boolean(video.error) };
+    return {
+      mediaTime: video.currentTime,
+      paused: video.paused,
+      ended: video.ended,
+      failed: Boolean(video.error) || this.videoPlaybackFailed,
+    };
+  }
+
+  setVideoPaused(paused: boolean): void {
+    const video = this.overlay?.videoElement;
+    if (!video || !this.state.video.src) return;
+    if (paused) {
+      video.pause();
+      this.state.video.playing = false;
+    } else if (!video.ended && !video.error && !this.videoPlaybackFailed) {
+      void video.play().catch((error: unknown) => {
+        if (this.destroyed || this.overlay?.videoElement !== video || this.state.paused) return;
+        this.videoPlaybackFailed = true;
+        this.state.video.playing = false;
+        this.state.error = error instanceof Error ? error.message : String(error);
+      });
+    }
   }
 
   skipVideo(): boolean {
@@ -7820,7 +7857,7 @@ export class ThreeStoryScene implements StorySceneBackend {
           if (raw >= 1) renderer = null;
           else renderer.nextFrameSeconds += frameSeconds;
         }
-        for (let index = 0; index < direct.length; ) {
+        for (let index = 0; index < direct.length;) {
           const entry = direct[index];
           if (entry.nextFrameSeconds > nextSeconds) {
             index += 1;

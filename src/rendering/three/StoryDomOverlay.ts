@@ -278,16 +278,28 @@ export class StoryDomOverlay {
       }
       if (startSeconds > 0) {
         const duration = Number.isFinite(video.duration) ? video.duration : Infinity;
-        const seeked = new Promise<void>((resolve) => {
-          const done = () => {
+        const seeked = new Promise<void>((resolve, reject) => {
+          const done = (error?: Error) => {
             clearTimeout(timer);
-            video.removeEventListener("seeked", done);
-            loadController.signal.removeEventListener("abort", done);
-            resolve();
+            video.removeEventListener("seeked", onSeeked);
+            video.removeEventListener("error", onError);
+            loadController.signal.removeEventListener("abort", onAbort);
+            if (error) reject(error);
+            else resolve();
           };
-          const timer = setTimeout(done, VIDEO_SHOW_TIMEOUT_MILLISECONDS);
-          video.addEventListener("seeked", done, { once: true });
-          loadController.signal.addEventListener("abort", done, { once: true });
+          const onSeeked = () => done();
+          const onError = () => done(new Error(video.error?.message || "Video seek failed"));
+          const onAbort = () => done(videoAbortError("Video seek was cancelled"));
+          const timer = setTimeout(() => {
+            const error = new Error("Timed out waiting for video seek");
+            error.name = "TimeoutError";
+            done(error);
+          }, VIDEO_SHOW_TIMEOUT_MILLISECONDS);
+          video.addEventListener("seeked", onSeeked, { once: true });
+          video.addEventListener("error", onError, { once: true });
+          loadController.signal.addEventListener("abort", onAbort, { once: true });
+          if (loadController.signal.aborted) onAbort();
+          else if (video.error) onError();
         });
         video.currentTime = Math.min(startSeconds, Math.max(0, duration - 0.001));
         await seeked;
@@ -332,7 +344,7 @@ export class StoryDomOverlay {
 
   waitVideoEnded(signal?: AbortSignal): Promise<void> {
     const video = this.video;
-    if (!video || video.ended || this.destroyed || signal?.aborted) return Promise.resolve();
+    if (!video || video.ended || video.error || this.destroyed || signal?.aborted) return Promise.resolve();
     return new Promise((resolve) => {
       let settled = false;
       const done = (): void => {
