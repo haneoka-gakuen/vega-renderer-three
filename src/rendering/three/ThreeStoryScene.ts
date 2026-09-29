@@ -6151,8 +6151,12 @@ export class ThreeStoryScene implements StorySceneBackend {
       // clearVideo(false) deliberately suppresses a residency callback while
       // replacing a playing element. Once the replacement has settled, the
       // old source is no longer an active/pending owner and its resolver lease
-      // can be released safely. Re-showing the same source keeps its lease.
-      if (previousSource && previousSource !== source) this.releaseEpisodeVideoRenderable(previousSource);
+      // can be released safely. Re-showing the same source keeps its lease only
+      // if the replacement actually became an owner; a failed same-source load
+      // must not strand the old object URL.
+      if (previousSource && (previousSource !== source || !this.hasVideoSourceOwner(previousSource))) {
+        this.releaseEpisodeVideoRenderable(previousSource);
+      }
     }
   }
 
