@@ -1,3 +1,4 @@
+import { videoPresentedTime } from "./AdvVideoClock";
 import { ScreenSpriteRenderer } from "./ScreenSpriteRenderer";
 import {
   AdaptiveRenderQuality,
@@ -2159,6 +2160,9 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   cancelTransitionsForSeek(): void {
+    // Retire shake's dedicated fade owner before the frozen scene clock
+    // strands a stopping cycle and blocks checkpoint restoration.
+    this.resetShakeState();
     // Rule fades advance on the scene clock, which is suspended during seek.
     // Settle that command before the playback loop waits to restore its target.
     this.clearRuleTransition();
@@ -6130,7 +6134,14 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (source) this.retainPendingVideoSource(source);
     try {
       const renderable = source ? await this.resolveEpisodeVideoRenderable(source, signal) : undefined;
-      const video = await overlay?.showVideo(videoInfo, playbackRate, signal, renderable?.url, startSeconds);
+      const video = await overlay?.showVideo(
+        videoInfo,
+        playbackRate,
+        signal,
+        renderable?.url,
+        startSeconds,
+        () => this.state.paused,
+      );
       if (this.destroyed || generation !== this.sceneGeneration || signal?.aborted || this.overlay !== overlay) return;
       if (!video) return;
       if (this.state.paused) video.pause();
@@ -6194,7 +6205,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     const video = this.overlay?.videoElement;
     if (!video || !this.state.video.src) return undefined;
     return {
-      mediaTime: video.currentTime,
+      mediaTime: videoPresentedTime(video),
       paused: video.paused,
       ended: video.ended,
       failed: Boolean(video.error) || this.videoPlaybackFailed,

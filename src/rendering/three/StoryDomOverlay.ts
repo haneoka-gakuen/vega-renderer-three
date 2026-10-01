@@ -2,7 +2,8 @@ import type { AdvFrameEntry, AdvVideoEntry, StoryFrameLayoutProvider } from "@ha
 import type { WebGLRenderer } from "three";
 import type { AdvRainFrameSnapshot } from "./AdvRainFrameRenderer";
 import { AdvCanvasPass, type CanvasTextureLoader } from "./AdvCanvasPass";
-import { videoAbortError, waitForVideo } from "./AdvVideoWait";
+import { seekVideoTime, videoAbortError, waitForVideo } from "./AdvVideoWait";
+import { startVideoClock, stopVideoClock } from "./AdvVideoClock";
 
 function absoluteLayer(zIndex: number): HTMLDivElement {
   const element = document.createElement("div");
@@ -224,6 +225,7 @@ export class StoryDomOverlay {
     signal?: AbortSignal,
     playableUrl?: string,
     startSeconds = 0,
+    isPaused: () => boolean = () => false,
   ): Promise<HTMLVideoElement> {
     if (this.destroyed) throw videoAbortError("Story overlay was destroyed");
     // Replacing a current video is a show transition, not a hide. Do not put
@@ -276,36 +278,10 @@ export class StoryDomOverlay {
       if (this.destroyed || this.video !== video || loadController.signal.aborted) {
         throw videoAbortError("Video load was cancelled");
       }
-      if (startSeconds > 0) {
-        const duration = Number.isFinite(video.duration) ? video.duration : Infinity;
-        const seeked = new Promise<void>((resolve, reject) => {
-          const done = (error?: Error) => {
-            clearTimeout(timer);
-            video.removeEventListener("seeked", onSeeked);
-            video.removeEventListener("error", onError);
-            loadController.signal.removeEventListener("abort", onAbort);
-            if (error) reject(error);
-            else resolve();
-          };
-          const onSeeked = () => done();
-          const onError = () => done(new Error(video.error?.message || "Video seek failed"));
-          const onAbort = () => done(videoAbortError("Video seek was cancelled"));
-          const timer = setTimeout(() => {
-            const error = new Error("Timed out waiting for video seek");
-            error.name = "TimeoutError";
-            done(error);
-          }, VIDEO_SHOW_TIMEOUT_MILLISECONDS);
-          video.addEventListener("seeked", onSeeked, { once: true });
-          video.addEventListener("error", onError, { once: true });
-          loadController.signal.addEventListener("abort", onAbort, { once: true });
-          if (loadController.signal.aborted) onAbort();
-          else if (video.error) onError();
-        });
-        video.currentTime = Math.min(startSeconds, Math.max(0, duration - 0.001));
-        await seeked;
-      }
+      await seekVideoTime(video, startSeconds, loadController.signal, VIDEO_SHOW_TIMEOUT_MILLISECONDS);
+      startVideoClock(video);
       this.canvasPass.setVideo(video);
-      await playVideoWithTimeout(video, loadController.signal, VIDEO_SHOW_TIMEOUT_MILLISECONDS);
+      if (!isPaused()) await playVideoWithTimeout(video, loadController.signal, VIDEO_SHOW_TIMEOUT_MILLISECONDS);
       if (this.destroyed || this.video !== video || loadController.signal.aborted) {
         throw videoAbortError("Video playback was cancelled");
       }
@@ -375,6 +351,7 @@ export class StoryDomOverlay {
     if (this.video) {
       const video = this.video;
       this.video = null;
+      stopVideoClock(video);
       video.pause();
       const source = video.dataset.vegaSource || "";
       video.remove();
@@ -453,6 +430,7 @@ export class StoryDomOverlay {
   private releaseVideoElement(video: HTMLVideoElement): void {
     if (this.releasedVideos.has(video)) return;
     this.releasedVideos.add(video);
+    stopVideoClock(video);
     video.pause();
     video.remove();
     video.removeAttribute("src");
