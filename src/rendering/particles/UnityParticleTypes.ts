@@ -92,6 +92,12 @@ export interface UnityParticleEmissionModule {
   }>;
 }
 
+/** Independent per-birth samples retained by a texture-sheet lifetime module. */
+export interface UnityTextureSheetBirthRandom {
+  readonly frameOverTime: number;
+  readonly startFrame: number;
+}
+
 export interface UnityParticleShapeModule {
   type: number;
   angle: number;

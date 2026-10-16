@@ -270,8 +270,6 @@ export class AdvBokehDepthOfField {
   ): boolean {
     if (!settings.active || Math.trunc(settings.mode) !== 2) return false;
 
-    source.texture.minFilter = LinearFilter;
-    source.texture.magFilter = LinearFilter;
 
     const width = source.width;
     const height = source.height;

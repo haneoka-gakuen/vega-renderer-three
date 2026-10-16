@@ -12,7 +12,7 @@ export function advBloomMappedScatter(scatter: number): number {
 function bloomGammaToLinear(value: number): number {
   if (value <= 0.04045) return value / 12.92;
   if (value < 1) return Math.pow((value + 0.055) / 1.055, 2.4);
-  return Math.pow(value, 2.4);
+  return Math.pow(value, 2.2);
 }
 
 /** Compatibility SetupBloom prefilter vector. */

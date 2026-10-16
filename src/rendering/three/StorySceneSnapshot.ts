@@ -1,6 +1,10 @@
 import type { StoryScreenEffectSnapshot } from "@haneoka/vega/renderer-kit";
 import type { AdvRainFrameSnapshot } from "./AdvRainFrameRenderer";
 import type { CanvasStillSnapshot } from "./AdvCanvasPass";
+import type { SceneAnimationClockSnapshot } from "./SceneAnimationClock";
+import type { ThreeParameterLoopTimeline } from "../ThreeCharacterModel";
+import type { AdvRuleTransitionSnapshot } from "./transitions/AdvRuleTransition";
+
 import type {
   AdvBackgroundEntry,
   AdvEffectEntry,
@@ -11,6 +15,10 @@ import type {
 } from "@haneoka/vega/renderer-kit";
 import type { PendingCharacterCommandsSnapshot } from "./PendingCharacterCommands";
 import type { FieldRendererState, LipSyncState, StoryCameraState, StoryCharacterEntry, Vec3 } from "./StorySceneTypes";
+
+export type SceneClockDomainSnapshot =
+  | { readonly mode: "owned"; readonly started: boolean; readonly snapshot: SceneAnimationClockSnapshot }
+  | { readonly mode: "legacy-wall" };
 
 export const STORY_SCENE_SEEK_SNAPSHOT_VERSION = 1 as const;
 
@@ -62,6 +70,7 @@ export interface AdvSeekCharacterSnapshot {
   readonly currentMotionName: string;
   readonly currentMotionFadeInSeconds?: number;
   readonly parameterLoopName?: string;
+  readonly parameterLoopTimeline?: ThreeParameterLoopTimeline;
   readonly eyeBlinkStopped?: boolean;
   readonly currentExpressionName: string;
   readonly currentExpressionFadeInSeconds?: number;
@@ -88,6 +97,7 @@ export interface AdvStorySceneSeekSnapshot extends PortableAdvStorySceneSeekSnap
   readonly rendererState: {
     readonly kind: "three";
     readonly version: 3;
+    readonly characterBlurIntensities?: readonly (readonly [number, number])[];
     readonly transforms: readonly {
       readonly target: string;
       readonly current: Readonly<Record<string, number>>;
@@ -140,6 +150,10 @@ export interface AdvStorySceneSeekSnapshot extends PortableAdvStorySceneSeekSnap
   readonly effect: AdvPlayerState["effect"];
   readonly effects: AdvPlayerState["effects"];
   readonly cover: AdvPlayerState["cover"];
+  readonly ruleTransition?: {
+    readonly source: string;
+    readonly state: AdvRuleTransitionSnapshot;
+  };
   readonly talk: AdvPlayerState["talk"];
   readonly title: AdvPlayerState["title"];
   readonly location: AdvPlayerState["location"];
@@ -149,6 +163,7 @@ export interface AdvStorySceneSeekSnapshot extends PortableAdvStorySceneSeekSnap
   readonly dofActive: boolean;
   readonly characters: readonly AdvSeekCharacterSnapshot[];
   readonly lifecycle: {
+    readonly animationClock?: SceneClockDomainSnapshot;
     readonly characterLoadSequence: number;
     readonly characterLoadTokens: readonly (readonly [string, number])[];
     readonly characterControllerIdentities: readonly (readonly [string, string])[];

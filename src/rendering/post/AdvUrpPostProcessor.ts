@@ -23,6 +23,8 @@ export const normalizeAdvColorGradingPipelineMode = (mode: unknown): AdvColorGra
 
 export interface AdvUrpPostProcessorOptions {
   readonly resolveTexture?: AdvPostTextureResolver;
+  readonly filmGrainMultiplier?: number;
+  readonly resolveGrainPixelScale?: (width: number) => number;
 }
 
 /**
@@ -46,7 +48,7 @@ export class AdvUrpPostProcessor {
   private colorGradingMode: AdvColorGradingPipelineMode = "ldr";
 
   constructor(options: AdvUrpPostProcessorOptions = {}) {
-    this.uber = new AdvUrpUberPost(options.resolveTexture);
+    this.uber = new AdvUrpUberPost(options.resolveTexture, options.filmGrainMultiplier ?? 0, options.resolveGrainPixelScale);
   }
 
   get currentVolumeState(): Readonly<AdvUrpVolumeState> {
@@ -70,7 +72,10 @@ export class AdvUrpPostProcessor {
     destination: WebGLRenderTarget,
     renderFullscreen: AdvRenderFullscreen,
     camera: Camera | null,
+    frameStamp?: number,
   ): WebGLRenderTarget {
+    if (frameStamp !== undefined && (!Number.isSafeInteger(frameStamp) || frameStamp < 0))
+      throw new TypeError("Invalid authored post frame stamp");
     // URP ping-pongs full-resolution passes. The caller's main/temp pair is no
     // longer needed for scene submission once this method begins, so it is the
     // exact allocation-free equivalent of GetSource()/GetDestination().
@@ -84,7 +89,7 @@ export class AdvUrpPostProcessor {
       current = next;
       next = previous;
     }
-    if (this.motionBlur.render(current, next, this.volumeState.motionBlur, renderFullscreen, camera)) {
+    if (this.motionBlur.render(current, next, this.volumeState.motionBlur, renderFullscreen, camera, null, frameStamp)) {
       const previous = current;
       current = next;
       next = previous;
@@ -113,10 +118,10 @@ export class AdvUrpPostProcessor {
       internalLut,
       bloom,
       hdrGrading,
-      this.frameCount,
+      frameStamp ?? this.frameCount,
       renderFullscreen,
     );
-    this.frameCount += 1;
+    if (frameStamp === undefined) this.frameCount += 1;
     return next;
   }
 

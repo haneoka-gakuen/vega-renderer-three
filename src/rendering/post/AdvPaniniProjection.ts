@@ -1,6 +1,5 @@
 import {
   ClampToEdgeWrapping,
-  LinearFilter,
   NoBlending,
   NoColorSpace,
   ShaderMaterial,
@@ -144,8 +143,6 @@ export class AdvPaniniProjection {
     );
 
     source.texture.colorSpace = NoColorSpace;
-    source.texture.minFilter = LinearFilter;
-    source.texture.magFilter = LinearFilter;
     source.texture.wrapS = ClampToEdgeWrapping;
     source.texture.wrapT = ClampToEdgeWrapping;
     this.uniforms.tInput.value = source.texture;

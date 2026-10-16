@@ -76,3 +76,12 @@ export function supportsRenderableRgba16Unorm(gl: WebGL2RenderingContext): boole
 export function detectAdvFieldTargetFormat(gl: WebGL2RenderingContext): AdvFieldTargetFormat {
   return selectAdvFieldTargetFormat(supportsRenderableRgba16Unorm(gl));
 }
+
+export function detectAdvFieldTargetSamples(gl: WebGL2RenderingContext, format: AdvFieldTargetFormat): number {
+  const internalFormat = format.normalized
+    ? gl.getExtension("EXT_texture_norm16")?.RGBA16_EXT
+    : gl.RGBA8;
+  if (internalFormat === undefined) return 0;
+  const supported = gl.getInternalformatParameter(gl.RENDERBUFFER, internalFormat, gl.SAMPLES) as Int32Array;
+  return supported.includes(2) ? 2 : 0;
+}

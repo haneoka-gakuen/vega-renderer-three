@@ -340,8 +340,6 @@ export class AdvGaussianDepthOfField {
     renderFullscreen: AdvRenderFullscreen,
   ): boolean {
     if (!settings.active || Math.trunc(settings.mode) !== 1) return false;
-    source.texture.minFilter = LinearFilter;
-    source.texture.magFilter = LinearFilter;
     const { halfWidth, halfHeight, maxRadius } = computeAdvGaussianParameters(settings, source.width, source.height);
     this.fullCoc.setSize(source.width, source.height);
     this.halfCoc.setSize(halfWidth, halfHeight);

@@ -1,3 +1,5 @@
+import { ScopedRenderTargetSampling } from "../post/ScopedRenderTargetSampling";
+import type { StoryDrawingBufferExtent } from "./StoryPhysicalViewport";
 import {
   AddEquation,
   Camera,
@@ -56,6 +58,7 @@ interface MutableAdvCharacterFramebuffer {
 
 interface ThreeRenderTargetProperties {
   __webglFramebuffer?: WebGLFramebuffer | readonly WebGLFramebuffer[];
+  __webglMultisampledFramebuffer?: WebGLFramebuffer;
 }
 
 export interface AdvBlurSettings {
@@ -98,8 +101,11 @@ export interface AdvPostPipelineOptions {
   readonly finalPostFxaaEnabled?: boolean;
   /** Authored portable color-grading path. */
   readonly colorGradingMode?: AdvColorGradingPipelineMode;
+  readonly filmGrainMultiplier?: number;
+  readonly resolveGrainPixelScale?: (width: number) => number;
   /** Capability-probed field buffer format. RGBA8 is the portable LDR fallback. */
   readonly fieldTargetFormat?: AdvFieldTargetFormat;
+  readonly fieldTargetSamples?: number;
   /** Optional host/plugin bridge for LUT, grain, and lens-dirt textures. */
   readonly resolvePostTexture?: AdvPostTextureResolver;
 }
@@ -132,6 +138,7 @@ export interface AdvPostFinishOptions {
   /** Defaults to the renderer's canvas. */
   readonly outputTarget?: WebGLRenderTarget | null;
   readonly timeSeconds?: number;
+  readonly frameStamp?: number;
 }
 
 export interface AdvCharacterGroupSettings {
@@ -464,6 +471,7 @@ export class AdvPostPipeline {
   private readonly curvedLensMaterial: ShaderMaterial;
   private readonly urpPostProcessor: AdvUrpPostProcessor;
   private readonly finalPostFxaa = new AdvFinalPostFxaa();
+  private readonly postSampling: ScopedRenderTargetSampling;
   private readonly fullscreenQuad: Mesh<PlaneGeometry, ShaderMaterial>;
   private readonly savedClearColor = new Color();
   private readonly savedViewport = new Vector4();
@@ -473,7 +481,7 @@ export class AdvPostPipeline {
     material: ShaderMaterial,
     target: WebGLRenderTarget | null,
     clear: boolean,
-  ): void => this.renderFullscreen(material, target, clear);
+  ): void => this.renderFullscreen(material, target, clear, true);
 
   private effects = copyEffects(DEFAULT_EFFECTS);
   private physicalWidth = 1;
@@ -499,6 +507,8 @@ export class AdvPostPipeline {
     this.renderer = renderer;
     this.urpPostProcessor = new AdvUrpPostProcessor({
       resolveTexture: options.resolvePostTexture,
+      filmGrainMultiplier: options.filmGrainMultiplier,
+      resolveGrainPixelScale: options.resolveGrainPixelScale,
     });
     const fieldTargetFormat = options.fieldTargetFormat;
     if (!fieldTargetFormat) throw new Error("AdvPostPipeline requires a capability-probed field target format");
@@ -515,6 +525,8 @@ export class AdvPostPipeline {
       fieldTargetFormat.textureType,
       fieldTargetFormat.normalized,
     );
+    this.mainTarget.samples = options.fieldTargetSamples ?? 0;
+    this.temporaryTarget.samples = options.fieldTargetSamples ?? 0;
     this.characterBlurTarget = createTarget(
       "adv-field-character-blur",
       false,
@@ -539,6 +551,7 @@ export class AdvPostPipeline {
     this.compositeMaterial.blendEquationAlpha = AddEquation;
     this.compositeMaterial.blendSrcAlpha = OneFactor;
     this.compositeMaterial.blendDstAlpha = OneMinusSrcAlphaFactor;
+    this.postSampling = new ScopedRenderTargetSampling(this.renderer);
     this.curvedLensMaterial = createMaterial(CURVED_LENS_FRAGMENT, this.curvedLensUniforms);
     this.fullscreenQuad = new Mesh(this.fullscreenGeometry, this.outputMaterial);
     this.fullscreenQuad.frustumCulled = false;
@@ -573,19 +586,23 @@ export class AdvPostPipeline {
     return copyEffects(this.effects);
   }
 
-  setSize(width: number, height: number, pixelRatio = this.pixelRatio): void {
+  setSize(width: number, height: number, pixelRatio = this.pixelRatio, measured?: StoryDrawingBufferExtent): void {
     this.assertUsable();
     if (this.frameActive) throw new Error("Cannot resize AdvPostPipeline during an active frame");
     this.cssWidth = Math.max(1, finite(width, 1));
     this.cssHeight = Math.max(1, finite(height, 1));
-    this.pixelRatio = Math.max(0.1, finite(pixelRatio, 1));
+    if (measured && (!Number.isFinite(pixelRatio) || pixelRatio <= 0))
+      throw new TypeError("Invalid measured post pixel ratio");
+    this.pixelRatio = measured ? pixelRatio : Math.max(0.1, finite(pixelRatio, 1));
 
     const requestedWidth = Math.max(1, Math.round(this.cssWidth * this.pixelRatio));
     const requestedHeight = Math.max(1, Math.round(this.cssHeight * this.pixelRatio));
     const maximum = Math.max(1, this.renderer.capabilities.maxTextureSize);
     const scale = Math.min(1, maximum / requestedWidth, maximum / requestedHeight);
-    const physicalWidth = Math.max(1, Math.round(requestedWidth * scale));
-    const physicalHeight = Math.max(1, Math.round(requestedHeight * scale));
+    if (measured && ![measured.width, measured.height].every((value) => Number.isSafeInteger(value) && value > 0 && value <= maximum))
+      throw new TypeError("Invalid measured post target extent");
+    const physicalWidth = measured?.width ?? Math.max(1, Math.round(requestedWidth * scale));
+    const physicalHeight = measured?.height ?? Math.max(1, Math.round(requestedHeight * scale));
     if (physicalWidth === this.physicalWidth && physicalHeight === this.physicalHeight) return;
 
     this.physicalWidth = physicalWidth;
@@ -768,6 +785,7 @@ export class AdvPostPipeline {
       throw new Error("finishCharacterGroup() requires an active character group");
     }
     try {
+      this.resolveCharacterTarget(this.activeCharacterTarget!);
       // Character mutates program/VAO/texture/blend state behind Three's cache.
       this.renderer.resetState();
       if (!this.characterGroupIsolated) return;
@@ -834,12 +852,13 @@ export class AdvPostPipeline {
         this.temporaryTarget,
         this.renderFullscreenCallback,
         this.activeCamera,
+        options.frameStamp,
       );
       if (this.curvedLensActive()) {
         this.configureCurvedLensUniforms();
         const destination = source === this.mainTarget ? this.temporaryTarget : this.mainTarget;
         this.curvedLensUniforms.tInput.value = source.texture;
-        this.renderFullscreen(this.curvedLensMaterial, destination, true);
+        this.renderFullscreen(this.curvedLensMaterial, destination, true, true);
         source = destination;
       }
       if (this.finalPostFxaaEnabled) {
@@ -884,6 +903,7 @@ export class AdvPostPipeline {
     this.curvedLensMaterial.dispose();
     this.urpPostProcessor.dispose();
     this.finalPostFxaa.dispose();
+    this.postSampling.dispose();
     this.fullscreenGeometry.dispose();
     this.fullscreenScene.remove(this.fullscreenQuad);
     this.disposed = true;
@@ -967,7 +987,7 @@ export class AdvPostPipeline {
     const gl = this.renderer.getContext() as GlContext;
     (gl as WebGL2RenderingContext).bindVertexArray(null);
     const properties = this.renderer.properties.get(target) as ThreeRenderTargetProperties;
-    const internalFramebuffer = properties.__webglFramebuffer;
+    const internalFramebuffer = properties.__webglMultisampledFramebuffer ?? properties.__webglFramebuffer;
     // These are ordinary 2D, single-mip targets. Reading Three's initialized
     // target property avoids a synchronous gl.getParameter driver round-trip;
     // retain the query only as a defensive fallback for an unexpected target.
@@ -1000,17 +1020,33 @@ export class AdvPostPipeline {
     return frame;
   }
 
+  private resolveCharacterTarget(target: WebGLRenderTarget): void {
+    if (target.samples === 0) return;
+    const properties = this.renderer.properties.get(target) as ThreeRenderTargetProperties;
+    const source = properties.__webglMultisampledFramebuffer;
+    const destination = properties.__webglFramebuffer;
+    if (!source || !destination || Array.isArray(destination)) return;
+    const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    gl.disable(gl.SCISSOR_TEST);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, source);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, destination as WebGLFramebuffer);
+    gl.blitFramebuffer(0, 0, target.width, target.height, 0, 0, target.width, target.height, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    this.renderer.resetState();
+    this.bindTarget(target);
+  }
+
   private renderSceneLayer(layer: AdvSceneLayer, target: WebGLRenderTarget): void {
     this.bindTarget(target);
     this.renderer.render(layer.scene, layer.camera);
   }
 
-  private renderFullscreen(material: ShaderMaterial, target: WebGLRenderTarget | null, clear: boolean): void {
+  private renderFullscreen(material: ShaderMaterial, target: WebGLRenderTarget | null, clear: boolean, linearClamp = false): void {
     this.fullscreenQuad.material = material;
     this.renderer.setRenderTarget(target);
     this.renderer.setScissorTest(false);
     if (clear) this.renderer.clear(true, false, false);
-    this.renderer.render(this.fullscreenScene, this.fullscreenCamera);
+    if (linearClamp) this.postSampling.render(material, () => this.renderer.render(this.fullscreenScene, this.fullscreenCamera));
+    else this.renderer.render(this.fullscreenScene, this.fullscreenCamera);
   }
 
   private bindTarget(target: WebGLRenderTarget): void {

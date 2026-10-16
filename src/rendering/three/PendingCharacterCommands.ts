@@ -1,3 +1,11 @@
+import type { ThreeParameterLoopTimelineEvent } from "../ThreeCharacterModel";
+
+export interface PendingCharacterLoop {
+  readonly name: string;
+  readonly fadeSeconds: number;
+  readonly atSeconds: number;
+}
+
 export interface PendingCharacterMotion {
   readonly name: string;
   readonly fadeInSeconds?: number;
@@ -82,6 +90,10 @@ export interface PendingCharacterPauseEvent {
 export interface PendingCharacterPresentation {
   readonly motion?: PendingCharacterMotion;
   readonly expression?: PendingCharacterExpression;
+  readonly parameterLoop?: PendingCharacterLoop;
+  readonly activeParameterLoop?: PendingCharacterLoop;
+  readonly parameterLoopQueuedWhilePaused?: boolean;
+  readonly parameterLoopEvents?: readonly ThreeParameterLoopTimelineEvent[];
   readonly activeMotion?: PendingCharacterMotion;
   readonly activeExpression?: PendingCharacterExpression;
   readonly lipSync?: PendingCharacterLipSync;
@@ -136,9 +148,12 @@ export class PendingCharacterCommands {
   private readonly loads = new Map<string, PendingCharacterLoad>();
   private readonly resourceChanges = new Map<string, PendingCharacterResourceChangeState>();
 
-  begin(target: string, token: number, currentExpressionName = ""): void {
+  begin(target: string, token: number, currentExpressionName = "", playbackRate = 1, atSeconds = 0): void {
     this.resourceChanges.get(target)?.controller.abort();
-    this.loads.set(target, { token, currentExpressionName });
+    this.loads.set(target, {
+      token, currentExpressionName,
+      parameterLoopEvents: [{ kind: "speed", rate: playbackRate, atSeconds }, { kind: "show", atSeconds }],
+    });
     this.resourceChanges.set(target, this.createResourceChangeState(token, 0));
   }
 
@@ -166,6 +181,9 @@ export class PendingCharacterCommands {
           ...pending,
           ...(pending.motion ? { motion: { ...pending.motion } } : {}),
           ...(pending.expression ? { expression: { ...pending.expression } } : {}),
+          ...(pending.parameterLoop ? { parameterLoop: { ...pending.parameterLoop } } : {}),
+          ...(pending.activeParameterLoop ? { activeParameterLoop: { ...pending.activeParameterLoop } } : {}),
+          ...(pending.parameterLoopEvents ? { parameterLoopEvents: pending.parameterLoopEvents.map((event) => ({ ...event })) } : {}),
           ...(pending.activeMotion ? { activeMotion: { ...pending.activeMotion } } : {}),
           ...(pending.activeExpression ? { activeExpression: { ...pending.activeExpression } } : {}),
           ...(pending.lipSync
@@ -204,6 +222,9 @@ export class PendingCharacterCommands {
         ...pending,
         ...(pending.motion ? { motion: { ...pending.motion } } : {}),
         ...(pending.expression ? { expression: { ...pending.expression } } : {}),
+        ...(pending.parameterLoop ? { parameterLoop: { ...pending.parameterLoop } } : {}),
+        ...(pending.activeParameterLoop ? { activeParameterLoop: { ...pending.activeParameterLoop } } : {}),
+        ...(pending.parameterLoopEvents ? { parameterLoopEvents: pending.parameterLoopEvents.map((event) => ({ ...event })) } : {}),
         ...(pending.activeMotion ? { activeMotion: { ...pending.activeMotion } } : {}),
         ...(pending.activeExpression ? { activeExpression: { ...pending.activeExpression } } : {}),
         ...(pending.lipSync
@@ -270,6 +291,30 @@ export class PendingCharacterCommands {
     });
     this.signalResourceChange(target, token);
     return true;
+  }
+
+  queueParameterLoop(target: string, token: number, parameterLoop: PendingCharacterLoop): boolean {
+    const pending = this.loads.get(target);
+    if (!pending || pending.token !== token) return false;
+    this.loads.set(target, {
+      ...pending,
+      parameterLoop,
+      parameterLoopEvents: [...(pending.parameterLoopEvents || []), { kind: "loop", ...parameterLoop }],
+      ...(pending.paused
+        ? { parameterLoopQueuedWhilePaused: true }
+        : { activeParameterLoop: parameterLoop, parameterLoopQueuedWhilePaused: false }),
+    });
+    this.signalResourceChange(target, token);
+    return true;
+  }
+
+  queueParameterLoopSpeed(rate: number, atSeconds: number): void {
+    for (const [target, pending] of this.loads) {
+      this.loads.set(target, {
+        ...pending,
+        parameterLoopEvents: [...(pending.parameterLoopEvents || []), { kind: "speed", rate, atSeconds }],
+      });
+    }
   }
 
   queueLipSync(target: string, token: number, lipSync: PendingCharacterLipSync): boolean {
@@ -407,6 +452,7 @@ export class PendingCharacterCommands {
       ...pending,
       paused,
       pauseEvents: [...(pending.pauseEvents || []), { paused, queuedAtSeconds }],
+      parameterLoopEvents: [...(pending.parameterLoopEvents || []), { kind: "pause", paused, atSeconds: queuedAtSeconds }],
       // Resume dispatches both single pending slots immediately. If another
       // Pause arrives before the browser model is ready, they are now active
       // requests that should be primed before that later Pause.
@@ -417,6 +463,10 @@ export class PendingCharacterCommands {
             ...(pending.expressionQueuedWhilePaused && pending.expression
               ? { activeExpression: pending.expression }
               : {}),
+            ...(pending.parameterLoopQueuedWhilePaused && pending.parameterLoop
+              ? { activeParameterLoop: pending.parameterLoop }
+              : {}),
+            parameterLoopQueuedWhilePaused: false,
             motionQueuedWhilePaused: false,
             expressionQueuedWhilePaused: false,
           }),
@@ -512,6 +562,10 @@ export class PendingCharacterCommands {
     const {
       motion,
       expression,
+      parameterLoop,
+      activeParameterLoop,
+      parameterLoopQueuedWhilePaused,
+      parameterLoopEvents,
       activeMotion,
       activeExpression,
       lipSync,
@@ -533,6 +587,10 @@ export class PendingCharacterCommands {
     return {
       ...(motion ? { motion } : {}),
       ...(expression ? { expression } : {}),
+      ...(parameterLoop ? { parameterLoop } : {}),
+      ...(activeParameterLoop ? { activeParameterLoop } : {}),
+      ...(parameterLoopQueuedWhilePaused ? { parameterLoopQueuedWhilePaused: true } : {}),
+      ...(parameterLoopEvents ? { parameterLoopEvents } : {}),
       ...(activeMotion ? { activeMotion } : {}),
       ...(activeExpression ? { activeExpression } : {}),
       ...(lipSync ? { lipSync } : {}),
@@ -562,6 +620,10 @@ export class PendingCharacterCommands {
     const {
       motion,
       expression,
+      parameterLoop,
+      activeParameterLoop,
+      parameterLoopQueuedWhilePaused,
+      parameterLoopEvents,
       activeMotion,
       activeExpression,
       lipSync,
@@ -583,6 +645,10 @@ export class PendingCharacterCommands {
     return {
       ...(motion ? { motion } : {}),
       ...(expression ? { expression } : {}),
+      ...(parameterLoop ? { parameterLoop } : {}),
+      ...(activeParameterLoop ? { activeParameterLoop } : {}),
+      ...(parameterLoopQueuedWhilePaused ? { parameterLoopQueuedWhilePaused: true } : {}),
+      ...(parameterLoopEvents ? { parameterLoopEvents } : {}),
       ...(activeMotion ? { activeMotion } : {}),
       ...(activeExpression ? { activeExpression } : {}),
       ...(lipSync ? { lipSync } : {}),

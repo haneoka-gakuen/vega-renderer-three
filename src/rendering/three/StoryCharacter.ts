@@ -3,6 +3,7 @@ import { Object3D } from "three";
 import type {
   ThreeCharacterParameterBlend,
   ThreeCharacterParameterFrame,
+  ThreeParameterLoopTimeline,
   ThreeStoryCharacterModel,
 } from "../ThreeCharacterModel";
 import type { LipSyncState, RimLightState, StoryCharacterEntry, StoryCharacterItem } from "./StorySceneTypes";
@@ -38,8 +39,9 @@ export class StoryCharacter implements StoryCharacterItem {
   /** Motion currently owned by the model, distinct from the pause queue. */
   currentMotionName = "";
   currentMotionFadeInSeconds: number | undefined;
-  /** Opcode 68 loop clip currently looping (empty when stopped). */
+  /** Latest loop key; provider state and timeline distinguish active/pending. */
   parameterLoopName = "";
+  parameterLoopTimeline?: ThreeParameterLoopTimeline;
   /** Opcode 69 stop state of the auto eye blink. */
   eyeBlinkStopped = false;
   /** Provider model's logical expression channel head. */
@@ -51,8 +53,6 @@ export class StoryCharacter implements StoryCharacterItem {
   /** Full-story animation resources proven ready for this controller. */
   readonly warmedMotionNames = new Set<string>();
   readonly warmedExpressionNames = new Set<string>();
-  /** Mirrors AdvCharacterFieldRendererEntry.BlurIntensity. */
-  blurIntensity = 0;
   /** Unity world-position z captured by RegisterCharacterEntry. */
   sortingOrder = 0;
   rimLight: RimLightState = structuredClone(DEFAULT_RIM_LIGHT);
@@ -105,10 +105,19 @@ export class StoryCharacter implements StoryCharacterItem {
     readonly entry: StoryCharacterEntry,
     public model: ThreeStoryCharacterModel,
     public positionType: number,
+    private readonly blurIntensities: Map<number, number>,
   ) {
     this.node.name = `ADV Character ${target}`;
     this.surface.name = `Character surface ${target}`;
     this.node.add(this.surface);
+  }
+
+  get blurIntensity(): number {
+    return this.blurIntensities.get(this.positionType) ?? 0;
+  }
+
+  set blurIntensity(value: number) {
+    if (this.blurIntensities.has(this.positionType)) this.blurIntensities.set(this.positionType, value);
   }
 
   get paused(): boolean {

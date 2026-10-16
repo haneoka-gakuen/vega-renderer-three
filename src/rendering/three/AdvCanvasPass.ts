@@ -1,40 +1,66 @@
+import { ScopedRenderTargetSampling } from "../post/ScopedRenderTargetSampling";
+import type { StoryDrawingBufferExtent } from "./StoryPhysicalViewport";
 import {
   AddEquation,
   Color,
   CustomBlending,
   DoubleSide,
   Group,
+  HalfFloatType,
+  LinearFilter,
   Matrix3,
+  Matrix4,
+  PerspectiveCamera,
   Mesh,
   NormalBlending,
   NoColorSpace,
   OneFactor,
+  OneMinusSrcAlphaFactor,
   OrthographicCamera,
   SrcAlphaFactor,
+  UnsignedByteType,
   PlaneGeometry,
   RawShaderMaterial,
   Scene,
   Texture,
   Vector2,
+  Vector3,
   Vector4,
   VideoTexture,
+  WebGLRenderTarget,
+  type ShaderMaterial,
   type WebGLRenderer,
 } from "three";
 import {
   computeAdvFrameBandLayout,
   resolveStoryFrameLayout,
+  resolveStoryCanvasScale,
   StoryStillAnimator,
   type AdvStillEntry,
   type StoryStillPresentation,
   type StoryStillAnimationSnapshot,
   type AdvFrameEntry,
   type StoryFrameLayout,
+  type StoryCanvasCamera,
   type StoryFrameLayoutProvider,
   type StoryFrameNode,
 } from "@haneoka/vega/renderer-kit";
 import { AdvRainFrameRenderer, type AdvRainFrameSnapshot } from "./AdvRainFrameRenderer";
 import { AdvFrameParticles } from "./AdvFrameParticles";
 import { NativeFrameAnimator } from "./NativeFrameAnimation";
+import { AdvUrpPostProcessor, type AdvColorGradingPipelineMode } from "../post/AdvUrpPostProcessor";
+import type { AdvPostTextureResolver } from "../post/AdvUrpUberPost";
+import type { AdvVolumeLayer } from "../post/AdvVolumeStack";
+
+const NO_CANVAS_VOLUMES: readonly AdvVolumeLayer[] = Object.freeze([]);
+
+export interface AdvCanvasPassOptions {
+  readonly resolvePostTexture?: AdvPostTextureResolver;
+  readonly colorGradingMode?: AdvColorGradingPipelineMode;
+  readonly filmGrainMultiplier?: number;
+  readonly resolveGrainPixelScale?: (width: number) => number;
+  readonly postCamera?: StoryCanvasCamera;
+}
 
 export interface CanvasTextureLease {
   readonly value: Texture;
@@ -47,18 +73,68 @@ export interface CanvasLayerTransaction {
 }
 const vertex = `precision highp float;
 attribute vec3 position; attribute vec2 uv;
-uniform vec2 uViewport; uniform vec4 uRect; uniform vec4 uCrop; uniform vec2 uOffset;
+uniform vec2 uViewport; uniform vec2 uNativePixelPerCss; uniform vec4 uRect; uniform vec4 uCrop; uniform vec2 uOffset;
 uniform mat3 uTransform;
-varying vec2 vUv;
+uniform int uNativeEnabled; uniform mat4 uNativeTransform; uniform mat4 uNativeProjection; uniform vec3 uNativeParams;
+varying vec2 vUv; varying vec2 vQuadUv;
 void main(){ vec2 p=(uTransform*vec3(uRect.xy+vec2(position.x+0.5,0.5-position.y)*uRect.zw,1.0)).xy+uOffset;
-gl_Position=vec4(2.0*p.x/uViewport.x-1.0,1.0-2.0*p.y/uViewport.y,0.0,1.0);
-vUv=uCrop.xy+uv*uCrop.zw; }`;
+if(uNativeEnabled!=0){
+ vec2 local=uRect.xy+vec2(position.x+0.5,0.5-position.y)*uRect.zw;
+ vec3 nativePoint=(uNativeTransform*vec4(local,0.0,1.0)).xyz;
+ vec3 world=vec3(nativePoint.xy*uNativeParams.x+vec2(uOffset.x,-uOffset.y)*uNativePixelPerCss*uNativeParams.y,-uNativeParams.z-nativePoint.z*uNativeParams.x);
+ gl_Position=uNativeProjection*vec4(world,1.0);
+}else{gl_Position=vec4(2.0*p.x/uViewport.x-1.0,1.0-2.0*p.y/uViewport.y,0.0,1.0);}
+vQuadUv=uv; vUv=uCrop.xy+uv*uCrop.zw; }`;
 const fragment = `precision highp float;
-uniform sampler2D uTexture; uniform vec4 uColor; uniform int uTextured; varying vec2 vUv;
-void main(){gl_FragColor=uColor;if(uTextured!=0)gl_FragColor*=texture2D(uTexture,vUv);}`;
+uniform sampler2D uTexture; uniform vec4 uColor; uniform int uTextured; uniform vec2 uTileRepeat;
+uniform int uSliceEnabled; uniform int uFillCenter; uniform vec4 uSliceBorder; uniform vec4 uSliceUvBorder; uniform vec4 uCrop;
+varying vec2 vUv; varying vec2 vQuadUv;
+float sliceAxis(float value,float start,float end,float sourceStart,float sourceEnd){
+ if(start>0.0&&value<start)return value/start*sourceStart;
+ if(end>0.0&&value>1.0-end)return 1.0-sourceEnd+(value-(1.0-end))/end*sourceEnd;
+ float center=1.0-start-end;
+ if(center<=0.0)return sourceStart;
+ return sourceStart+(value-start)/center*(1.0-sourceStart-sourceEnd);
+}
+void main(){gl_FragColor=uColor;if(uTextured!=0){vec2 sampleUv=vUv;
+ if(uSliceEnabled!=0){
+  if(uFillCenter==0&&vQuadUv.x>=uSliceBorder.x&&vQuadUv.x<=1.0-uSliceBorder.z&&vQuadUv.y>=uSliceBorder.y&&vQuadUv.y<=1.0-uSliceBorder.w)discard;
+  sampleUv=uCrop.xy+vec2(sliceAxis(vQuadUv.x,uSliceBorder.x,uSliceBorder.z,uSliceUvBorder.x,uSliceUvBorder.z),sliceAxis(vQuadUv.y,uSliceBorder.y,uSliceBorder.w,uSliceUvBorder.y,uSliceUvBorder.w))*uCrop.zw;
+ }else if(uTileRepeat.x>0.0&&uTileRepeat.y>0.0)sampleUv=fract(vUv*uTileRepeat);
+ gl_FragColor*=texture2D(uTexture,sampleUv);}}`;
 const finite = (value: unknown, fallback = 0): number =>
   typeof value === "number" && Number.isFinite(value) ? value : fallback;
 const alpha = (value: unknown): number => Math.max(0, Math.min(1, finite(value)));
+const roundEven = (value: number): number => {
+  const lower = Math.floor(value), fraction = value - lower;
+  return fraction === 0.5 ? lower + (lower % 2) : Math.round(value);
+};
+const simpleSpriteRect = (node: StoryFrameNode, width: number, height: number, target: Vector4): boolean => {
+  const image = node.image, sprite = image?.sprite;
+  if (!image || !sprite) return false;
+  if (image.type !== 0 || image.useSpriteMesh !== false || sprite.packed !== false || sprite.packingRotation !== 0 ||
+      image.tileSize || image.sliceBorder)
+    throw new TypeError(`Unsupported Simple Sprite geometry: ${node.id}`);
+  const fullWidth = sprite.rect[2], fullHeight = sprite.rect[3];
+  const sourceWidth = roundEven(fullWidth), sourceHeight = roundEven(fullHeight);
+  const [left, bottom, right, top] = sprite.padding;
+  if (![fullWidth, fullHeight, left, bottom, right, top].every(Number.isFinite) ||
+      !(fullWidth > 0 && fullHeight > 0 && sourceWidth > 0 && sourceHeight > 0))
+    throw new TypeError(`Invalid Simple Sprite dimensions: ${node.id}`);
+  if (image.preserveAspect) {
+    const ratio = fullWidth / fullHeight;
+    if (width / height > ratio) width = height * ratio;
+    else height = width / ratio;
+  }
+  // Convert original bottom-up Sprite padding once into the existing top-down drawing rect.
+  target.set(
+    -node.pivot[0] * width + width * left / sourceWidth,
+    -(1 - node.pivot[1]) * height + height * top / sourceHeight,
+    width * (sourceWidth - left - right) / sourceWidth,
+    height * (sourceHeight - bottom - top) / sourceHeight,
+  );
+  return true;
+};
 interface ImageView {
   readonly mesh: Mesh<PlaneGeometry, RawShaderMaterial>;
   readonly rect: Vector4;
@@ -66,6 +142,9 @@ interface ImageView {
   readonly offset: Vector2;
   readonly color: Vector4;
   readonly transform: Matrix3;
+  readonly nativeTransform: Matrix4;
+  readonly nativeProjection: Matrix4;
+  readonly nativeParams: Vector3;
   node?: StoryFrameNode;
   opacityFactor: number;
   lease?: CanvasTextureLease;
@@ -115,6 +194,42 @@ export interface CanvasStillSnapshot {
 
 export class AdvCanvasPass {
   private readonly scene = new Scene();
+  private readonly cameraScene = new Scene();
+  private readonly screenScene = new Scene();
+  private readonly post: AdvUrpPostProcessor;
+  private readonly screenGeometry = new PlaneGeometry(2, 2);
+  private readonly screenMaterial = new RawShaderMaterial({
+    vertexShader:
+      "precision highp float; attribute vec3 position; attribute vec2 uv; varying vec2 vUv; void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}",
+    fragmentShader:
+      "precision highp float; uniform sampler2D tInput; varying vec2 vUv; void main(){gl_FragColor=texture2D(tInput,vUv);}",
+    uniforms: { tInput: { value: null } },
+    depthTest: false,
+    depthWrite: false,
+    transparent: true,
+    blending: CustomBlending,
+    blendEquation: AddEquation,
+    blendSrc: OneFactor,
+    blendDst: OneMinusSrcAlphaFactor,
+    blendEquationAlpha: AddEquation,
+    blendSrcAlpha: OneFactor,
+    blendDstAlpha: OneMinusSrcAlphaFactor,
+    toneMapped: false,
+  });
+  private readonly screenQuad = new Mesh<PlaneGeometry, ShaderMaterial | RawShaderMaterial>(
+    this.screenGeometry,
+    this.screenMaterial,
+  );
+  private cameraTarget: WebGLRenderTarget | undefined;
+  private postTarget: WebGLRenderTarget | undefined;
+  private volumeLayers: readonly AdvVolumeLayer[] = NO_CANVAS_VOLUMES;
+  private postVolumeDirty = true;
+  private postStillSet = false;
+  private readonly drawingSize = new Vector2();
+  private readonly savedClearColor = new Color();
+  private readonly nativeCamera = new PerspectiveCamera();
+  private actualViewport = false;
+  private readonly postCamera: PerspectiveCamera | undefined;
   private readonly camera = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
   private readonly geometry = new PlaneGeometry(1, 1);
   private readonly viewport = new Vector2(1, 1);
@@ -138,11 +253,15 @@ export class AdvCanvasPass {
   private videoLayout: import("@haneoka/vega/renderer-kit").StoryVideoLayout | undefined;
   private paused = false;
   private disposed = false;
+  private physicalViewport: StoryDrawingBufferExtent | undefined;
+  private readonly nativePixelPerCss = new Vector2(1, 1);
   private offsetX = 0;
   private offsetY = 0;
   private stillOffsetX = 0;
   private stillOffsetY = 0;
   private stillSpeed = 1;
+  private frameSpeed = 1;
+  private readonly preparingFrames = new Map<string, { frame: AdvFrameEntry; ready: Promise<unknown> }>();
   get ready(): boolean {
     return this.pending.size === 0;
   }
@@ -151,7 +270,21 @@ export class AdvCanvasPass {
     private readonly renderer: WebGLRenderer,
     private readonly loadTexture: CanvasTextureLoader,
     private readonly layouts?: StoryFrameLayoutProvider,
+    options: AdvCanvasPassOptions = {},
   ) {
+    if (options.postCamera) {
+      resolveStoryCanvasScale(options.postCamera, 1, 1);
+      this.postCamera = new PerspectiveCamera(options.postCamera.fieldOfView, 1, options.postCamera.nearClip, options.postCamera.farClip);
+      this.postCamera.updateMatrixWorld();
+    }
+    this.post = new AdvUrpPostProcessor({ resolveTexture: options.resolvePostTexture,
+      filmGrainMultiplier: options.filmGrainMultiplier, resolveGrainPixelScale: options.resolveGrainPixelScale });
+    this.postSampling = new ScopedRenderTargetSampling(this.renderer);
+    this.post.setColorGradingMode(options.colorGradingMode ?? "ldr");
+    this.screenQuad.frustumCulled = false;
+    this.screenScene.add(this.screenQuad);
+    this.cameraScene.matrixAutoUpdate = false;
+    this.cameraScene.matrixWorldAutoUpdate = false;
     this.scene.matrixAutoUpdate = false;
     this.scene.matrixWorldAutoUpdate = false;
     this.videoBackground = this.image(27);
@@ -166,24 +299,37 @@ export class AdvCanvasPass {
     this.setColor(this.flash, "#ffffff");
     this.setColor(this.cover, "#000000");
   }
-  private image(order: number, parent: Scene | Group = this.scene): ImageView {
+  private image(order: number, parent: Scene | Group = order <= 32 ? this.cameraScene : this.scene): ImageView {
     const rect = new Vector4(0, 0, this.viewport.x, this.viewport.y),
       crop = new Vector4(0, 0, 1, 1);
     const offset = new Vector2(this.offsetX, this.offsetY),
       color = new Vector4(1, 1, 1, 0);
     const transform = new Matrix3();
+    const nativeTransform = new Matrix4(),
+      nativeProjection = new Matrix4(),
+      nativeParams = new Vector3();
     const material = new RawShaderMaterial({
       vertexShader: vertex,
       fragmentShader: fragment,
       uniforms: {
         uViewport: { value: this.viewport },
+        uNativePixelPerCss: { value: this.nativePixelPerCss },
         uRect: { value: rect },
         uCrop: { value: crop },
         uOffset: { value: offset },
         uColor: { value: color },
         uTexture: { value: null },
         uTextured: { value: 0 },
+        uTileRepeat: { value: new Vector2(0, 0) },
+        uSliceEnabled: { value: 0 },
+        uFillCenter: { value: 1 },
+        uSliceBorder: { value: new Vector4() },
+        uSliceUvBorder: { value: new Vector4() },
         uTransform: { value: transform },
+        uNativeEnabled: { value: 0 },
+        uNativeTransform: { value: nativeTransform },
+        uNativeProjection: { value: nativeProjection },
+        uNativeParams: { value: nativeParams },
       },
       transparent: true,
       depthTest: false,
@@ -205,6 +351,9 @@ export class AdvCanvasPass {
       offset,
       color,
       transform,
+      nativeTransform,
+      nativeProjection,
+      nativeParams,
       opacityFactor: 1,
       source: "",
       leaseSource: "",
@@ -265,8 +414,7 @@ export class AdvCanvasPass {
     view.crop.set(0, 0, 1, 1);
     if (view.fit === "stretch") return;
     const source = texture.image as
-      | { width?: number; height?: number; videoWidth?: number; videoHeight?: number }
-      | undefined;
+      { width?: number; height?: number; videoWidth?: number; videoHeight?: number } | undefined;
     const width = source?.videoWidth || source?.width || 1,
       height = source?.videoHeight || source?.height || 1;
     const visible = view.rect.z / Math.max(1, view.rect.w) / (width / height);
@@ -362,7 +510,37 @@ export class AdvCanvasPass {
     this.opacity(this.videoBackground, this.videoLayout?.background && this.videoTexture ? value : 0);
   }
   async setFrame(key: string, frame: AdvFrameEntry, value: number, signal?: AbortSignal): Promise<void> {
-    await this.createLayer(this.frames, key, frame, value, signal);
+    const preparation = this.preparingFrames.get(key);
+    if (preparation?.frame === frame) {
+      await preparation.ready;
+      return;
+    }
+    const current = this.frames.get(key);
+    if (current && current.frame === frame && !current.disposed) {
+      // UIAdvWidget.SetFrame brings the retained instance to the front. It
+      // does not restart its Animator or particle simulation before the delay.
+      current.group.removeFromParent();
+      this.scene.add(current.group);
+      this.frames.delete(key);
+      this.frames.set(key, current);
+      this.orderFrames();
+      return;
+    }
+    const pending = { frame, ready: this.createLayer(this.frames, key, frame, value, signal) };
+    this.preparingFrames.set(key, pending);
+    try { await pending.ready; }
+    finally { if (this.preparingFrames.get(key) === pending) this.preparingFrames.delete(key); }
+  }
+  playFrameAnimation(key: string, frame: AdvFrameEntry): void {
+    const current = this.frames.get(key);
+    if (!current || current.disposed) return;
+    const layout = current.frame.layout as StoryFrameLayout | undefined;
+    current.elapsed = 0;
+    if (layout && frame.animation) current.frameAnimator = new NativeFrameAnimator(layout, frame.animation);
+    else delete current.frameAnimator;
+    if (layout) current.layout = current.frameAnimator?.sample(0) ?? layout;
+    current.particles?.selectAnimation(frame.animation?.name, frame.animation?.speed, frame.animation?.loop);
+    this.layoutFrame(current);
   }
   beginLayerTransaction(): CanvasLayerTransaction {
     const transaction = { id: ++this.nextLayerTransactionId };
@@ -464,7 +642,7 @@ export class AdvCanvasPass {
     const pending = pendingByKey.get(key) ?? new Set<FrameView>();
     pendingByKey.set(key, pending);
     pending.add(entry);
-    this.scene.add(entry.group);
+    (collection === this.stills ? this.cameraScene : this.scene).add(entry.group);
     entry.group.visible = false;
     this.orderFrames();
     const kind = String(frame.type || frame.name || frame.source || "").toLowerCase();
@@ -480,7 +658,7 @@ export class AdvCanvasPass {
           entry.frameAnimator = new NativeFrameAnimator(layout, frame.animation);
         const loads: Promise<boolean>[] = [];
         for (const node of layout.nodes) {
-          if (!node.image) continue;
+          if (!node.image || node.image.enabled === false) continue;
           const image = this.image(0, entry.group);
           image.node = node;
           image.fit = "stretch";
@@ -587,24 +765,61 @@ export class AdvCanvasPass {
     const { x: width, y: height } = this.viewport,
       kind = String(entry.frame.type || "").toLowerCase();
     entry.rain?.setViewport(width, height);
-    entry.particles?.layout(entry.layout, width, height);
+    const nativeExtent = entry.layout?.camera ? this.physicalViewport : undefined;
+    const layoutWidth = nativeExtent?.width ?? width, layoutHeight = nativeExtent?.height ?? height;
+    entry.particles?.layout(entry.layout, layoutWidth, layoutHeight);
     if (entry.layout) {
       const placements = new Map(
-        resolveStoryFrameLayout(entry.layout, width, height).map((placement) => [placement.node.id, placement]),
+        resolveStoryFrameLayout(entry.layout, layoutWidth, layoutHeight).map((placement) => [placement.node.id, placement]),
       );
       for (const image of entry.images) {
         const placement = placements.get(image.node!.id)!;
         let w = placement.width,
           h = placement.height;
+        const tile = placement.node.image?.tileSize;
+        const tileRepeat = image.mesh.material.uniforms.uTileRepeat!.value as Vector2;
+        if (tile && tile[0] > 0 && tile[1] > 0) tileRepeat.set(w / tile[0], h / tile[1]);
+        else tileRepeat.set(0, 0);
+        const slice = placement.node.image?.sliceBorder;
+        const sliceUv = placement.node.image?.sliceUvBorder;
+        const uniforms = image.mesh.material.uniforms;
+        uniforms.uSliceEnabled!.value = slice && sliceUv && w > 0 && h > 0 ? 1 : 0;
+        uniforms.uFillCenter!.value = placement.node.image?.fillCenter === false ? 0 : 1;
+        if (slice && sliceUv && w > 0 && h > 0) {
+          const border = uniforms.uSliceBorder!.value as Vector4;
+          const sourceBorder = uniforms.uSliceUvBorder!.value as Vector4;
+          const horizontal = Math.max(w, slice[0] + slice[2]);
+          const vertical = Math.max(h, slice[1] + slice[3]);
+          border.set(slice[0] / horizontal, slice[1] / vertical, slice[2] / horizontal, slice[3] / vertical);
+          sourceBorder.set(...sliceUv);
+        }
         const source = image.lease?.value.image as { width?: number; height?: number } | undefined;
-        if (image.node?.image?.preserveAspect && source?.width && source.height) {
+        const visibleSprite = entry.group.visible && placement.node.image?.enabled !== false &&
+          entry.opacity * placement.opacity * (placement.node.image?.color[3] ?? 1) > 0;
+        const hasSpriteRect = visibleSprite && simpleSpriteRect(placement.node, w, h, image.rect);
+        if (!hasSpriteRect && !tile && image.node?.image?.preserveAspect && source?.width && source.height) {
           const ratio = source.width / source.height;
           if (w / h > ratio) w = h * ratio;
           else h = w / ratio;
         }
+        const nativeCamera = entry.layout.camera;
+        image.mesh.material.uniforms.uNativeEnabled!.value = nativeCamera && placement.transform3D ? 1 : 0;
+        if (nativeCamera && placement.transform3D) {
+          this.nativeCamera.fov = nativeCamera.fieldOfView;
+          this.nativeCamera.aspect = layoutWidth / layoutHeight;
+          this.nativeCamera.near = nativeCamera.nearClip;
+          this.nativeCamera.far = nativeCamera.farClip;
+          this.nativeCamera.updateProjectionMatrix();
+          image.nativeProjection.copy(this.nativeCamera.projectionMatrix);
+          image.nativeTransform.fromArray(placement.transform3D);
+          const scaler = resolveStoryCanvasScale(nativeCamera, layoutWidth, layoutHeight);
+          const worldPerPixel =
+            (2 * nativeCamera.planeDistance * Math.tan((nativeCamera.fieldOfView * Math.PI) / 360)) / layoutHeight;
+          image.nativeParams.set(worldPerPixel * scaler, worldPerPixel, nativeCamera.planeDistance);
+        }
         const [a, b, c, d, x, y] = placement.transform;
         image.transform.set(a, c, x, b, d, y, 0, 0, 1);
-        image.rect.set(-placement.node.pivot[0] * w, -(1 - placement.node.pivot[1]) * h, w, h);
+        if (!hasSpriteRect) image.rect.set(-placement.node.pivot[0] * w, -(1 - placement.node.pivot[1]) * h, w, h);
         const tint = placement.node.image?.color;
         if (tint) image.color.set(tint[0], tint[1], tint[2], image.color.w);
         image.opacityFactor = placement.opacity * (tint?.[3] ?? 1);
@@ -737,8 +952,18 @@ export class AdvCanvasPass {
   restoreFrameParticles(snapshots: Readonly<Record<string, AdvRainFrameSnapshot>>): void {
     for (const [key, snapshot] of Object.entries(snapshots)) this.frames.get(key)?.rain?.restore(snapshot);
   }
-  setViewport(width: number, height: number): void {
+  setViewport(width: number, height: number, physical?: StoryDrawingBufferExtent): void {
+    this.actualViewport = [width,height].every((value)=>Number.isFinite(value)&&value>0);
     this.viewport.set(Math.max(1, width), Math.max(1, height));
+    if (physical && ![physical.width, physical.height].every((value) => Number.isSafeInteger(value) && value > 0))
+      throw new TypeError("Invalid measured canvas extent");
+    this.physicalViewport = physical;
+    this.nativePixelPerCss.set(physical ? physical.width / this.viewport.x : 1, physical ? physical.height / this.viewport.y : 1);
+    const aspect = physical ? physical.width / physical.height : this.viewport.x / this.viewport.y;
+    if (this.postCamera && this.postCamera.aspect !== aspect) {
+      this.postCamera.aspect = aspect;
+      this.postCamera.updateProjectionMatrix();
+    }
     for (const view of this.views) {
       view.rect.set(0, 0, width, height);
       if (view.lease) this.crop(view, view.lease.value);
@@ -788,11 +1013,20 @@ export class AdvCanvasPass {
     if (entry.disposed || entry.operation !== operation) return;
     entry.group.visible = true;
     entry.opacity = alpha(opacity);
+    this.requestStillAttachment(key);
     entry.animator?.play(animationIndex);
     if (entry.animator) entry.layout = entry.animator.layout;
     for (const image of entry.images) this.opacity(image, entry.opacity);
     this.layoutFrame(entry);
     this.setStillOffset(this.stillOffsetX, this.stillOffsetY);
+  }
+  /** Existing verified instance at the actual SetStill command boundary. */
+  requestStillAttachment(key: string): void {
+    const entry = this.stills.get(key);
+    if (!entry || entry.disposed || !entry.animator?.presentation.layout.stillExternalLayout) return;
+    entry.animator.requestAttachment();
+    this.stills.delete(key);this.stills.set(key,entry);
+    this.orderFrames();
   }
   isStillVisible(key: string): boolean {
     return this.stills.get(key)?.group.visible ?? false;
@@ -840,6 +1074,9 @@ export class AdvCanvasPass {
   setStillSpeed(value: number): void {
     this.stillSpeed = Math.max(0, finite(value, 1));
   }
+  setFrameSpeed(value: number): void {
+    this.frameSpeed = Math.max(0, finite(value, 1));
+  }
   snapshotStills(): readonly CanvasStillSnapshot[] {
     return [...this.stills]
       .filter(([, entry]) => entry.still)
@@ -879,8 +1116,10 @@ export class AdvCanvasPass {
     if (!this.paused && deltaSeconds > 0)
       for (const [key, frame] of this.frames) {
         if (frame.opacity <= 0) continue;
-        frame.elapsed += deltaSeconds;
-        frame.particles?.update(deltaSeconds);
+        frame.elapsed += deltaSeconds * this.frameSpeed;
+        // AdvFrame.SpeedRate changes Animator.speed; native ParticleSystems
+        // keep their simulation clock and sample rate-driven module curves.
+        frame.particles?.update(deltaSeconds, this.frameSpeed);
         if (frame.frameAnimator) {
           frame.layout = frame.frameAnimator.sample(frame.elapsed);
           this.layoutFrame(frame);
@@ -899,34 +1138,128 @@ export class AdvCanvasPass {
           }
         }
   }
-  render(): void {
+  setVolumeLayers(layers: readonly AdvVolumeLayer[]): void {
+    this.volumeLayers = layers;
+    this.postVolumeDirty = true;
+  }
+
+  resetTemporalHistory(): void {
+    this.post.resetTemporalHistory();
+  }
+
+  private hasCameraContent(): boolean {
+    if (
+      this.video.mesh.visible ||
+      this.videoBackground.mesh.visible ||
+      this.still.mesh.visible ||
+      this.stillBackground.mesh.visible ||
+      this.stillShade.mesh.visible
+    )
+      return true;
+    for (const entry of this.stills.values()) if (entry.group.visible && entry.opacity > 0) return true;
+    return false;
+  }
+
+  private hasFrontContent(): boolean {
+    for (const view of this.views) if (view.mesh.visible && view.mesh.parent === this.scene) return true;
+    for (const entry of this.frames.values()) if (entry.group.visible && entry.opacity > 0) return true;
+    return false;
+  }
+
+  private hasStillSet(): boolean {
+    if (this.still.lease !== undefined) return true;
+    for (const entry of this.stills.values()) if (entry.group.visible) return true;
+    return false;
+  }
+
+  private ensureCameraTargets(): void {
+    this.renderer.getDrawingBufferSize(this.drawingSize);
+    const width = Math.max(1, Math.round(this.drawingSize.x));
+    const height = Math.max(1, Math.round(this.drawingSize.y));
+    if (!this.cameraTarget || !this.postTarget) {
+      const create = (name: string): WebGLRenderTarget => {
+        const target = new WebGLRenderTarget(width, height, {
+          // Preserve the existing renderer's portable path on devices that
+          // cannot render float colour attachments; capable devices use HDR.
+          type: this.renderer.getContext().getExtension("EXT_color_buffer_float") ? HalfFloatType : UnsignedByteType,
+          minFilter: LinearFilter,
+          magFilter: LinearFilter,
+          depthBuffer: false,
+          stencilBuffer: false,
+        });
+        target.texture.name = name;
+        target.texture.colorSpace = NoColorSpace;
+        target.texture.generateMipmaps = false;
+        return target;
+      };
+      this.cameraTarget = create("adv-video-still-camera");
+      this.postTarget = create("adv-video-still-post");
+    } else if (this.cameraTarget.width !== width || this.cameraTarget.height !== height) {
+      const aspectChanged = Math.fround(this.cameraTarget.width / this.cameraTarget.height) !== Math.fround(width / height);
+      this.cameraTarget.setSize(width, height);
+      this.postTarget.setSize(width, height);
+      if (!this.physicalViewport || aspectChanged) this.resetTemporalHistory();
+    }
+  }
+
+  private readonly postSampling: ScopedRenderTargetSampling;
+  private readonly renderFullscreen = (
+    material: ShaderMaterial,
+    target: WebGLRenderTarget | null,
+    clear: boolean,
+  ): void => {
+    this.screenQuad.material = material;
+    this.renderer.setRenderTarget(target);
+    if (clear) this.renderer.clear(true, false, false);
+    this.postSampling.render(material, () => this.renderer.render(this.screenScene, this.camera));
+  };
+
+  render(frameStamp?: number): void {
     if (this.disposed) return;
-    let visible = false;
-    for (const view of this.views)
-      if (view.mesh.visible) {
-        visible = true;
-        break;
+    // The real canvas-layout phase follows update. Hidden instances also consume pending XY.
+    if (this.actualViewport) for (const entry of this.stills.values()) {
+      if (!entry.disposed && entry.animator?.presentation.layout.stillExternalLayout) {
+        entry.animator.consumeAttachment(this.physicalViewport?.width ?? this.viewport.x,this.physicalViewport?.height ?? this.viewport.y);
+        entry.layout=entry.animator.layout;
+        if(entry.group.visible) this.layoutFrame(entry);
       }
-    if (!visible)
-      for (const frame of this.frames.values())
-        if (frame.rain?.mesh.visible && frame.rain.mesh.geometry.instanceCount) {
-          visible = true;
-          break;
-        }
-    if (!visible)
-      for (const frame of this.frames.values())
-        if (frame.particles?.hasVisibleContent()) {
-          visible = true;
-          break;
-        }
-    if (!visible) return;
-    const target = this.renderer.getRenderTarget(),
-      autoClear = this.renderer.autoClear;
+    }
+    const cameraVisible = this.hasCameraContent();
+    const frontVisible = this.hasFrontContent();
+    if (!cameraVisible && !frontVisible) return;
+    const target = this.renderer.getRenderTarget();
+    const autoClear = this.renderer.autoClear;
+    const clearAlpha = this.renderer.getClearAlpha();
+    this.renderer.getClearColor(this.savedClearColor);
     try {
       this.renderer.autoClear = false;
-      this.renderer.setRenderTarget(null);
-      this.renderer.render(this.scene, this.camera);
+      if (cameraVisible) {
+        this.ensureCameraTargets();
+        // VideoCanvas and StillCanvas share their own camera colour/post pair.
+        // UIAdvWidget suppresses that camera's volume mask while a still is set.
+        const stillSet = this.hasStillSet();
+        if (this.postVolumeDirty || this.postStillSet !== stillSet) {
+          this.post.setVolumeLayers(stillSet ? NO_CANVAS_VOLUMES : this.volumeLayers);
+          this.postVolumeDirty = false;
+          this.postStillSet = stillSet;
+        }
+        this.renderer.setClearColor(0x000000, 0);
+        this.renderer.setRenderTarget(this.cameraTarget!);
+        this.renderer.clear(true, false, false);
+        this.renderer.render(this.cameraScene, this.camera);
+        const output = this.post.render(this.cameraTarget!, this.postTarget!, this.renderFullscreen, this.postCamera ?? this.camera, frameStamp);
+        this.screenQuad.material = this.screenMaterial;
+        this.screenMaterial.uniforms.tInput!.value = output.texture;
+        this.renderer.setRenderTarget(target);
+        this.renderer.render(this.screenScene, this.camera);
+      }
+      // FrameCanvas/front flash are composited after the screen image. They
+      // never inherit the video/still camera's post-processing volume stack.
+      this.renderer.setRenderTarget(target);
+      if (frontVisible) this.renderer.render(this.scene, this.camera);
     } finally {
+      this.screenQuad.material = this.screenMaterial;
+      this.renderer.setClearColor(this.savedClearColor, clearAlpha);
       this.renderer.autoClear = autoClear;
       this.renderer.setRenderTarget(target);
     }
@@ -939,6 +1272,12 @@ export class AdvCanvasPass {
     this.clearStills();
     for (const view of this.views) this.removeImage(view);
     this.videoTexture?.dispose();
+    this.cameraTarget?.dispose();
+    this.postTarget?.dispose();
+    this.post.dispose();
+    this.postSampling.dispose();
+    this.screenMaterial.dispose();
+    this.screenGeometry.dispose();
     this.geometry.dispose();
   }
 }

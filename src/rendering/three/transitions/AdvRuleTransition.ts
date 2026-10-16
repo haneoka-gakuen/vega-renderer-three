@@ -125,6 +125,14 @@ interface ActiveTransition {
   completeOnNextUpdate: boolean;
 }
 
+export interface AdvRuleTransitionSnapshot {
+  readonly color: Readonly<{ r: number; g: number; b: number; a: number }>;
+  readonly value: number;
+  readonly useGradient: boolean;
+  readonly fadeOut: boolean;
+  readonly active: Omit<ActiveTransition, "resolve"> | null;
+}
+
 function finite(value: number, fallback = 0): number {
   return Number.isFinite(value) ? value : fallback;
 }
@@ -157,7 +165,46 @@ export class AdvRuleTransitionController {
   private value = RULE_TRANSITION_FROM_VALUE;
   private useGradient = false;
   private visible = false;
+  private fadeOut = false;
   private active: ActiveTransition | null = null;
+
+  snapshot(): AdvRuleTransitionSnapshot | null {
+    if (!this.visible || !this.texture) return null;
+    const active = this.active;
+    return {
+      color: { r: this.color.r, g: this.color.g, b: this.color.b, a: this.colorAlpha },
+      value: this.value,
+      useGradient: this.useGradient,
+      fadeOut: this.fadeOut,
+      active: active
+        ? {
+            curve: active.curve,
+            duration: active.duration,
+            startValue: active.startValue,
+            endValue: active.endValue,
+            fadeOut: active.fadeOut,
+            current: active.current,
+            completeOnNextUpdate: active.completeOnNextUpdate,
+          }
+        : null,
+    };
+  }
+
+  restore(texture: Texture, snapshot: AdvRuleTransitionSnapshot): Promise<void> {
+    this.finishActive();
+    this.texture = texture;
+    this.color.setRGB(snapshot.color.r, snapshot.color.g, snapshot.color.b);
+    this.colorAlpha = snapshot.color.a;
+    this.value = snapshot.value;
+    this.useGradient = snapshot.useGradient;
+    this.fadeOut = snapshot.fadeOut;
+    this.visible = true;
+    const active = snapshot.active;
+    if (!active) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      this.active = { ...active, resolve };
+    });
+  }
 
   get renderState(): AdvRuleTransitionRenderState | null {
     if (!this.visible || !this.texture) return null;
@@ -177,6 +224,7 @@ export class AdvRuleTransitionController {
     this.color.setRGB(options.color.r, options.color.g, options.color.b);
     this.colorAlpha = finite(options.color.a, 1);
     this.useGradient = options.useGradient;
+    this.fadeOut = options.fadeOut;
     this.visible = true;
     const startValue = options.fadeOut ? RULE_TRANSITION_FROM_VALUE : RULE_TRANSITION_TO_VALUE;
     const endValue = options.fadeOut ? RULE_TRANSITION_TO_VALUE : RULE_TRANSITION_FROM_VALUE;

@@ -1,7 +1,8 @@
+import type { StoryDrawingBufferExtent } from "./StoryPhysicalViewport";
 import type { AdvFrameEntry, AdvVideoEntry, StoryFrameLayoutProvider } from "@haneoka/vega/renderer-kit";
 import type { WebGLRenderer } from "three";
 import type { AdvRainFrameSnapshot } from "./AdvRainFrameRenderer";
-import { AdvCanvasPass, type CanvasTextureLoader } from "./AdvCanvasPass";
+import { AdvCanvasPass, type CanvasTextureLoader, type AdvCanvasPassOptions } from "./AdvCanvasPass";
 import { seekVideoTime, videoAbortError, waitForVideo } from "./AdvVideoWait";
 import { startVideoClock, stopVideoClock } from "./AdvVideoClock";
 
@@ -31,7 +32,7 @@ interface VideoPreloadJob {
   readonly detachCallerSignal: () => void;
 }
 
-export interface StoryDomOverlayOptions {
+export interface StoryDomOverlayOptions extends AdvCanvasPassOptions {
   /**
    * Notifies the scene owner when a source leaves DOM-video residency. The
    * Three scene owns the corresponding resolver lease and may release it only
@@ -113,7 +114,7 @@ export class StoryDomOverlay {
   ) {
     this.mount = mount;
     this.onVideoResidencyReleased = options.onVideoResidencyReleased;
-    this.canvasPass = new AdvCanvasPass(renderer, loadTexture, layouts);
+    this.canvasPass = new AdvCanvasPass(renderer, loadTexture, layouts, options);
     this.root.className = "adv-three-overlay";
     this.videoLayer.style.display = "none";
     this.root.append(this.videoLayer, this.ruleTransitionLayer);
@@ -171,8 +172,8 @@ export class StoryDomOverlay {
   update(deltaSeconds: number): void {
     this.canvasPass.update(deltaSeconds);
   }
-  render(): void {
-    this.canvasPass.render();
+  render(frameStamp?: number): void {
+    this.canvasPass.render(frameStamp);
   }
 
   async preloadVideo(source: string, playableUrl: string, signal?: AbortSignal): Promise<void> {
@@ -388,7 +389,7 @@ export class StoryDomOverlay {
     this.canvasPass.setStillOffset(offsetX, offsetY);
   }
 
-  setViewport(x: number, y: number, width: number, height: number): void {
+  setViewport(x: number, y: number, width: number, height: number, physical?: StoryDrawingBufferExtent): void {
     this.viewportX = Number.isFinite(x) ? x : 0;
     this.viewportY = Number.isFinite(y) ? y : 0;
     this.viewportWidth = Math.max(0, width);
@@ -399,7 +400,7 @@ export class StoryDomOverlay {
       height: `${height}px`,
     });
     this.layoutRoot();
-    this.canvasPass.setViewport(width, height);
+    this.canvasPass.setViewport(width, height, physical);
   }
 
   private layoutRoot(): void {

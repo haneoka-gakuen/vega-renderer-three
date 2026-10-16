@@ -43,6 +43,8 @@ jobs:
           cache: pnpm
           cache-dependency-path: vega-renderer-three/pnpm-lock.yaml
 
+      - name: Set up locked Rust/WASM tools
+        uses: ./vega-renderer-three/.dependencies/vega/.github/actions/setup-wasm
       - name: Install dependencies
         working-directory: vega-renderer-three
         run: pnpm install --no-frozen-lockfile

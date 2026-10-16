@@ -619,19 +619,30 @@ export function writeUnityConeShapeSample(
   radiusRandom: number,
   position: MutableVector3Like,
   direction: MutableVector3Like,
+  radiusThickness?: number,
 ): void {
   const azimuth = clamp01(angleRandom) * Math.PI * 2 * (Math.max(0, finite(arcDegrees, 360)) / 360);
-  const radial = Math.max(0, finite(radius, 1)) * Math.sqrt(clamp01(radiusRandom));
+  const inner = radiusThickness === undefined ? 0 : 1 - clamp01(radiusThickness);
+  const radial =
+    Math.max(0, finite(radius, 1)) * Math.sqrt(inner * inner + (1 - inner * inner) * clamp01(radiusRandom));
   const coneAngle = (finite(coneAngleDegrees, 25) * Math.PI) / 180;
   const cosine = Math.cos(azimuth);
   const sine = Math.sin(azimuth);
-  const coneSine = Math.sin(coneAngle);
   position.x = cosine * radial;
   position.y = sine * radial;
   position.z = 0;
-  direction.x = cosine * coneSine;
-  direction.y = sine * coneSine;
-  direction.z = -Math.cos(coneAngle);
+  if (radiusThickness === undefined) {
+    const coneSine = Math.sin(coneAngle);
+    direction.x = cosine * coneSine;
+    direction.y = sine * coneSine;
+    direction.z = -Math.cos(coneAngle);
+  } else {
+    const coneSpread = (radius > 0 ? radial / radius : 0) * Math.tan(coneAngle);
+    const inverseLength = 1 / Math.sqrt(1 + coneSpread * coneSpread);
+    direction.x = cosine * coneSpread * inverseLength;
+    direction.y = sine * coneSpread * inverseLength;
+    direction.z = -inverseLength;
+  }
 }
 
 /** Writes Unity's SingleSidedEdge line sample and its documented local +Y direction. */

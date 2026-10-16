@@ -65,6 +65,7 @@ import type {
   UnityParticleShapeModule,
   UnityParticleSystemDefinition,
   UnitySpriteRendererDefinition,
+  UnityTextureSheetBirthRandom,
 } from "./UnityParticleTypes";
 
 const ATTRIBUTE_ACTIVE = unityStringHash("m_IsActive");
@@ -81,6 +82,8 @@ attribute vec3 iFlip;
 uniform int uRenderMode;
 uniform int uRenderAlignment;
 uniform float uLengthScale;
+uniform float uVelocityScale;
+uniform float uBakePlaneDistance;
 uniform bool uAllowRoll;
 uniform vec3 uParticleScale;
 uniform vec3 uPivot;
@@ -132,7 +135,20 @@ void main() {
   vec3 centerWorld = (modelMatrix * vec4(iPosition, 1.0)).xyz;
   vec4 center = viewMatrix * vec4(centerWorld, 1.0);
   vec2 billboardSize = iSize.xy * uParticleScale.xy;
-  if (uRenderMode == 1) {
+  if (uRenderMode == 1 && uBakePlaneDistance > 0.0) {
+    float speedSquared = dot(iVelocity, iVelocity);
+    vec3 direction = speedSquared > 1e-30 ? iVelocity * inversesqrt(speedSquared) : vec3(0.0);
+    vec3 head = iPosition + direction * uPivot.y * iSize.y;
+    vec3 tail = head - iVelocity * uVelocityScale - direction * uLengthScale * iSize.y;
+    vec3 p = head - vec3(0.0, 0.0, uBakePlaneDistance);
+    vec3 e = tail - vec3(0.0, 0.0, uBakePlaneDistance);
+    vec2 across = vec2(p.z * e.y - p.y * e.z, p.x * e.z - p.z * e.x);
+    float widthSquared = dot(across, across);
+    across = widthSquared > 0.0 ? across * inversesqrt(widthSquared) : vec2(0.0);
+    vec3 point = mix(head, tail, uv.x);
+    point.xy += across * (0.5 * iSize.x) * (uPivot.x + 1.0 - 2.0 * uv.y);
+    center = modelViewMatrix * vec4(point, 1.0);
+  } else if (uRenderMode == 1) {
     vec2 viewVelocity = (viewMatrix * vec4(mat3(modelMatrix) * iVelocity, 0.0)).xy;
     vec2 along = length(viewVelocity) > 0.00001 ? normalize(viewVelocity) : vec2(0.0, 1.0);
     vec2 across = vec2(along.y, -along.x);
@@ -392,6 +408,7 @@ interface Particle {
   rotation: Vector3;
   startColor: UnityColor;
   curveRandom: number;
+  textureSheetRandom: UnityTextureSheetBirthRandom | null;
   colorRandom: number;
   flipU: boolean;
   flipV: boolean;
@@ -502,6 +519,7 @@ function sampleShape(
   meshes: ReadonlyMap<string, UnityMeshDefinition>,
   random: UnityRandom,
   scratch: ShapeSamplerScratch,
+  physicalBake: boolean,
 ): ShapeSample {
   const { position, direction } = scratch.sample;
   position.set(0, 0, 0);
@@ -511,7 +529,16 @@ function sampleShape(
   const radius = Math.max(0, finite(shape.radius, 1));
   const angleRandom = random.next();
   if (shape.type === 4) {
-    writeUnityConeShapeSample(radius, shape.angle, shape.arc, angleRandom, random.next(), position, direction);
+    writeUnityConeShapeSample(
+      radius,
+      shape.angle,
+      shape.arc,
+      angleRandom,
+      random.next(),
+      position,
+      direction,
+      physicalBake ? shape.radiusThickness : undefined,
+    );
   } else if (shape.type === 5) {
     position.set(random.signed() * 0.5, random.signed() * 0.5, random.signed() * 0.5);
   } else if (shape.type === 6) {
@@ -539,6 +566,15 @@ function sampleShape(
   unityEulerDegrees(shape.rotation, scratch.rotation);
   position.applyQuaternion(scratch.rotation).add(unityVector3(shape.position, scratch.translation));
   direction.applyQuaternion(scratch.rotation);
+  if (physicalBake && shape.randomPositionAmount > 0) {
+    const z = random.signed(),
+      angle = random.next() * Math.PI * 2;
+    const distance = Math.cbrt(random.next()) * shape.randomPositionAmount;
+    const planar = Math.sqrt(Math.max(0, 1 - z * z));
+    position.x += planar * Math.cos(angle) * distance;
+    position.y += planar * Math.sin(angle) * distance;
+    position.z -= z * distance;
+  }
   return scratch.sample;
 }
 
@@ -627,6 +663,8 @@ export class UnityParticleSystemView {
   private delay = 0;
   private rateRemainder = 0;
   private emitting = false;
+  private pendingPrewarm = false;
+  private deferPrewarmAttributes = false;
   private simulationSpeed = 1;
   private burstEpoch = -1;
   private particleDelta = 0;
@@ -637,7 +675,17 @@ export class UnityParticleSystemView {
    * flattened placements whose node scale is not the authored emitter scale.
    */
   externalParticleScale: Vector3 | null = null;
+  /** Billboard dimensions are limited in this physical space before the final transform. */
+  billboardSizeLimits: { readonly worldHeight: number; readonly scale: Vector3 } | null = null;
   /** Extra alpha multiplier applied on upload; ADV canvas overlays scale whole frames by opacity. */
+  private physicalBake = false;
+  set bakeCameraPlaneDistance(value: number | null) {
+    const sheet = this.definition.textureSheetAnimation;
+    if (value !== null && sheet && (sheet.mode !== 0 || sheet.timeMode !== 0 || sheet.animationType !== 0))
+      throw new TypeError("Physical bake texture-sheet mode is unsupported");
+    this.physicalBake = value !== null;
+    this.mesh.material.uniforms.uBakePlaneDistance.value = value ?? 0;
+  }
   frameOpacity = 1;
   private readonly retainParticle = (particle: Particle): boolean => this.updateParticle(particle, this.particleDelta);
 
@@ -747,6 +795,8 @@ export class UnityParticleSystemView {
         uRenderMode: { value: renderer.renderMode },
         uRenderAlignment: { value: renderer.renderAlignment },
         uLengthScale: { value: renderer.lengthScale },
+        uVelocityScale: { value: renderer.velocityScale },
+        uBakePlaneDistance: { value: 0 },
         uAllowRoll: { value: renderer.allowRoll },
         uParticleScale: { value: new Vector3(1, 1, 1) },
         uPivot: { value: new Vector3(renderer.pivot.x, renderer.pivot.y, -renderer.pivot.z) },
@@ -773,12 +823,18 @@ export class UnityParticleSystemView {
     this.simulationSpeed = Math.max(0, finite(simulationSpeed, 1));
     this.emitting = true;
     if (this.definition.prewarm && this.definition.looping) {
+      if (!this.hierarchyActive()) {
+        this.pendingPrewarm = true;
+        return;
+      }
       const step = 1 / 30;
       for (let elapsed = 0; elapsed < this.definition.duration; elapsed += step) this.update(step);
     }
   }
 
   stop(immediate: boolean): void {
+    this.pendingPrewarm = false;
+    this.deferPrewarmAttributes = false;
     this.emitting = false;
     if (immediate) this.clear();
   }
@@ -797,6 +853,8 @@ export class UnityParticleSystemView {
   }
 
   private clear(): void {
+    this.pendingPrewarm = false;
+    this.deferPrewarmAttributes = false;
     for (const particle of this.particles) this.pool.push(particle);
     this.particles.length = 0;
     this.time = 0;
@@ -818,6 +876,7 @@ export class UnityParticleSystemView {
         rotation: new Vector3(),
         startColor: { r: 1, g: 1, b: 1, a: 1 },
         curveRandom: 0,
+        textureSheetRandom: null,
         colorRandom: 0,
         flipU: false,
         flipV: false,
@@ -832,7 +891,7 @@ export class UnityParticleSystemView {
     const maximum = this.positions.length / 3;
     for (let index = 0; index < count && this.particles.length < maximum; index += 1) {
       const particle = this.acquire();
-      const shape = sampleShape(this.definition.shape, this.meshes, this.random, this.shapeScratch);
+      const shape = sampleShape(this.definition.shape, this.meshes, this.random, this.shapeScratch, this.physicalBake);
       particle.age = 0;
       particle.curveRandom = this.random.next();
       particle.colorRandom = this.random.next();
@@ -885,6 +944,8 @@ export class UnityParticleSystemView {
       particle.rendererFlipX = rendererFlipX > 0 && this.random.next() < rendererFlipX ? -1 : 1;
       particle.rendererFlipY = rendererFlipY > 0 && this.random.next() < rendererFlipY ? -1 : 1;
       particle.rendererFlipZ = rendererFlipZ > 0 && this.random.next() < rendererFlipZ ? -1 : 1;
+      particle.textureSheetRandom =
+        this.physicalBake && uv ? { frameOverTime: this.random.next(), startFrame: this.random.next() } : null;
       this.particles.push(particle);
     }
   }
@@ -929,6 +990,17 @@ export class UnityParticleSystemView {
       if (!this.emitting && this.particles.length > 0) this.clear();
       this.mesh.geometry.instanceCount = 0;
       return;
+    }
+    if (this.pendingPrewarm) {
+      if (!(deltaSeconds > 0)) return;
+      this.pendingPrewarm = false;
+      this.deferPrewarmAttributes = this.renderer.sortMode === 0;
+      try {
+        const step = 1 / 30;
+        for (let elapsed = 0; elapsed < this.definition.duration; elapsed += step) this.update(step);
+      } finally {
+        this.deferPrewarmAttributes = false;
+      }
     }
     const delta = unityParticleSimulationDelta(
       deltaSeconds,
@@ -1122,6 +1194,7 @@ export class UnityParticleSystemView {
     } else if (this.renderer.sortMode === 3) {
       this.particles.sort(sortYoungestInFront);
     }
+    if (this.deferPrewarmAttributes) return;
     for (let index = 0; index < this.particles.length; index += 1) {
       const particle = this.particles[index];
       const age = clamp01(particle.age / particle.lifetime);
@@ -1153,8 +1226,24 @@ export class UnityParticleSystemView {
         ? 1 + noise.x * sampleUnityMinMaxCurve(this.definition.noise.sizeAmount, age, particle.curveRandom)
         : 1;
       const sizeOffset = index * 3;
-      this.sizes[sizeOffset] = Math.max(0, sizeX * sizeNoise);
-      this.sizes[sizeOffset + 1] = Math.max(0, sizeY * sizeNoise);
+      const unclampedX = Math.max(0, sizeX * sizeNoise),
+        unclampedY = Math.max(0, sizeY * sizeNoise);
+      let uiSizeFactor = 1;
+      if (this.billboardSizeLimits) {
+        const limit = this.billboardSizeLimits;
+        const extent =
+          this.physicalBake && this.renderer.renderMode === 1
+            ? unclampedX * limit.scale.x
+            : Math.max(unclampedX * limit.scale.x, unclampedY * limit.scale.y);
+        const maximum = this.renderer.maxParticleSize * limit.worldHeight;
+        const minimum = this.renderer.minParticleSize * limit.worldHeight;
+        if (extent > 0) {
+          if (maximum > 0 && extent > maximum) uiSizeFactor = maximum / extent;
+          else if (minimum > 0 && extent < minimum) uiSizeFactor = minimum / extent;
+        }
+      }
+      this.sizes[sizeOffset] = unclampedX * uiSizeFactor;
+      this.sizes[sizeOffset + 1] = unclampedY * uiSizeFactor;
       this.sizes[sizeOffset + 2] = Math.max(0, sizeZ * sizeNoise);
       const rotationOffset = index * 3;
       this.rotations[rotationOffset] = particle.rotation.x;
@@ -1190,11 +1279,17 @@ export class UnityParticleSystemView {
         const columns = Math.max(1, sheet.tilesX);
         const rows = Math.max(1, sheet.tilesY);
         const frameCount = columns * rows;
-        const start = sampleUnityMinMaxCurve(sheet.startFrame, age, particle.curveRandom) * frameCount;
-        const frame =
-          Math.floor(
-            start + sampleUnityMinMaxCurve(sheet.frameOverTime, age, particle.curveRandom) * sheet.cycles * frameCount,
-          ) % frameCount;
+        const random = particle.textureSheetRandom;
+        const frame = random
+          ? Math.floor(
+              (sampleUnityMinMaxCurve(sheet.startFrame, 0, random.startFrame) +
+                sampleUnityMinMaxCurve(sheet.frameOverTime, (age * sheet.cycles) % 1, random.frameOverTime)) *
+                frameCount,
+            ) % frameCount
+          : Math.floor(
+              sampleUnityMinMaxCurve(sheet.startFrame, age, particle.curveRandom) * frameCount +
+                sampleUnityMinMaxCurve(sheet.frameOverTime, age, particle.curveRandom) * sheet.cycles * frameCount,
+            ) % frameCount;
         const column = ((frame % columns) + columns) % columns;
         const row = Math.floor(frame / columns) % rows;
         const scaleX = (particle.flipU ? -1 : 1) / columns;
@@ -1233,6 +1328,8 @@ export class UnityParticleSystemView {
   }
 
   dispose(): void {
+    this.pendingPrewarm = false;
+    this.deferPrewarmAttributes = false;
     this.mesh.removeFromParent();
     this.mesh.geometry.dispose();
     this.mesh.material.dispose();

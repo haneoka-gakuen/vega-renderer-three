@@ -363,8 +363,6 @@ export class AdvUrpBloom {
     if (!settings.active || settings.intensity <= 0) return null;
     // URP binds sampler_LinearClamp independently of the point-filtered ADV
     // field target. WebGL texture state carries the sampler instead.
-    source.minFilter = LinearFilter;
-    source.magFilter = LinearFilter;
 
     // BloomDownscaleMode.Half=0, Quarter=1. All stage assets retain Half.
     const downres = Math.trunc(settings.downscale) === 1 ? 2 : 1;

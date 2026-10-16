@@ -357,7 +357,12 @@ export class AdvUrpUberPost {
     toneMapped: false,
   });
 
-  constructor(private readonly resolveTexture?: AdvPostTextureResolver) {}
+  constructor(private readonly resolveTexture?: AdvPostTextureResolver,
+    private readonly filmGrainMultiplier = 0,
+    private readonly resolveGrainPixelScale?: (width: number) => number) {
+    if (!Number.isFinite(filmGrainMultiplier) || filmGrainMultiplier < 0)
+      throw new TypeError("Invalid film grain multiplier");
+  }
 
   render(
     source: WebGLRenderTarget,
@@ -369,8 +374,6 @@ export class AdvUrpUberPost {
     frameCount: number,
     renderFullscreen: AdvRenderFullscreen,
   ): void {
-    source.texture.minFilter = LinearFilter;
-    source.texture.magFilter = LinearFilter;
     this.uniforms.tInput.value = source.texture;
     this.uniforms.uInputTexelSize.value.set(1 / source.width, 1 / source.height);
     this.uniforms.tLut.value = lut;
@@ -479,7 +482,8 @@ export class AdvUrpUberPost {
     );
 
     const grain = state.filmGrain;
-    const grainRequested = grain.active && grain.intensity > 0;
+    const intensity = grain.intensity * this.filmGrainMultiplier;
+    const grainRequested = grain.active && intensity > 0;
     const grainType = Math.trunc(Number(grain.type));
     const grainReference = grainRequested ? advFilmGrainTextureReference(grainType, grain.texture) : null;
     const grainTexture = grainReference === null ? null : this.resolveExternalTexture(grainReference, "film-grain");
@@ -488,11 +492,14 @@ export class AdvUrpUberPost {
     this.uniforms.uUseGrainTexture.value = grainActive && grainTexture ? 1 : 0;
     this.uniforms.tGrain.value = grainTexture ?? source.texture;
     if (grainActive) {
-      this.uniforms.uGrainParams.value.set(Math.max(0, grain.intensity) * 4, Math.max(0, Math.min(1, grain.response)));
+      this.uniforms.uGrainParams.value.set(Math.max(0, intensity) * 4, Math.max(0, Math.min(1, grain.response)));
       const image = grainTexture?.image as { width?: number; height?: number } | undefined;
+      // Source dimensions are render-target pixels: DPR is already included.
+      const grainScale = this.resolveGrainPixelScale?.(source.width) ?? 1;
+      if (!Number.isFinite(grainScale) || grainScale <= 0) throw new TypeError("Invalid grain pixel scale");
       this.uniforms.uGrainScale.value.set(
-        source.width / Math.max(1, Number(image?.width) || 512),
-        source.height / Math.max(1, Number(image?.height) || 512),
+        source.width * grainScale / Math.max(1, Number(image?.width) || 512),
+        source.height * grainScale / Math.max(1, Number(image?.height) || 512),
       );
       const random = new UnityRandom(frameCount);
       this.uniforms.uGrainSeed.value.set(random.next(), random.next());

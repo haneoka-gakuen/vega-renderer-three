@@ -83,6 +83,14 @@ for (const target of targets) {
 const ignoredRoots = new Set([".dependencies", ".git", "coverage", "dist", "node_modules"]);
 const forbiddenPath =
   /(?:^|\/)(?:assets?|character-models?|game-assets?|models?|sdk|vendor|runtime|core)(?:\/|$)|\.(?:avif|bmp|gif|jpe?g|png|svg|webp|mp3|ogg|wav|m4a|mp4|webm|moc|moc3|model3\.json|motion3\.json|physics3\.json|cdi3\.json|exp3\.json|skel|atlas|wasm|dll|dylib|so|node)$/iu;
+// Project documentation artwork is retained in Git and never ships as a
+// renderer runtime asset. Publishable payloads still use the full rule below.
+const documentationBrandFiles = new Set([
+  "docs/brand/favicon.svg",
+  "docs/brand/icon-512.png",
+  "docs/brand/social.svg",
+  "docs/brand/social.png",
+]);
 const repositoryFiles = [];
 const insideRoot = (path) => {
   const pathFromRoot = relative(root, path);
@@ -105,7 +113,7 @@ const walkRepository = async (path, relativePath = "") => {
   repositoryFiles.push(relativePath);
 };
 await walkRepository(root);
-const forbiddenFiles = repositoryFiles.filter((path) => forbiddenPath.test(path));
+const forbiddenFiles = repositoryFiles.filter((path) => forbiddenPath.test(path) && !documentationBrandFiles.has(path));
 if (forbiddenFiles.length > 0) {
   fail(`forbidden runtime or asset payload:\n${forbiddenFiles.join("\n")}`);
 }

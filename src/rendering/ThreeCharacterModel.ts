@@ -3,6 +3,18 @@ import type { Matrix4 } from "three";
 
 export type ThreeCharacterMotionSyncStatus = "unconfigured" | "loading" | "ready" | "failed" | "released";
 
+export type ThreeParameterLoopTimelineEvent =
+  | { readonly kind: "loop"; readonly name: string; readonly fadeSeconds: number; readonly atSeconds: number }
+  | { readonly kind: "pause"; readonly paused: boolean; readonly atSeconds: number }
+  | { readonly kind: "speed"; readonly rate: number; readonly atSeconds: number }
+  | { readonly kind: "show"; readonly atSeconds: number };
+
+/** Renderer records channel intent; the character provider projects its own state. */
+export interface ThreeParameterLoopTimeline {
+  readonly events: readonly ThreeParameterLoopTimelineEvent[];
+  readonly atSeconds: number;
+}
+
 export interface ThreeCharacterParameterBlend {
   readonly id: string;
   readonly value: number;
@@ -92,6 +104,7 @@ export interface ThreeStoryCharacterModel extends StoryCharacterRendererModel {
   readonly motionSyncStatus: ThreeCharacterMotionSyncStatus;
 
   setPaused(paused: boolean): void;
+  clearPausedRequests?(): void;
   setMotionSpeed(speed: number): void;
   setEyeBlinkEnabled(enabled: boolean): void;
   resetExpressionParametersToDefault(): void;
@@ -109,6 +122,7 @@ export interface ThreeStoryCharacterModel extends StoryCharacterRendererModel {
   setClockSuspended?(suspended: boolean): void;
   createSnapshot?(): unknown;
   restoreSnapshot?(snapshot: unknown): void | Promise<void>;
+  restoreParameterLoopTimeline?(timeline: ThreeParameterLoopTimeline): void | Promise<void>;
 
   playMotion(name: string, fadeInSeconds?: number): boolean;
   playExpression(name: string, fadeInSeconds?: number): boolean;
@@ -144,6 +158,8 @@ export interface ThreeStoryCharacterModel extends StoryCharacterRendererModel {
   forceEyeBallPosition(x: number, y: number): void;
 
   update(deltaSeconds: number, frame: ThreeCharacterParameterFrame): void;
+  /** Resource retries only; must not evaluate pose, motion, blink, physics or Core. */
+  pollResourceReadiness?(): void;
   draw(
     mvp: Matrix4,
     framebuffer: WebGLFramebuffer | null,

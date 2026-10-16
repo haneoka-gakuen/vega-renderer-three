@@ -34,6 +34,8 @@ export {
   type ThreeCharacterMotionSyncStatus,
   type ThreeCharacterParameterBlend,
   type ThreeCharacterParameterFrame,
+  type ThreeParameterLoopTimeline,
+  type ThreeParameterLoopTimelineEvent,
   type ThreeRendererAdditionalLight,
   type ThreeRendererLightState,
   type ThreeRendererMultiplyTextureOptions,

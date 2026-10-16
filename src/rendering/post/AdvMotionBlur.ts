@@ -317,6 +317,9 @@ export class AdvMotionBlur {
   private readonly currentViewProjection = new Matrix4();
   private readonly inverseViewProjection = new Matrix4();
   private readonly previousViewProjection = new Matrix4();
+  private readonly liveViewProjection = new Matrix4();
+  private historyFrameStamp: number | undefined;
+  private historyAspect: number | undefined;
   private previousCameraUuid = "";
   private hasPreviousViewProjection = false;
 
@@ -329,6 +332,8 @@ export class AdvMotionBlur {
   }
 
   resetHistory(): void {
+    this.historyFrameStamp = undefined;
+    this.historyAspect = undefined;
     this.hasPreviousViewProjection = false;
     this.previousCameraUuid = "";
   }
@@ -340,27 +345,26 @@ export class AdvMotionBlur {
     renderFullscreen: AdvRenderFullscreen,
     camera: Camera | null,
     motionVectors: Texture | null = null,
+    frameStamp?: number,
   ): boolean {
+    if (frameStamp !== undefined && (!Number.isSafeInteger(frameStamp) || frameStamp < 0))
+      throw new TypeError("Invalid authored motion frame stamp");
+    if (frameStamp !== undefined && camera) this.updateOwnedCameraHistory(camera, source.width, source.height, frameStamp);
     const pass = advMotionBlurPass(settings.mode, settings.quality);
     const mode = Math.trunc(settings.mode);
     const needsMotionBlur = settings.active && settings.intensity > 0 && pass !== null;
     if (!needsMotionBlur) {
-      // Do not carry an old camera transform across an inactive interval. The
-      // first enabled frame initializes current == previous and produces no
-      // stale full-screen velocity spike.
-      this.hasPreviousViewProjection = false;
-      this.previousCameraUuid = "";
+      // Legacy callers discard disabled history. Owned cameras retain the
+      // authored frame's VP pair even while this effect is inactive.
+      if (frameStamp === undefined || !camera) this.resetHistory();
       return false;
     }
     const needsCameraTexture = needsMotionBlur && mode === 1 && motionVectors === null;
     const needsCameraMotion = mode === 0 || motionVectors === null;
-    if (!needsCameraMotion || !camera) {
-      this.hasPreviousViewProjection = false;
-      this.previousCameraUuid = "";
-    }
+    if (!camera || (frameStamp === undefined && !needsCameraMotion)) this.resetHistory();
     const cameraMotionVectors =
       camera && needsCameraMotion
-        ? this.updateCameraMotionVectors(camera, source.width, source.height, renderFullscreen, needsCameraTexture)
+        ? this.updateCameraMotionVectors(camera, source.width, source.height, renderFullscreen, needsCameraTexture, frameStamp)
         : null;
     source.texture.minFilter = NearestFilter;
     source.texture.magFilter = NearestFilter;
@@ -390,24 +394,47 @@ export class AdvMotionBlur {
     return true;
   }
 
+  private updateOwnedCameraHistory(camera: Camera, width: number, height: number, frameStamp: number): void {
+    const aspect = Math.fround(width / height);
+    if (this.hasPreviousViewProjection && this.previousCameraUuid === camera.uuid &&
+        this.historyFrameStamp === frameStamp && this.historyAspect === aspect) return;
+    camera.updateMatrixWorld(true);
+    this.liveViewProjection.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    const reset = !this.hasPreviousViewProjection || this.previousCameraUuid !== camera.uuid ||
+      this.historyAspect !== aspect || this.historyFrameStamp === undefined || frameStamp < this.historyFrameStamp;
+    this.previousViewProjection.copy(reset ? this.liveViewProjection : this.currentViewProjection);
+    this.currentViewProjection.copy(this.liveViewProjection);
+    this.previousCameraUuid = camera.uuid;
+    this.hasPreviousViewProjection = true;
+    this.historyFrameStamp = frameStamp;
+    this.historyAspect = aspect;
+  }
+
   private updateCameraMotionVectors(
     camera: Camera,
     width: number,
     height: number,
     renderFullscreen: AdvRenderFullscreen,
     renderTexture: boolean,
+    frameStamp?: number,
   ): Texture | null {
     camera.updateMatrixWorld(true);
-    this.currentViewProjection.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-    if (!this.hasPreviousViewProjection || this.previousCameraUuid !== camera.uuid) {
-      this.previousViewProjection.copy(this.currentViewProjection);
-      this.previousCameraUuid = camera.uuid;
-      this.hasPreviousViewProjection = true;
+    this.liveViewProjection.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    if (frameStamp === undefined) {
+      this.historyFrameStamp = undefined;
+      this.historyAspect = undefined;
+      this.currentViewProjection.copy(this.liveViewProjection);
+      if (!this.hasPreviousViewProjection || this.previousCameraUuid !== camera.uuid) {
+        this.previousViewProjection.copy(this.currentViewProjection);
+        this.previousCameraUuid = camera.uuid;
+        this.hasPreviousViewProjection = true;
+      }
     }
+    // Reference reconstructs from the live camera every draw, even when VP history is held for this frame.
+    this.inverseViewProjection.copy(this.liveViewProjection).invert();
 
     let texture: Texture | null = null;
     if (renderTexture) {
-      this.inverseViewProjection.copy(this.currentViewProjection).invert();
       this.cameraMotionUniforms.uInverseViewProjection.value.copy(this.inverseViewProjection);
       this.cameraMotionUniforms.uViewProjection.value.copy(this.currentViewProjection);
       this.cameraMotionUniforms.uPreviousViewProjection.value.copy(this.previousViewProjection);
@@ -415,11 +442,10 @@ export class AdvMotionBlur {
       renderFullscreen(this.cameraMotionMaterial, this.cameraMotionTarget, true);
       texture = this.cameraMotionTarget.texture;
     }
-    if (!renderTexture) this.inverseViewProjection.copy(this.currentViewProjection).invert();
     this.cameraOnlyUniforms.uInverseViewProjection.value.copy(this.inverseViewProjection);
     this.cameraOnlyUniforms.uViewProjection.value.copy(this.currentViewProjection);
     this.cameraOnlyUniforms.uPreviousViewProjection.value.copy(this.previousViewProjection);
-    this.previousViewProjection.copy(this.currentViewProjection);
+    if (frameStamp === undefined) this.previousViewProjection.copy(this.currentViewProjection);
     return texture;
   }
 

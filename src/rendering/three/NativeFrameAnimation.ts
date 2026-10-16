@@ -55,7 +55,7 @@ export class NativeFrameAnimator {
     private readonly layout: StoryFrameLayout,
     private readonly animation: AdvFrameAnimation,
   ) {
-    if (!(animation.duration > 0) || animation.bindings.length > 4096) {
+    if (!(animation.duration >= 0) || animation.bindings.length > 4096) {
       throw new TypeError("Invalid frame animation");
     }
     this.curves = parseCurves(animation);
@@ -78,12 +78,14 @@ export class NativeFrameAnimator {
     const key = keys[Math.max(0, low - 1)]!;
     const delta = time - key.time;
     const [a, b, c, d] = key.coefficients;
+    if (!Number.isFinite(key.time)) return d;
     return ((a * delta + b) * delta + c) * delta + d;
   }
 
   sample(elapsed: number): StoryFrameLayout {
     const duration = this.animation.duration;
-    const time = this.animation.loop
+    elapsed *= Math.max(0, this.animation.speed ?? 1);
+    const time = this.animation.loop && duration > 0
       ? ((Math.max(0, elapsed) % duration) + duration) % duration
       : Math.max(0, Math.min(duration, elapsed));
     const changes = new Map<
@@ -119,12 +121,30 @@ export class NativeFrameAnimator {
           change.scale = [value, y !== undefined && Number.isFinite(y) ? y : node.scale[1]];
           break;
         }
+        case "rotationEuler":
+        case "rotationQuaternion": {
+          const components = [value, this.value(binding.curve + 1, time) ?? 0,
+            this.value(binding.curve + 2, time) ?? 0, this.value(binding.curve + 3, time) ?? 1];
+          let [x, y, z, w] = components as [number, number, number, number];
+          if (binding.property === "rotationEuler") {
+            // Authored Euler tracks apply Z, X, then Y: qY * qX * qZ.
+            const cx = Math.cos(x * Math.PI / 360), sx = Math.sin(x * Math.PI / 360);
+            const cy = Math.cos(y * Math.PI / 360), sy = Math.sin(y * Math.PI / 360);
+            const cz = Math.cos(z * Math.PI / 360), sz = Math.sin(z * Math.PI / 360);
+            [x, y, z, w] = [cy * sx * cz + sy * cx * sz, sy * cx * cz - cy * sx * sz,
+              cy * cx * sz - sy * sx * cz, cy * cx * cz + sy * sx * sz];
+          }
+          change.rotationQuaternion = [x, y, z, w];
+          change.rotation = Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z));
+          break;
+        }
         case "active":
           change.active = value >= 0.5;
           break;
         case "imageR":
         case "imageG":
-        case "imageB": {
+        case "imageB":
+        case "imageA": {
           if (!node.image) break;
           const color = [...((change.imageColor as readonly number[] | undefined) ?? node.image.color)] as [
             number,
@@ -132,7 +152,7 @@ export class NativeFrameAnimator {
             number,
             number,
           ];
-          color[binding.property === "imageR" ? 0 : binding.property === "imageG" ? 1 : 2] = value;
+          color[binding.property === "imageR" ? 0 : binding.property === "imageG" ? 1 : binding.property === "imageB" ? 2 : 3] = value;
           change.imageColor = color;
           break;
         }
