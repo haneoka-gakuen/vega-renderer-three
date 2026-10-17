@@ -1,3 +1,5 @@
+import { SpatialUpscalerPass } from "@haneoka/render-shaders/three";
+import type { SpatialConfiguration } from "@haneoka/render-shaders/three";
 import { ScopedRenderTargetSampling } from "../post/ScopedRenderTargetSampling";
 import type { StoryDrawingBufferExtent } from "./StoryPhysicalViewport";
 import {
@@ -428,6 +430,26 @@ function copyEffects(source: AdvPostPipelineEffects): AdvPostPipelineEffects {
  */
 export class AdvPostPipeline {
   readonly renderer: WebGLRenderer;
+  private spatial: SpatialUpscalerPass | null = null;
+  private spatialOutput: WebGLRenderTarget | null = null;
+  private nativeWidth = 1;
+  private nativeHeight = 1;
+
+  setSpatialUpscaling(value: SpatialConfiguration, native: StoryDrawingBufferExtent): void {
+    this.nativeWidth = native.width;
+    this.nativeHeight = native.height;
+    if (value.factor > 1) {
+      this.spatial ??= new SpatialUpscalerPass();
+      this.spatial.setConfiguration(value);
+      this.spatialOutput ??= createTarget("adv-spatial-native", false, UnsignedByteType, true);
+      this.spatialOutput.setSize(native.width, native.height);
+    } else {
+      this.spatial?.dispose();
+      this.spatial = null;
+      this.spatialOutput?.dispose();
+      this.spatialOutput = null;
+    }
+  }
 
   // AdvFieldRenderPass.Setup forces depthBufferBits=0 for all four RTs.
   private readonly mainTarget: WebGLRenderTarget;
@@ -599,7 +621,10 @@ export class AdvPostPipeline {
     const requestedHeight = Math.max(1, Math.round(this.cssHeight * this.pixelRatio));
     const maximum = Math.max(1, this.renderer.capabilities.maxTextureSize);
     const scale = Math.min(1, maximum / requestedWidth, maximum / requestedHeight);
-    if (measured && ![measured.width, measured.height].every((value) => Number.isSafeInteger(value) && value > 0 && value <= maximum))
+    if (
+      measured &&
+      ![measured.width, measured.height].every((value) => Number.isSafeInteger(value) && value > 0 && value <= maximum)
+    )
       throw new TypeError("Invalid measured post target extent");
     const physicalWidth = measured?.width ?? Math.max(1, Math.round(requestedWidth * scale));
     const physicalHeight = measured?.height ?? Math.max(1, Math.round(requestedHeight * scale));
@@ -866,8 +891,17 @@ export class AdvPostPipeline {
         this.finalPostFxaa.render(source, destination, this.renderFullscreenCallback);
         source = destination;
       }
-      if (options.uiEffects) this.renderSceneLayer(options.uiEffects, source);
-      options.filterStage?.(source);
+      if (this.spatial && this.spatialOutput) {
+        options.filterStage?.(source);
+        // UberPost already emits gamma RGB. Quantize only after all world post,
+        // reconstruct, then draw the UI camera at the native output extent.
+        this.spatial.render(this.renderer, source, this.nativeWidth, this.nativeHeight, this.spatialOutput);
+        source = this.spatialOutput;
+        if (options.uiEffects) this.renderSceneLayer(options.uiEffects, source);
+      } else {
+        if (options.uiEffects) this.renderSceneLayer(options.uiEffects, source);
+        options.filterStage?.(source);
+      }
 
       this.lastOutputTarget = source;
       const outputTarget = options.outputTarget ?? null;
@@ -890,6 +924,8 @@ export class AdvPostPipeline {
   dispose(): void {
     if (this.disposed) return;
     this.abortFrame();
+    this.spatial?.dispose();
+    this.spatialOutput?.dispose();
     this.mainTarget.dispose();
     this.temporaryTarget.dispose();
     this.characterBlurTarget.dispose();
@@ -1030,7 +1066,18 @@ export class AdvPostPipeline {
     gl.disable(gl.SCISSOR_TEST);
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, source);
     gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, destination as WebGLFramebuffer);
-    gl.blitFramebuffer(0, 0, target.width, target.height, 0, 0, target.width, target.height, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    gl.blitFramebuffer(
+      0,
+      0,
+      target.width,
+      target.height,
+      0,
+      0,
+      target.width,
+      target.height,
+      gl.COLOR_BUFFER_BIT,
+      gl.NEAREST,
+    );
     this.renderer.resetState();
     this.bindTarget(target);
   }
@@ -1040,12 +1087,18 @@ export class AdvPostPipeline {
     this.renderer.render(layer.scene, layer.camera);
   }
 
-  private renderFullscreen(material: ShaderMaterial, target: WebGLRenderTarget | null, clear: boolean, linearClamp = false): void {
+  private renderFullscreen(
+    material: ShaderMaterial,
+    target: WebGLRenderTarget | null,
+    clear: boolean,
+    linearClamp = false,
+  ): void {
     this.fullscreenQuad.material = material;
     this.renderer.setRenderTarget(target);
     this.renderer.setScissorTest(false);
     if (clear) this.renderer.clear(true, false, false);
-    if (linearClamp) this.postSampling.render(material, () => this.renderer.render(this.fullscreenScene, this.fullscreenCamera));
+    if (linearClamp)
+      this.postSampling.render(material, () => this.renderer.render(this.fullscreenScene, this.fullscreenCamera));
     else this.renderer.render(this.fullscreenScene, this.fullscreenCamera);
   }
 

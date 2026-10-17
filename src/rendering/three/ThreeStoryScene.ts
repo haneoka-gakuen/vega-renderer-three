@@ -1,3 +1,5 @@
+import { spatialConfiguration, spatialInputSize } from "@haneoka/render-shaders/three";
+import type { SpatialConfiguration } from "@haneoka/render-shaders/three";
 import type { StoryPhysicalViewport } from "./StoryPhysicalViewport";
 import { videoPresentedTime } from "./AdvVideoClock";
 import { SceneAnimationClock, type SceneAnimationClockSnapshot } from "./SceneAnimationClock";
@@ -912,6 +914,12 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.screenSprites?.sync(this.screenEffects.batches);
   }
   private renderer: WebGLRenderer | null = null;
+  private spatialConfiguration = spatialConfiguration();
+  setSpatialUpscaling(value: SpatialConfiguration): void {
+    this.spatialConfiguration = spatialConfiguration(value);
+    this.resize();
+    this.heldRenderPending = true;
+  }
   private pipeline: AdvPostPipeline | null = null;
   private overlay: StoryDomOverlay | null = null;
   private videoPlaybackFailed = false;
@@ -1673,11 +1681,14 @@ export class ThreeStoryScene implements StorySceneBackend {
           item.entry.profile?.defaultExpressionName,
           record(item.entry.runtime).defaultExpressionName,
         ),
-        loopNames: [...new Set([
-          ...(item.parameterLoopTimeline?.events.flatMap((event) =>
-            event.kind === "loop" && event.name ? [event.name] : []) ?? []),
-          ...(item.parameterLoopName ? [item.parameterLoopName] : []),
-        ])],
+        loopNames: [
+          ...new Set([
+            ...(item.parameterLoopTimeline?.events.flatMap((event) =>
+              event.kind === "loop" && event.name ? [event.name] : [],
+            ) ?? []),
+            ...(item.parameterLoopName ? [item.parameterLoopName] : []),
+          ]),
+        ],
       };
     };
     let prepared = desiredChannels();
@@ -1689,8 +1700,11 @@ export class ThreeStoryScene implements StorySceneBackend {
       ]);
       if (signal.aborted) throw sceneAbortError(`Character ${item.target} recovery was aborted`);
       const latest = desiredChannels();
-      const stable = latest.motionName === prepared.motionName && latest.expressionName === prepared.expressionName &&
-        latest.loopNames.length === prepared.loopNames.length && latest.loopNames.every((name, i) => name === prepared.loopNames[i]);
+      const stable =
+        latest.motionName === prepared.motionName &&
+        latest.expressionName === prepared.expressionName &&
+        latest.loopNames.length === prepared.loopNames.length &&
+        latest.loopNames.every((name, i) => name === prepared.loopNames[i]);
       prepared = latest;
       if (!stable) continue;
 
@@ -1701,9 +1715,12 @@ export class ThreeStoryScene implements StorySceneBackend {
       replacement.setPaused(item.paused);
       if (prepared.motionName) replacement.playMotion(prepared.motionName, item.currentMotionFadeInSeconds ?? 0);
       replacement.setEyeBlinkStopped?.(item.eyeBlinkStopped, 0);
-      if (prepared.expressionName) replacement.playExpression(prepared.expressionName, item.activeExpressionFadeInSeconds ?? 0);
+      if (prepared.expressionName)
+        replacement.playExpression(prepared.expressionName, item.activeExpressionFadeInSeconds ?? 0);
       if (item.parameterLoopTimeline && replacement.restoreParameterLoopTimeline) {
-        const projection = replacement.restoreParameterLoopTimeline(this.captureParameterLoopTimeline(item.parameterLoopTimeline));
+        const projection = replacement.restoreParameterLoopTimeline(
+          this.captureParameterLoopTimeline(item.parameterLoopTimeline),
+        );
         if (projection && typeof projection.then === "function") {
           // The replacement is still private. Re-enter preparation rather than
           // installing a model whose deferred projection could overwrite a
@@ -1884,7 +1901,9 @@ export class ThreeStoryScene implements StorySceneBackend {
       width: `${width}px`,
       height: `${height}px`,
     });
-    this.pipeline.setSize(width, height, effectiveDpr, physical);
+    this.pipeline.setSpatialUpscaling(this.spatialConfiguration, physical);
+    const world = spatialInputSize(physical.width, physical.height, this.spatialConfiguration.factor);
+    this.pipeline.setSize(width, height, effectiveDpr / this.spatialConfiguration.factor, world);
     this.overlay?.setViewport(x, y, width, height, physical);
     this.camera.aspect = physical.width / physical.height;
     this.camera.updateProjectionMatrix();
@@ -2463,7 +2482,9 @@ export class ThreeStoryScene implements StorySceneBackend {
       }
     }
     this.runSceneUpdateSubsystem("command effects", timeSeconds, () => this.commandEffects.update(deltaSeconds));
-    this.runSceneUpdateSubsystem("stage effects", timeSeconds, () => this.stageEffects.update(deltaSeconds * this.playbackSpeedRate));
+    this.runSceneUpdateSubsystem("stage effects", timeSeconds, () =>
+      this.stageEffects.update(deltaSeconds * this.playbackSpeedRate),
+    );
     this.runSceneUpdateSubsystem("video state", timeSeconds, () => {
       const video = this.overlay?.videoElement;
       if (!video) return;
@@ -3136,7 +3157,10 @@ export class ThreeStoryScene implements StorySceneBackend {
   private fieldPosition(kind: "background" | "character", target: Vec3): Vec3 {
     const stage = record(this.state.stage || this.runtime.stage);
     const key = kind === "background" ? "backgroundFieldPosition" : "characterFieldPosition";
-    const fallback = (kind === "background" ? this.runtime.stage.backgroundFieldPosition : this.runtime.stage.characterFieldPosition) ?? ZERO_VEC3;
+    const fallback =
+      (kind === "background"
+        ? this.runtime.stage.backgroundFieldPosition
+        : this.runtime.stage.characterFieldPosition) ?? ZERO_VEC3;
     return vec3(stage[key] ?? record(this.runtime.stage)[key], fallback, target);
   }
 
@@ -3293,7 +3317,11 @@ export class ThreeStoryScene implements StorySceneBackend {
   private layoutCharacter(item: StoryCharacter, fieldScale = this.fieldScale("character")): void {
     const profile = item.entry.profile || {};
     const placement = this.characterPlacement(item);
-    const basePosition = vec3(profile.basePosition, this.runtime.stage.characterBasePosition ?? ZERO_VEC3, this.scratchCharacterBasePosition);
+    const basePosition = vec3(
+      profile.basePosition,
+      this.runtime.stage.characterBasePosition ?? ZERO_VEC3,
+      this.scratchCharacterBasePosition,
+    );
     const scale = placement ? placement.scale : Math.max(0.001, finite(profile.baseScale, 1.6));
     const authoredPosition = item.worldPosition ?? placement?.position;
     const expectedParent = this.stageNode(item.positionType);
@@ -3676,7 +3704,10 @@ export class ThreeStoryScene implements StorySceneBackend {
       worldPosition: snapshot.worldPosition ? { ...snapshot.worldPosition } : null,
       presentation: snapshot.presentation.map((event) => ({ ...event })),
       parameterLoopTimeline: snapshot.parameterLoopTimeline
-        ? { ...snapshot.parameterLoopTimeline, events: snapshot.parameterLoopTimeline.events.map((event) => ({ ...event })) }
+        ? {
+            ...snapshot.parameterLoopTimeline,
+            events: snapshot.parameterLoopTimeline.events.map((event) => ({ ...event })),
+          }
         : undefined,
       rimLight: clonePlain(snapshot.rimLight),
       lipSync: {
@@ -5239,7 +5270,8 @@ export class ThreeStoryScene implements StorySceneBackend {
   playMotionForTarget(target: string, motionName = "", motionFadeIn = -1, expectedIdentity?: string): void {
     if (this.seekIndexCompilationActive) {
       const logical = this.logicalCharacterByTarget(target, expectedIdentity);
-      if (!logical || !logical.visible || !this.hasCharacterPresentationResource(logical.entry, "motions", motionName)) return;
+      if (!logical || !logical.visible || !this.hasCharacterPresentationResource(logical.entry, "motions", motionName))
+        return;
       if (logical.paused) {
         this.logicalPresentationEvent(logical, { kind: "motion", name: motionName });
         logical.pendingPausedMotion = { name: motionName, fadeInSeconds: motionFadeIn };
@@ -5378,7 +5410,8 @@ export class ThreeStoryScene implements StorySceneBackend {
     const event = { kind: "loop" as const, name: motionName, fadeSeconds: fadeIn, atSeconds: this.authoredSeconds() };
     if (this.seekIndexCompilationActive) {
       const logical = this.logicalCharacterByTarget(target, expectedIdentity);
-      if (!logical || !logical.visible || !this.hasCharacterPresentationResource(logical.entry, "motions", motionName)) return;
+      if (!logical || !logical.visible || !this.hasCharacterPresentationResource(logical.entry, "motions", motionName))
+        return;
       this.logicalPresentationEvent(logical, { kind: "motionLoop", name: motionName });
       this.recordParameterLoopEvent(logical, event);
       logical.parameterLoopName = motionName;
@@ -6009,20 +6042,18 @@ export class ThreeStoryScene implements StorySceneBackend {
     const additional = packUnityUrpAdditionalLights(
       lights
         .filter((light) => light !== directional)
-        .map(
-          (light): UnityCharacterAdditionalLightLike => ({
-            active: true,
-            type: finite(light.type, -1),
-            position: vec3(light.worldPosition, { x: 0, y: 0, z: 0 }),
-            forward: vec3(light.worldForward, { x: 0, y: 0, z: 1 }),
-            rotation: lightQuaternion(light.worldRotation),
-            color: lightColor(light.color),
-            intensity: finite(light.intensity, 1),
-            range: finite(light.range, 10),
-            spotAngle: finite(light.spotAngle, 30),
-            innerSpotAngle: Number.isFinite(Number(light.innerSpotAngle)) ? Number(light.innerSpotAngle) : undefined,
-          }),
-        ),
+        .map((light): UnityCharacterAdditionalLightLike => ({
+          active: true,
+          type: finite(light.type, -1),
+          position: vec3(light.worldPosition, { x: 0, y: 0, z: 0 }),
+          forward: vec3(light.worldForward, { x: 0, y: 0, z: 1 }),
+          rotation: lightQuaternion(light.worldRotation),
+          color: lightColor(light.color),
+          intensity: finite(light.intensity, 1),
+          range: finite(light.range, 10),
+          spotAngle: finite(light.spotAngle, 30),
+          innerSpotAngle: Number.isFinite(Number(light.innerSpotAngle)) ? Number(light.innerSpotAngle) : undefined,
+        })),
     );
     const enabled = this.qualityConfig.isUnityLightingEnabled() && lights.length > 0;
     this.characterLightingState = {
@@ -7220,7 +7251,10 @@ export class ThreeStoryScene implements StorySceneBackend {
         item.currentMotionFadeInSeconds = character.currentMotionFadeInSeconds;
         item.parameterLoopName = character.parameterLoopName ?? "";
         item.parameterLoopTimeline = character.parameterLoopTimeline
-          ? { ...character.parameterLoopTimeline, events: character.parameterLoopTimeline.events.map((event) => ({ ...event })) }
+          ? {
+              ...character.parameterLoopTimeline,
+              events: character.parameterLoopTimeline.events.map((event) => ({ ...event })),
+            }
           : undefined;
         item.eyeBlinkStopped = character.eyeBlinkStopped ?? false;
         item.currentExpressionName = character.currentExpressionName;
@@ -7257,8 +7291,11 @@ export class ThreeStoryScene implements StorySceneBackend {
           model.stopParameterLoopMotion?.(0);
           model.resetExpressionParametersToDefault();
           if (item.currentMotionName) model.playMotion(item.currentMotionName, 0);
-          if (character.modelState === undefined &&
-            (!character.parameterLoopTimeline || !model.restoreParameterLoopTimeline) && item.parameterLoopName)
+          if (
+            character.modelState === undefined &&
+            (!character.parameterLoopTimeline || !model.restoreParameterLoopTimeline) &&
+            item.parameterLoopName
+          )
             model.playParameterLoopMotion?.(item.parameterLoopName, 0);
           if (item.activeExpressionName) model.playExpression(item.activeExpressionName, 0);
           model.setEyeBlinkStopped?.(item.eyeBlinkStopped, 0);
@@ -8212,7 +8249,7 @@ export class ThreeStoryScene implements StorySceneBackend {
           if (raw >= 1) renderer = null;
           else renderer.nextFrameSeconds += frameSeconds;
         }
-        for (let index = 0; index < direct.length; ) {
+        for (let index = 0; index < direct.length;) {
           const entry = direct[index];
           if (entry.nextFrameSeconds > nextSeconds) {
             index += 1;
@@ -9125,8 +9162,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     if (!targetName) return false;
     if (this.seekIndexCompilationActive) return this.logicalCharacterByTarget(targetName) !== null;
     return (
-      this.cachedCharacterController(targetName) !== null ||
-      this.pendingCharacterHeadWorldPosition(targetName) !== null
+      this.cachedCharacterController(targetName) !== null || this.pendingCharacterHeadWorldPosition(targetName) !== null
     );
   }
 
@@ -9136,7 +9172,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       targetNameToPositionTypeMap?: ReadonlyMap<string, number>;
       tryGetTargetNameToPositionType?: (name: string) => number;
     } | null;
-    const namedPosition = targetName ? session?.tryGetTargetNameToPositionType?.(targetName) ?? 0 : 0;
+    const namedPosition = targetName ? (session?.tryGetTargetNameToPositionType?.(targetName) ?? 0) : 0;
     const hasNamedMapping =
       Boolean(targetName) && (session?.targetNameToPositionTypeMap?.has(targetName) ?? Boolean(namedPosition));
     const logical =

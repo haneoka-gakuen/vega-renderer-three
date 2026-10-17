@@ -56,7 +56,8 @@
   "peerDependencies": {
     "@haneoka/vega": "^0.1.0",
     "howler": ">=2.2.0 <3",
-    "three": ">=0.184.0 <0.185.0"
+    "three": ">=0.184.0 <0.185.0",
+    "@haneoka/render-shaders": "^0.1.0"
   },
   "devDependencies": {
     "@haneoka/vega": "^0.1.0",
@@ -65,7 +66,8 @@
     "howler": "2.2.4",
     "three": "0.184.0",
     "typescript": "^6.0.3",
-    "prettier": "3.7.4"
+    "prettier": "3.7.4",
+    "@haneoka/render-shaders": "git+https://github.com/haneoka-gakuen/render-shaders.git#6bf76578c7ebdf318f5a3f5c198d01ac9235c853"
   },
   "publishConfig": {
     "access": "public",

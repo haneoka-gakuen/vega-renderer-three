@@ -41,7 +41,7 @@ for (const document of requiredPublishedDocuments) {
 }
 
 const actualPeers = Object.keys(manifest.peerDependencies ?? {}).sort();
-const expectedPeers = ["@haneoka/vega", "howler", "three"].sort();
+const expectedPeers = ["@haneoka/render-shaders", "@haneoka/vega", "howler", "three"].sort();
 if (JSON.stringify(actualPeers) !== JSON.stringify(expectedPeers)) {
   fail(`peer dependencies must be exactly ${expectedPeers.join(", ")}`);
 }
