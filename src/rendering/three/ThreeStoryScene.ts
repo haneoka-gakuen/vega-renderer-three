@@ -6,11 +6,16 @@ import { SceneAnimationClock, type SceneAnimationClockSnapshot } from "./SceneAn
 import { ScreenSpriteRenderer } from "./ScreenSpriteRenderer";
 import {
   AdaptiveRenderQuality,
+  PropertyAnimationPlayer,
+  type PropertyAnimationClip,
+  type PropertyAnimationOptions,
   STORY_SCREEN_FILTER_PROVIDER,
   StoryScreenEffects,
   STORY_FRAME_LAYOUT_PROVIDER,
   STORY_STILL_PRESENTATION_PROVIDER,
   resolveStoryPlaneLayout,
+  resolveStoryStagePoint,
+  resolveStoryFocusPoint,
   scenePlaneSize,
   scenePointFromPixels,
   type SceneCoordinateReference,
@@ -92,6 +97,7 @@ import {
 import {
   isThreeStoryCharacterModel,
   type ThreeCharacterParameterBlend,
+  type ThreeCharacterBounds,
   type ThreeCharacterParameterFrame,
   type ThreeParameterLoopTimeline,
   type ThreeParameterLoopTimelineEvent,
@@ -177,6 +183,15 @@ type MutableAdvSeekCharacterSnapshot = {
 type LogicalCharacterState = Omit<MutableAdvSeekCharacterSnapshot, "lipSync"> & {
   lipSync: LipSyncState;
 };
+
+type CharacterGeometryModel = Pick<
+  ThreeStoryCharacterModel,
+  "canvasBounds" | "drawableBounds" | "pixelsPerUnit" | "framingAnchors"
+>;
+type CharacterLayout = Pick<
+  StoryCharacter,
+  "entry" | "positionType" | "target" | "offset" | "worldPosition" | "facing" | "roleAngle" | "node" | "surface"
+> & { model: CharacterGeometryModel };
 
 type BackgroundMesh = Mesh<PlaneGeometry, MeshBasicMaterial>;
 type UnknownRecord = Record<string, unknown>;
@@ -691,8 +706,13 @@ export class ThreeStoryScene implements StorySceneBackend {
   private readonly spriteProjection = new Matrix4();
   private readonly sceneReferenceCache = new WeakMap<object, SceneCoordinateReference>();
   private readonly placementCache = new WeakMap<
-    StoryCharacter,
+    CharacterLayout,
     { stage: object; positions: Map<number, { position: Vec3; origin: Vec3; scale: number }> }
+  >();
+  private readonly portraitGeometry = new WeakMap<StoryCharacterEntry, CharacterGeometryModel>();
+  private readonly nativeCharacterFraming = new WeakMap<
+    CharacterGeometryModel,
+    { head: Vec3; stomach: Vec3; eyeSpan?: number }
   >();
 
   private coordinateReference(): SceneCoordinateReference {
@@ -726,6 +746,13 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   clearSceneTransform(target: string): void {
+    if (target === "*") {
+      this.propertyAnimations.cancel();
+      for (const key of [...this.sceneTransforms.keys()]) this.clearSceneTransform(key);
+      return;
+    }
+    if (target.startsWith("volume:")) this.commandVolumes.delete(target);
+    this.propertyAnimations.cancel(target);
     this.sceneTransforms.delete(target);
     this.screenFilter(target);
   }
@@ -734,11 +761,107 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.clearSceneTransform(target);
   }
 
+  playPropertyAnimation(
+    target: string,
+    clip: PropertyAnimationClip,
+    options?: PropertyAnimationOptions,
+  ): Promise<void> {
+    if (target === "scene-camera") {
+      for (const { channel } of clip.tracks)
+        this.cameraTweenVersions[channel] = (this.cameraTweenVersions[channel] ?? 0) + 1;
+    }
+    return this.propertyAnimations.play(target, clip, options);
+  }
+
+  cancelPropertyAnimations(target?: string, channels?: readonly string[]): void {
+    this.propertyAnimations.cancel(target, channels);
+  }
+
+  private releasePropertyChannels(target: string, channels: readonly string[]): void {
+    this.propertyAnimations.cancel(target, channels);
+    const values = this.sceneTransforms.get(target);
+    if (!values) return;
+    const current = { ...values.current },
+      planned = { ...values.planned };
+    for (const channel of channels) {
+      delete current[channel];
+      delete planned[channel];
+    }
+    this.writeSceneTransform(target, { current, planned });
+  }
+
+  private adoptCharacterPropertyChannels(
+    target: string,
+    channels: readonly ("headAngle" | "bodyAngle" | "lookX" | "lookY")[],
+  ): void {
+    const current = this.sceneTransforms.get(target)?.current;
+    if (!current) return;
+    const item = this.seekIndexCompilationActive
+      ? this.logicalCharacterByTarget(target)
+      : this.cachedCharacterController(target);
+    if (item)
+      for (const channel of channels) {
+        const value = current[channel];
+        if (value === undefined) continue;
+        if (channel === "headAngle") item.angle = value;
+        else if (channel === "bodyAngle") item.bodyAngle = value;
+        else item[channel] = value;
+      }
+    this.releasePropertyChannels(target, channels);
+  }
+
   writeSceneTransform(
     target: string,
     value: { current: Readonly<Record<string, number>>; planned: Readonly<Record<string, number>> },
   ): void {
     this.sceneTransforms.set(target, { current: { ...value.current }, planned: { ...value.planned } });
+    if (target === "scene-camera") {
+      for (const key of [
+        "baseX",
+        "baseY",
+        "baseZ",
+        "angle",
+        "zoomRatio",
+        "rotationX",
+        "rotationY",
+        "panOffsetX",
+        "panOffsetY",
+      ] as const)
+        if (value.current[key] !== undefined) this.cameraState[key] = value.current[key]!;
+    } else if (target.startsWith("volume:")) {
+      const components: Record<
+        string,
+        { active: boolean; fields: Record<string, { override: boolean; value: number }> }
+      > = {};
+      for (const [channel, parameter] of Object.entries(value.current)) {
+        const parts = /^([A-Za-z]+)\.([A-Za-z]+)$/u.exec(channel);
+        if (!parts) continue;
+        const component = (components[parts[1]!] ??= { active: true, fields: {} });
+        component.fields[parts[2]!] = { override: true, value: parameter };
+      }
+      const profile = { name: target, components };
+      this.commandVolumes.set(target, { profile, weight: 1, enabled: true, version: 0 });
+    } else {
+      const item = this.characterItems.get(target) || this.cachedCharacterController(target);
+      const logical = this.seekIndexCompilationActive ? this.logicalCharacterByTarget(target) : undefined;
+      if (item || logical) {
+        const position = item
+          ? this.characterAuthoredWorldPosition(item)
+          : (logical!.worldPosition ?? { x: 0, y: 0, z: 0 });
+        if (["worldX", "worldY", "worldZ"].some((key) => value.current[key] !== undefined)) {
+          const next = {
+            x: value.current.worldX ?? position.x,
+            y: value.current.worldY ?? position.y,
+            z: value.current.worldZ ?? position.z,
+          };
+          if (logical) logical.worldPosition = next;
+          if (item) {
+            item.worldPosition = next;
+            this.layoutCharacter(item);
+          }
+        }
+      }
+    }
     this.screenFilter(target);
   }
 
@@ -930,6 +1053,13 @@ export class ThreeStoryScene implements StorySceneBackend {
   private previousFrameTime = 0;
   private lastRenderedTimeSeconds = 0;
   private readonly animationClock = new SceneAnimationClock();
+  private readonly propertyAnimations = new PropertyAnimationPlayer(this.animationClock, (target, current, planned) => {
+    const previous = this.readScreenTransform(target);
+    this.writeScreenTransform(target, {
+      current: { ...previous?.current, ...current },
+      planned: { ...previous?.planned, ...planned },
+    });
+  });
   private clockMode: "owned" | "legacy-wall" = "owned";
   private sceneClockStarted = false;
   private previousClockHeld = true;
@@ -1170,6 +1300,23 @@ export class ThreeStoryScene implements StorySceneBackend {
         "rotation",
         "alpha",
         "brightness",
+        "headAngle",
+        "headPitch",
+        "bodyAngle",
+        "lookX",
+        "lookY",
+        "worldX",
+        "worldY",
+        "worldZ",
+        "baseX",
+        "baseY",
+        "baseZ",
+        "angle",
+        "zoomRatio",
+        "rotationX",
+        "rotationY",
+        "panOffsetX",
+        "panOffsetY",
         ...(this.screenFilterProvider?.channels ?? []),
       ]),
     ]);
@@ -1851,25 +1998,33 @@ export class ThreeStoryScene implements StorySceneBackend {
     const displayPortrait =
       globalThis.matchMedia?.("(orientation: portrait)").matches ??
       (globalThis.innerHeight || surfaceHeight) > (globalThis.innerWidth || surfaceWidth);
-    const targetAspect = unityAdvOrientedTargetAspect(
-      displayPortrait,
-      surfaceWidth,
-      surfaceHeight,
-      finite(this.runtime.layout.designViewportAspect, 16 / 9),
-      finite(this.runtime.layout.portraitTargetAspect, 16 / 9),
-      positiveFinite(this.runtime.layout.landscapeTargetAspect),
-    );
-    const viewport = createUnityAdvViewport(surfaceWidth, surfaceHeight, targetAspect);
+    const targetAspect = this.videoCaptureSize
+      ? this.videoCaptureSize.width / this.videoCaptureSize.height
+      : unityAdvOrientedTargetAspect(
+          displayPortrait,
+          surfaceWidth,
+          surfaceHeight,
+          finite(this.runtime.layout.designViewportAspect, 16 / 9),
+          finite(this.runtime.layout.portraitTargetAspect, 16 / 9),
+          positiveFinite(this.runtime.layout.landscapeTargetAspect),
+        );
+    const captureWidthRatio = targetAspect / (surfaceWidth / surfaceHeight);
+    const viewport =
+      this.videoCaptureSize && captureWidthRatio < 1
+        ? { x: (1 - captureWidthRatio) / 2, y: 0, width: captureWidthRatio, height: 1 }
+        : createUnityAdvViewport(surfaceWidth, surfaceHeight, targetAspect);
     const x = viewport.x * surfaceWidth;
     const y = viewport.y * surfaceHeight;
     const width = Math.max(1, viewport.width * surfaceWidth);
     const height = Math.max(1, viewport.height * surfaceHeight);
-    const requestedDpr = Math.min(
-      Math.max(1, globalThis.devicePixelRatio || 1) *
-        clamp(this.runtime.rendererResolutionScale, 0.5, 2) *
-        this.adaptiveRenderQuality.scale,
-      Math.max(1, finite(this.runtime.rendererResolutionMax, 3)),
-    );
+    const requestedDpr = this.videoCaptureSize
+      ? Math.max(this.videoCaptureSize.width / width, this.videoCaptureSize.height / height)
+      : Math.min(
+          Math.max(1, globalThis.devicePixelRatio || 1) *
+            clamp(this.runtime.rendererResolutionScale, 0.5, 2) *
+            this.adaptiveRenderQuality.scale,
+          Math.max(1, finite(this.runtime.rendererResolutionMax, 3)),
+        );
     const pixelCountMax = Math.max(1, finite(this.runtime.rendererPixelCountMax, 10_000_000));
     const pixelLimitedDpr = Math.sqrt(pixelCountMax / Math.max(1, width * height));
     const dpr = Math.max(0.5, Math.min(requestedDpr, pixelLimitedDpr));
@@ -2338,6 +2493,11 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.backgroundBlurTweenController = null;
   }
 
+  private videoCaptureSize?: { width: number; height: number };
+  get storyClock() {
+    return this.animationClock;
+  }
+
   capturePreview(options: StoryScenePreviewOptions): string | undefined {
     if (!this.renderer || !this.pipeline || this.destroyed || this.contextLost) return undefined;
     try {
@@ -2357,6 +2517,52 @@ export class ThreeStoryScene implements StorySceneBackend {
       return preview.toDataURL(options.format, options.quality);
     } catch {
       return undefined;
+    }
+  }
+
+  createVideoCapture(options: { width: number; height: number; fps: number }): {
+    stream: MediaStream;
+    dispose(): void;
+  } {
+    if (!this.renderer || this.destroyed || this.contextLost) throw new Error("Stage capture is unavailable");
+    const source = this.renderer.domElement,
+      canvas = source.ownerDocument.createElement("canvas");
+    if (this.videoCaptureSize) throw new Error("Video recording already exists");
+    canvas.width = options.width;
+    canvas.height = options.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Stage capture is unavailable");
+    let frame = 0,
+      active = true;
+    let stream: MediaStream | undefined;
+    const dispose = () => {
+      if (!active) return;
+      active = false;
+      cancelAnimationFrame(frame);
+      for (const track of stream?.getTracks() ?? []) track.stop();
+      canvas.width = canvas.height = 1;
+      this.videoCaptureSize = undefined;
+      this.resize();
+    };
+    const draw = () => {
+      if (!active || this.destroyed || this.contextLost) return;
+      this.render(this.authoredSeconds());
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      const scale = Math.min(canvas.width / source.width, canvas.height / source.height),
+        width = source.width * scale,
+        height = source.height * scale;
+      context.drawImage(source, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
+      frame = requestAnimationFrame(draw);
+    };
+    try {
+      this.videoCaptureSize = { width: options.width, height: options.height };
+      this.resize();
+      draw();
+      stream = canvas.captureStream(options.fps);
+      return { stream, dispose };
+    } catch (error) {
+      dispose();
+      throw error;
     }
   }
 
@@ -2386,7 +2592,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       if (deltaSeconds == null) return;
       if (this.adaptiveRenderQuality.sample(deltaSeconds * 1000)) this.resize();
       try {
-        if (this.clockMode === "owned")
+        if (this.clockMode === "owned" || !this.state.paused)
           this.animationClock.step(deltaSeconds, () => this.update(deltaSeconds, wallSeconds));
         else this.update(deltaSeconds, wallSeconds);
       } catch (error) {
@@ -2413,10 +2619,12 @@ export class ThreeStoryScene implements StorySceneBackend {
   ): ThreeCharacterParameterFrame {
     const applyFallbackMouth = item.lipSync.enabled && !item.lipSync.motionSyncPcm;
     const frame = item.parameterFrame;
-    frame.angleX = item.angleOverride ? item.angle : undefined;
-    frame.bodyAngleX = item.angleOverride ? item.bodyAngle : undefined;
-    frame.lookX = item.lookOverride ? finite(item.lookX) : undefined;
-    frame.lookY = item.lookOverride ? finite(item.lookY) : undefined;
+    const pose = this.readSceneTransform(item.target)?.current;
+    frame.angleX = pose?.headAngle ?? (item.angleOverride ? item.angle : undefined);
+    frame.angleY = pose?.headPitch;
+    frame.bodyAngleX = pose?.bodyAngle ?? (item.angleOverride ? item.bodyAngle : undefined);
+    frame.lookX = pose?.lookX ?? (item.lookOverride ? finite(item.lookX) : undefined);
+    frame.lookY = pose?.lookY ?? (item.lookOverride ? finite(item.lookY) : undefined);
     frame.mouthOpenY = applyFallbackMouth ? item.lipSync.mouthOpenY : undefined;
     // RMS/timed fallback has no honest vowel classifier. Leave MouthForm
     // authored by the expression; ready MotionSync PCM drives it directly.
@@ -3263,12 +3471,11 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   private stagePointInto(key: number, target: Vec3): Vec3 {
-    return vec3(this.runtime.stage.positions?.[key] || this.runtime.stage.focusAnchors?.[key], ZERO_VEC3, target);
+    return resolveStoryStagePoint(this.runtime.stage, key, target);
   }
 
   private focusPointInternal(positionType: unknown): Vec3 {
-    const key = AdvCamera.focusAnchorPositionType(positionType as number | undefined);
-    return vec3(this.runtime.stage.focusAnchors?.[key] || this.runtime.stage.positions?.[key], ZERO_VEC3);
+    return resolveStoryFocusPoint(this.runtime.stage, positionType);
   }
 
   private stageOffsetInternal(positionType: number): Vec3 {
@@ -3314,7 +3521,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     }
   }
 
-  private layoutCharacter(item: StoryCharacter, fieldScale = this.fieldScale("character")): void {
+  private layoutCharacter(item: CharacterLayout, fieldScale = this.fieldScale("character")): void {
     const profile = item.entry.profile || {};
     const placement = this.characterPlacement(item);
     const basePosition = vec3(
@@ -3322,7 +3529,14 @@ export class ThreeStoryScene implements StorySceneBackend {
       this.runtime.stage.characterBasePosition ?? ZERO_VEC3,
       this.scratchCharacterBasePosition,
     );
-    const scale = placement ? placement.scale : Math.max(0.001, finite(profile.baseScale, 1.6));
+    const framing = profile.framing ? this.characterFraming(item) : undefined;
+    const framingScale =
+      framing?.eyeSpan && profile.framing?.eyeSpan
+        ? profile.framing.eyeSpan / framing.eyeSpan
+        : framing && profile.framing
+          ? (profile.framing.head.y - profile.framing.stomach.y) / Math.max(0.001, framing.head.y - framing.stomach.y)
+          : 1;
+    const scale = placement ? placement.scale : Math.max(0.001, finite(profile.baseScale, 1.6)) * framingScale;
     const authoredPosition = item.worldPosition ?? placement?.position;
     const expectedParent = this.stageNode(item.positionType);
     if (item.node.parent !== expectedParent) expectedParent.add(item.node);
@@ -3373,8 +3587,40 @@ export class ThreeStoryScene implements StorySceneBackend {
         .premultiply(this.sceneParentInverse);
     }
     item.node.matrixWorldNeedsUpdate = true;
-    item.surface.position.set(-(placement?.origin.x ?? 0), -(placement?.origin.y ?? 0), 0);
+    const origin =
+      framing && profile.framing
+        ? {
+            x: framing.head.x - profile.framing.head.x / framingScale,
+            y: framing.head.y - profile.framing.head.y / framingScale,
+          }
+        : placement?.origin;
+    item.surface.position.set(-(origin?.x ?? 0), -(origin?.y ?? 0), 0);
     item.surface.updateMatrix();
+  }
+
+  private characterFraming(item: Pick<CharacterLayout, "model" | "entry">): {
+    head: Vec3;
+    stomach: Vec3;
+    eyeSpan?: number;
+  } {
+    let value = this.nativeCharacterFraming.get(item.model);
+    if (!value) {
+      const anchors = item.model.framingAnchors?.();
+      const authored = item.entry.profile?.anchors;
+      const bounds = item.model.drawableBounds(true) ?? item.model.canvasBounds();
+      const center = bounds.x + bounds.width / 2;
+      value = {
+        ...(anchors?.eyeSpan ? { eyeSpan: anchors.eyeSpan } : {}),
+        head: vec3(authored?.head?.position ?? anchors?.head, { x: center, y: bounds.y + bounds.height * 0.84, z: 0 }),
+        stomach: vec3(authored?.stomach?.position ?? anchors?.stomach, {
+          x: center,
+          y: bounds.y + bounds.height * 0.62,
+          z: 0,
+        }),
+      };
+      this.nativeCharacterFraming.set(item.model, value);
+    }
+    return value;
   }
 
   private spritePlaneProjection(layer: "background" | "foreground"): Matrix4 {
@@ -3401,7 +3647,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       .multiply(item.surface.matrixWorld);
   }
 
-  private characterCanvasBounds(item: StoryCharacter): { x: number; y: number; width: number; height: number } {
+  private characterCanvasBounds(item: CharacterLayout): ThreeCharacterBounds {
     const bounds = item.model.canvasBounds(),
       base = record(record(item.entry.profile).placement);
     const layout = { ...base, ...record(record(base.positions)[String(item.positionType)]) };
@@ -3420,7 +3666,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     };
   }
 
-  private characterPlacement(item: StoryCharacter): { position: Vec3; origin: Vec3; scale: number } | undefined {
+  private characterPlacement(item: CharacterLayout): { position: Vec3; origin: Vec3; scale: number } | undefined {
     const base = record(item.entry.profile).placement;
     if (!base || typeof base !== "object") return undefined;
     let cache = this.placementCache.get(item);
@@ -3987,6 +4233,61 @@ export class ThreeStoryScene implements StorySceneBackend {
     return clamp((atSeconds - placement.fadeInStartedAtSeconds) / duration);
   }
 
+  private readonly portraitReplacementGenerations = new WeakMap<StoryCharacter, number>();
+  private portraitEntry(entry: StoryCharacterEntry, source: string): StoryCharacterEntry {
+    return {
+      ...entry,
+      runtime: { ...this.normalizeCharacterModelEntry(entry).runtime, format: "static-portrait", imageUrl: source },
+    };
+  }
+  private async replacePortrait(
+    item: StoryCharacter,
+    entry: StoryCharacterEntry,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (!(item.model instanceof StaticPortraitModel)) return false;
+    const generation = (this.portraitReplacementGenerations.get(item) ?? 0) + 1;
+    this.portraitReplacementGenerations.set(item, generation);
+    const previous = item.model,
+      contextGeneration = this.contextRestoreGeneration;
+    const replacement = await this.createCharacterModel(item.target, entry, signal ?? new AbortController().signal);
+    if (!replacement) return false;
+    if (
+      signal?.aborted ||
+      this.destroyed ||
+      this.contextLost ||
+      contextGeneration !== this.contextRestoreGeneration ||
+      this.portraitReplacementGenerations.get(item) !== generation ||
+      item.model !== previous ||
+      !this.ownsCharacterController(item)
+    ) {
+      await this.disposeCharacterModelSafely(replacement, "superseded portrait replacement", item.target);
+      return false;
+    }
+    this.cancelCharacterModelRecovery(item);
+    item.entry = entry;
+    item.model = replacement;
+    this.placementCache.delete(item);
+    this.layoutCharacter(item);
+    await this.disposeCharacterModelSafely(previous, "portrait replacement", item.target);
+    return true;
+  }
+  async replaceCharacterImage(target: string, source: string, signal?: AbortSignal): Promise<boolean> {
+    const identity = this.characterControllerIdentities.get(target);
+    const logical = identity ? this.logicalCharacterStates.get(identity) : undefined;
+    if (this.seekIndexCompilationActive) {
+      if (!logical || !this.normalizeCharacterModelEntry(logical.entry).runtime?.imageUrl) return false;
+      logical.entry = this.portraitEntry(logical.entry, source);
+      return true;
+    }
+    const item = this.characterItems.get(target);
+    if (!item) return false;
+    const entry = this.portraitEntry(item.entry, source);
+    const replaced = await this.replacePortrait(item, entry, signal);
+    if (replaced && logical) logical.entry = entry;
+    return replaced;
+  }
+
   /** Mirror AdvEpisodeResourceLoader.SetCharacterAssetIndex for controller lookup. */
   selectCharacterAssetIndex(target: string, assetIndex: number): void {
     const name = String(target || "");
@@ -4543,6 +4844,39 @@ export class ThreeStoryScene implements StorySceneBackend {
       // compilation must preserve that decision; it cannot invent a logical
       // controller for a descriptor the loader did not resolve.
       if (!entry) return;
+      const normalized = this.normalizeCharacterModelEntry(entry);
+      const runtime = normalized.runtime;
+      const imageUrl = firstString(runtime?.imageUrl);
+      const dynamicSource = firstString(
+        runtime?.model,
+        runtime?.moc,
+        runtime?.skeleton,
+        runtime?.skel,
+        runtime?.json,
+        runtime?.atlas,
+      );
+      if (imageUrl && !dynamicSource && this.staticPortraitFallback && !this.portraitGeometry.has(entry)) {
+        const stage = record(this.state.stage);
+        const geometry = await StaticPortraitModel.readGeometry({
+          imageUrl,
+          resources: this.resources,
+          signal: this.lifecycleController.signal,
+          pixelsPerUnit:
+            positiveFinite(runtime?.pixelsPerUnit) ??
+            positiveFinite(stage.characterPixelsPerUnit) ??
+            positiveFinite(this.runtime.stage.characterPixelsPerUnit),
+          worldHeight:
+            positiveFinite(runtime?.worldHeight) ??
+            positiveFinite(stage.characterCanvasWorldHeight) ??
+            positiveFinite(this.runtime.stage.characterCanvasWorldHeight),
+          pivot: runtime?.pivot,
+        });
+        this.portraitGeometry.set(entry, {
+          pixelsPerUnit: geometry.pixelsPerUnit,
+          canvasBounds: () => geometry.bounds,
+          drawableBounds: () => geometry.bounds,
+        });
+      }
       const compileIdentity = firstString(
         record(cmd).controllerIdentity,
         `${target}\u0000${Number(cmd.targetAssetIndex) || 0}`,
@@ -7052,6 +7386,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       dofActive: Boolean(this.state.dofActive),
       characters,
       lifecycle: {
+        propertyAnimations: this.propertyAnimations.snapshot(),
         animationClock:
           this.clockMode === "owned"
             ? { mode: "owned", started: this.sceneClockStarted, snapshot: this.animationClock.snapshot() }
@@ -7154,6 +7489,7 @@ export class ThreeStoryScene implements StorySceneBackend {
           current: { ...transform.current },
           planned: { ...transform.planned },
         });
+      this.propertyAnimations.restore(snapshot.lifecycle.propertyAnimations ?? []);
       await this.screenEffects.restore(snapshot.screenEffects ?? [], signal);
       if (signal?.aborted || this.destroyed) return;
       for (const entry of this.screenFilters.values()) entry.controller.dispose();
@@ -7230,6 +7566,13 @@ export class ThreeStoryScene implements StorySceneBackend {
           if (!character.visible) continue;
           throw new Error(`ADV seek could not restore visible character ${character.target}`);
         }
+        const portrait = this.normalizeCharacterModelEntry(character.entry).runtime?.imageUrl;
+        if (
+          portrait &&
+          item.model instanceof StaticPortraitModel &&
+          this.normalizeCharacterModelEntry(item.entry).runtime?.imageUrl !== portrait
+        )
+          await this.replacePortrait(item, character.entry, signal);
         item.positionType = character.positionType;
         item.worldPosition = character.worldPosition ? { ...character.worldPosition } : null;
         Object.assign(item.offset, character.offset);
@@ -7508,6 +7851,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     duration = 0,
     enabled = true,
   ): (() => Promise<void>) | null {
+    this.adoptCharacterPropertyChannels(target, ["lookX", "lookY"]);
     if (this.seekIndexCompilationActive) {
       const logical = this.logicalCharacterByTarget(target);
       if (!logical) return null;
@@ -7584,6 +7928,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   async setLook(target: string, lookX: number, lookY: number, duration = 0, enabled = true): Promise<void> {
+    this.adoptCharacterPropertyChannels(target, ["lookX", "lookY"]);
     // RefreshLookCancellationToken cancels the preceding Look/Stop task before
     // either the loaded or Web-staged path starts the new linear tween.
     this.cancelPendingLookWait(target);
@@ -7853,6 +8198,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   prepareCharacterAngle(target: string, angle: number, bodyAngle: number, duration = 0): (() => Promise<void>) | null {
+    this.adoptCharacterPropertyChannels(target, ["headAngle", "bodyAngle"]);
     if (this.seekIndexCompilationActive) {
       const logical = this.logicalCharacterByTarget(target);
       if (!logical) return null;
@@ -7880,6 +8226,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   async setCharacterAngle(target: string, angle: number, bodyAngle: number, duration = 0): Promise<void> {
+    this.adoptCharacterPropertyChannels(target, ["headAngle", "bodyAngle"]);
     // AdvAngleCommand refreshes a per-character cancellation token before
     // SmoothRotateToAngle. Keep that ownership while the Web-only lazy load is
     // pending as well, so an obsolete blocking command is released promptly.
@@ -8054,6 +8401,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   ): Promise<void> {
     const destination = worldPosition(position);
     if (!destination) return Promise.resolve();
+    this.releasePropertyChannels(target, ["worldX", "worldY", "worldZ"]);
     if (this.seekIndexCompilationActive) {
       const logical = this.logicalCharacterByTarget(target);
       if (!logical) return Promise.resolve();
@@ -9037,9 +9385,11 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   private characterHeadWorldPosition(item: StoryCharacter): Vec3 {
+    if (item.entry.profile?.framing)
+      return computeAdvCharacterHeadWorldPosition(item.surface, this.characterFraming(item).head);
     const authoredHead = item.entry.profile?.anchors?.head?.position;
     if (authoredHead) {
-      return computeAdvCharacterHeadWorldPosition(item.node, vec3(authoredHead, ZERO_VEC3));
+      return computeAdvCharacterHeadWorldPosition(item.surface, vec3(authoredHead, ZERO_VEC3));
     }
     const bounds = this.invokeCharacterModel(
       item,
@@ -9047,7 +9397,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       { x: -0.5, y: -1, width: 1, height: 2 },
       (model) => model.drawableBounds(true) || model.canvasBounds(),
     );
-    return computeAdvCharacterHeadWorldPosition(item.node, {
+    return computeAdvCharacterHeadWorldPosition(item.surface, {
       x: bounds.x + bounds.width / 2,
       y: bounds.y + bounds.height,
       z: 0,
@@ -9055,7 +9405,28 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   private logicalCharacterHeadWorldPosition(state: LogicalCharacterState): Vec3 | null {
-    const head = state.entry.profile?.anchors?.head?.position;
+    const model =
+      this.cachedCharacterControllers.get(state.controllerIdentity)?.model ?? this.portraitGeometry.get(state.entry);
+    if (model) {
+      this.applyTransforms();
+      const item: CharacterLayout = { ...state, model, node: new Object3D(), surface: new Object3D() };
+      item.node.add(item.surface);
+      this.layoutCharacter(item);
+      const bounds = model.drawableBounds(true) ?? model.canvasBounds();
+      const head = (state.entry.profile?.framing
+        ? this.characterFraming(item).head
+        : state.entry.profile?.anchors?.head?.position) ?? {
+        x: bounds.x + bounds.width / 2,
+        y: bounds.y + bounds.height,
+        z: 0,
+      };
+      try {
+        return computeAdvCharacterHeadWorldPosition(item.surface, vec3(head, ZERO_VEC3));
+      } finally {
+        item.node.removeFromParent();
+      }
+    }
+    const head = state.entry.profile?.anchors?.head?.position ?? state.entry.profile?.framing?.head;
     if (!head) return null;
     const stage = this.stageNode(state.positionType);
     this.applyTransforms();
@@ -9092,7 +9463,7 @@ export class ThreeStoryScene implements StorySceneBackend {
 
     const pending = this.pendingCharacterPlacements.get(target);
     if (!pending || pending.token !== this.characterLoadTokens.get(target)) return null;
-    const head = pending.entry.profile?.anchors?.head?.position;
+    const head = pending.entry.profile?.anchors?.head?.position ?? pending.entry.profile?.framing?.head;
     if (!head) return null;
     const pendingWorld = this.pendingCharacterWorldPositions.get(target);
     const positionType = pendingWorld?.token === pending.token ? pendingWorld.positionType : pending.positionType;
@@ -9166,7 +9537,12 @@ export class ThreeStoryScene implements StorySceneBackend {
     );
   }
 
-  focusBaseCameraPosition(positionType: number, targetName = "", focusData: AdvFocusDataRow | null = null): Vec3 {
+  focusBaseCameraPosition(
+    positionType: number,
+    targetName = "",
+    focusData: AdvFocusDataRow | null = null,
+    cameraAnchor: "slot" | "character" = "slot",
+  ): Vec3 {
     const point = this.focusPointInternal(positionType);
     const session = this.state.session as {
       targetNameToPositionTypeMap?: ReadonlyMap<string, number>;
@@ -9183,7 +9559,7 @@ export class ThreeStoryScene implements StorySceneBackend {
         : this.characterHeadWorldPositionAtPosition(namedPosition, targetName)
       : null;
     return {
-      x: point.x,
+      x: cameraAnchor === "character" && head ? head.x : point.x,
       y: AdvCamera.focusTargetY(
         finite(focusData?.fieldZoomOffsetY),
         head?.y,
@@ -9194,6 +9570,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   private beginCameraTween(keys: readonly string[]): Record<string, number> {
+    this.releasePropertyChannels("scene-camera", keys);
     const token: Record<string, number> = {};
     for (const key of keys) {
       const next = (this.cameraTweenVersions[key] || 0) + 1;
@@ -9227,9 +9604,57 @@ export class ThreeStoryScene implements StorySceneBackend {
     };
   }
 
+  focusFrame(targets: readonly string[], cameraDistance: number): { position: Vec3; zoomRatio: number } | null {
+    if (targets.length < 2) return null;
+    this.applyTransforms();
+    const subjects = [...new Set(targets)].flatMap((target) => {
+      const head = this.characterHeadWorldPositionAtPosition(0, target);
+      if (!head) return [];
+      const item = this.cachedCharacterController(target),
+        logical = this.logicalCharacterByTarget(target);
+      const profile = item?.entry.profile ?? logical?.entry.profile;
+      const scale = item
+        ? Math.abs(item.surface.getWorldScale(new Vector3()).x)
+        : finite(profile?.baseScale, 1.6) * this.fieldScale("character");
+      const eyeSpan = item ? this.characterFraming(item).eyeSpan : profile?.framing?.eyeSpan;
+      const eyeWidth = Math.max(0.04, finite(eyeSpan, 0.0735) * scale);
+      return [{ head, halfWidth: eyeWidth * 2.5, headRoom: eyeWidth * 1.5 }];
+    });
+    if (subjects.length < 2) return null;
+    const data = this.currentFocusData(clampCameraDistance(cameraDistance));
+    const minX = Math.min(...subjects.map((value) => value.head.x - value.halfWidth));
+    const maxX = Math.max(...subjects.map((value) => value.head.x + value.halfWidth));
+    const position = {
+      x: (minX + maxX) / 2,
+      y:
+        subjects.reduce((sum, value) => sum + value.head.y, 0) / subjects.length -
+        finite(data?.characterHeadFocusOffsetY),
+      z: 0,
+    };
+    const reference = this.coordinateReference();
+    const aspect = Math.max(0.1, Math.min(this.camera.aspect, reference.width / reference.height));
+    const requiredFov = Math.max(
+      ...subjects.map((value) => {
+        const depth = Math.max(0.1, Math.abs(value.head.z - position.z));
+        const horizontal = (Math.abs(value.head.x - position.x) + value.halfWidth) / aspect;
+        const vertical = Math.max(0, value.head.y + value.headRoom - position.y);
+        return (2 * Math.atan(Math.max(horizontal, vertical) / (depth * 0.9)) * 180) / Math.PI;
+      }),
+    );
+    return {
+      position,
+      zoomRatio: Math.max(
+        0.001,
+        Math.min(finite(data?.fieldZoomRatio, 1), this.stageFov() / Math.max(0.001, requiredFov)),
+      ),
+    };
+  }
+
   focus({
     positionType = 5,
     targetName = "",
+    cameraAnchor = "slot",
+    focusTargets = [],
     cameraDistance = 0,
     sharp = false,
     duration = 0,
@@ -9238,6 +9663,8 @@ export class ThreeStoryScene implements StorySceneBackend {
   }: {
     positionType?: number;
     targetName?: string;
+    cameraAnchor?: "slot" | "character";
+    focusTargets?: readonly string[];
     cameraDistance?: number;
     sharp?: boolean;
     duration?: number;
@@ -9258,7 +9685,9 @@ export class ThreeStoryScene implements StorySceneBackend {
     );
     const distance = clampCameraDistance(cameraDistance);
     const focusData = this.currentFocusData(distance);
-    const targetBase = this.focusBaseCameraPosition(anchorPosition, targetName, focusData);
+    const frame = this.focusFrame(focusTargets, cameraDistance);
+    const targetBase =
+      frame?.position ?? this.focusBaseCameraPosition(anchorPosition, targetName, focusData, cameraAnchor);
     const rendererTarget = this.fieldRendererValuesForDistance(distance, true);
     if (sharp) {
       rendererTarget.backgroundBlur = 0;
@@ -9291,7 +9720,13 @@ export class ThreeStoryScene implements StorySceneBackend {
             positionType,
             version,
             from: this.characterBlurIntensities.get(positionType) ?? 0,
-            to: positionType === subjectPosition || !hasFocusedCharacter ? 0 : rendererTarget.characterBlur,
+            to: (
+              focusTargets.length > 1
+                ? focusTargets.some((target) => session?.tryGetTargetNameToPositionType?.(target) === positionType)
+                : positionType === subjectPosition || !hasFocusedCharacter
+            )
+              ? 0
+              : rendererTarget.characterBlur,
           };
         })
       : [];
@@ -9329,7 +9764,7 @@ export class ThreeStoryScene implements StorySceneBackend {
         if (this.ownsCameraTween(token, "zoomRatio"))
           this.cameraState.zoomRatio = lerp(
             startCamera.zoomRatio,
-            Math.max(0.001, finite(focusData?.fieldZoomRatio, 1)),
+            frame?.zoomRatio ?? Math.max(0.001, finite(focusData?.fieldZoomRatio, 1)),
             progress,
           );
         if (this.ownsCameraTween(token, "panOffsetX"))
@@ -9473,12 +9908,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   }
 
   panV2CameraOffset(rotationY: number, distance: number, focusSlideRate: number): Vec2 {
-    const radians = finite(rotationY) * DEG_TO_RAD;
-    const radiusRate = 1 - finite(focusSlideRate, 0.5);
-    return {
-      x: -radiusRate * finite(distance) * Math.sin(radians),
-      y: radiusRate * finite(distance) * (1 - Math.cos(radians)),
-    };
+    return AdvCamera.panV2CameraOffset(rotationY, distance, focusSlideRate);
   }
 
   setPanV2CameraOffset(

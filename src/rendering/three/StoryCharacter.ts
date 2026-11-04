@@ -102,7 +102,7 @@ export class StoryCharacter implements StoryCharacterItem {
   constructor(
     readonly target: string,
     readonly characterKey: string,
-    readonly entry: StoryCharacterEntry,
+    public entry: StoryCharacterEntry,
     public model: ThreeStoryCharacterModel,
     public positionType: number,
     private readonly blurIntensities: Map<number, number>,

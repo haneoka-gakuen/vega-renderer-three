@@ -16,6 +16,10 @@ resource leases, and WebGL teardown.
 - Abort-aware resource preparation, deterministic seek snapshots, bounded
   texture ownership, and WebGL context-loss recovery.
 
+Seek-index compilation reads static portrait dimensions without allocating GPU
+models. Head focus uses the same portrait geometry and stage-placement transforms
+as normal playback, including per-position layout, offsets and role rotation.
+
 The plugin is the normal integration surface. `ThreeStoryScene` is exported for
 hosts that construct a `StorySceneBackend` directly; its constructor requires a
 complete `StorySceneBackendContext` and an optional `ThreeStorySceneOptions`.
@@ -67,10 +71,10 @@ import { VEGA_ADV_OPCODE } from "@haneoka/vega-protocol/opcodes";
 import { createThreeRendererPlugin } from "@haneoka/vega-renderer-three";
 
 const mount = document.querySelector<HTMLElement>("#player");
-if (!mount) throw new Error("Add <div id=\"player\"></div> to the page");
+if (!mount) throw new Error('Add <div id="player"></div> to the page');
 
 const engine = new VegaEngine({
-  plugins: [createThreeRendererPlugin({ profile: "vega" })]
+  plugins: [createThreeRendererPlugin({ profile: "vega" })],
 });
 const handle = await engine.createPlayer({
   mount,
@@ -80,10 +84,10 @@ const handle = await engine.createPlayer({
         command: VEGA_ADV_OPCODE.Talk,
         targetName: "Guide",
         text: "The Three.js stage is running.",
-        noWait: true
-      }
-    ]
-  }
+        noWait: true,
+      },
+    ],
+  },
 });
 
 await handle.player.play();
@@ -109,9 +113,8 @@ const renderer = createThreeRendererPlugin({
   profile: "unity-adv",
   colorGradingMode: "hdr",
   postTextureAssets: {
-    "haneoka.renderer-three/film-grain/0":
-      "/authorized-assets/post/film-grain-0.png"
-  }
+    "haneoka.renderer-three/film-grain/0": "/authorized-assets/post/film-grain-0.png",
+  },
 });
 ```
 
@@ -128,6 +131,12 @@ character leaves the scene or the player ends.
 
 ## Resource, host, and lifetime contract
 
+Character providers may expose `framingAnchors()` with stable model-local head,
+torso and eye-span measurements. A character profile's optional `framing`
+maps those landmarks to the host's native character coordinates. Layout,
+camera focus and seek reconstruction use the same model surface transform;
+native profiles without `framing` retain their authored scale and anchors.
+
 Vega remains the host-facing interpreter. This package renders the scene and
 does not supply story conversion, audio clocks, input mapping, save storage, or
 licensed character SDKs. A host typically combines:
@@ -143,6 +152,13 @@ leases, destroy the scene, dispose Three textures and render targets, remove
 the canvas listeners, and release the WebGL renderer. Call `handle.player.resize()`
 after a host-controlled layout change when the stage size changes outside its
 normal observer path.
+
+## Group composition
+
+Native `Focus.focusTargets` composes multiple visible characters through their
+world-space head anchors and calibrated body widths. The backend fits the
+requested shot to the viewport and keeps its subjects sharp. Playback, seek
+snapshots and the camera session share this same framing calculation.
 
 ## License
 

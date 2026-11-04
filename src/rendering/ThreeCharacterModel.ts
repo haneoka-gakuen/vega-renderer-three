@@ -24,6 +24,7 @@ export interface ThreeCharacterParameterBlend {
 
 export interface ThreeCharacterParameterFrame {
   angleX?: number;
+  angleY?: number;
   bodyAngleX?: number;
   lookX?: number;
   lookY?: number;
@@ -118,6 +119,12 @@ export interface ThreeStoryCharacterModel extends StoryCharacterRendererModel {
   stopMotions(): void;
   drawableBounds(visibleOnly?: boolean): ThreeCharacterBounds | null;
   canvasBounds(): ThreeCharacterBounds;
+  /** Stable model-local landmarks, sampled before story animation starts. */
+  framingAnchors?(): {
+    readonly eyeSpan?: number;
+    readonly head?: { readonly x: number; readonly y: number };
+    readonly stomach?: { readonly x: number; readonly y: number };
+  };
   resetMotionSync(): void;
   setClockSuspended?(suspended: boolean): void;
   createSnapshot?(): unknown;
