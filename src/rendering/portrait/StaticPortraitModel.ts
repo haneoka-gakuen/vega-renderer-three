@@ -96,6 +96,22 @@ const finite = (value: unknown, fallback: number): number => {
   return Number.isFinite(number) ? number : fallback;
 };
 
+const portraitGeometry = (
+  widthPixels: number,
+  heightPixels: number,
+  options: Pick<StaticPortraitModelOptions, "pixelsPerUnit" | "worldHeight" | "pivot">,
+): { pixelsPerUnit: number; bounds: ThreeCharacterBounds } => {
+  const worldHeight = positive(options.worldHeight);
+  const pixelsPerUnit =
+    positive(options.pixelsPerUnit) ?? (worldHeight ? heightPixels / worldHeight : DEFAULT_PIXELS_PER_UNIT);
+  const width = widthPixels / pixelsPerUnit;
+  const height = heightPixels / pixelsPerUnit;
+  return {
+    pixelsPerUnit,
+    bounds: { x: -finite(options.pivot?.x, 0.5) * width, y: -finite(options.pivot?.y, 0.5) * height, width, height },
+  };
+};
+
 const createTexture = async (
   gl: WebGL2RenderingContext,
   imageUrl: string,
@@ -351,14 +367,14 @@ export class StaticPortraitModel implements ThreeStoryCharacterModel {
     this.modelUrl = options.imageUrl;
     this.textureLease = textureLease;
     this.resources = resources;
-    const worldHeight = positive(options.worldHeight);
-    this.pixelsPerUnit =
-      positive(options.pixelsPerUnit) ?? (worldHeight ? textureLease.height / worldHeight : DEFAULT_PIXELS_PER_UNIT);
-    const width = textureLease.width / this.pixelsPerUnit;
-    const height = textureLease.height / this.pixelsPerUnit;
-    const pivotX = finite(options.pivot?.x, 0.5);
-    const pivotY = finite(options.pivot?.y, 0.5);
-    this.bounds = { x: -pivotX * width, y: -pivotY * height, width, height };
+    const geometry = portraitGeometry(textureLease.width, textureLease.height, options);
+    this.pixelsPerUnit = geometry.pixelsPerUnit;
+    this.bounds = geometry.bounds;
+  }
+
+  static async readGeometry(options: Omit<StaticPortraitModelOptions, "gl" | "anisotropy">) {
+    const image = await loadRendererImage(options.imageUrl, options.resources, options.signal);
+    return portraitGeometry(image.naturalWidth || image.width, image.naturalHeight || image.height, options);
   }
 
   static async create(options: StaticPortraitModelOptions): Promise<StaticPortraitModel> {

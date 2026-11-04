@@ -1,4 +1,5 @@
 import type { StoryScreenEffectSnapshot } from "@haneoka/vega/renderer-kit";
+import type { PropertyAnimationSnapshot } from "@haneoka/vega/renderer-kit";
 import type { AdvRainFrameSnapshot } from "./AdvRainFrameRenderer";
 import type { CanvasStillSnapshot } from "./AdvCanvasPass";
 import type { SceneAnimationClockSnapshot } from "./SceneAnimationClock";
@@ -163,6 +164,7 @@ export interface AdvStorySceneSeekSnapshot extends PortableAdvStorySceneSeekSnap
   readonly dofActive: boolean;
   readonly characters: readonly AdvSeekCharacterSnapshot[];
   readonly lifecycle: {
+    readonly propertyAnimations?: readonly PropertyAnimationSnapshot[];
     readonly animationClock?: SceneClockDomainSnapshot;
     readonly characterLoadSequence: number;
     readonly characterLoadTokens: readonly (readonly [string, number])[];

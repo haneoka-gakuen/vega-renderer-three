@@ -46,6 +46,8 @@ export interface FieldRendererState {
 export interface CharacterPresentationProfile {
   basePosition?: Partial<Vec3>;
   baseScale?: number;
+  /** Target landmarks in the native stage's unscaled character coordinates. */
+  framing?: { head: Vec3; stomach: Vec3; eyeSpan?: number };
   anchors?: {
     head?: { position?: Partial<Vec3> };
     stomach?: { position?: Partial<Vec3> };
