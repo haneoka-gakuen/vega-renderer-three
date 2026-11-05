@@ -2590,7 +2590,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       const targetFrameRate = Math.max(1, finite(this.runtime.targetFrameRate, 45));
       const deltaSeconds = this.targetFrameClock.advance(elapsedMs / 1000, targetFrameRate);
       if (deltaSeconds == null) return;
-      if (this.adaptiveRenderQuality.sample(deltaSeconds * 1000)) this.resize();
+      if (this.adaptiveRenderQuality.sample(elapsedMs)) this.resize();
       try {
         if (this.clockMode === "owned" || !this.state.paused)
           this.animationClock.step(deltaSeconds, () => this.update(deltaSeconds, wallSeconds));
@@ -9096,10 +9096,14 @@ export class ThreeStoryScene implements StorySceneBackend {
       item.model.setClockSuspended?.(this.authoredClockHeld() || this.characterItems.get(item.target) !== item);
   }
 
+  private readonly resourcePollItems = new Set<StoryCharacter>();
+
   private pollSceneResources(wallSeconds: number): void {
     this.pumpCharacterModelRecoveries(wallSeconds);
     if (this.contextLost || this.contextRestoreController) return;
-    const controllers = new Set<StoryCharacter>(this.cachedCharacterControllers.values());
+    const controllers = this.resourcePollItems;
+    controllers.clear();
+    for (const item of this.cachedCharacterControllers.values()) controllers.add(item);
     for (const { item } of this.stagedCharacterItems.values()) controllers.add(item);
     for (const item of this.characterItems.values()) controllers.add(item);
     for (const item of controllers)
@@ -9107,6 +9111,7 @@ export class ThreeStoryScene implements StorySceneBackend {
         this.invokeCharacterModel(item, "poll resource readiness", undefined, (model) =>
           model.pollResourceReadiness?.(),
         );
+    controllers.clear();
   }
 
   private ownsCharacterTransition(signal: AbortSignal): boolean {

@@ -13,6 +13,7 @@ import {
   PerspectiveCamera,
   Mesh,
   NormalBlending,
+  NoBlending,
   NoColorSpace,
   OneFactor,
   OneMinusSrcAlphaFactor,
@@ -1210,7 +1211,7 @@ export class AdvCanvasPass {
   ): void => {
     this.screenQuad.material = material;
     this.renderer.setRenderTarget(target);
-    if (clear) this.renderer.clear(true, false, false);
+    if (clear && material.blending !== NoBlending) this.renderer.clear(true, false, false);
     this.postSampling.render(material, () => this.renderer.render(this.screenScene, this.camera));
   };
 

@@ -1096,7 +1096,7 @@ export class AdvPostPipeline {
     this.fullscreenQuad.material = material;
     this.renderer.setRenderTarget(target);
     this.renderer.setScissorTest(false);
-    if (clear) this.renderer.clear(true, false, false);
+    if (clear && material.blending !== NoBlending) this.renderer.clear(true, false, false);
     if (linearClamp)
       this.postSampling.render(material, () => this.renderer.render(this.fullscreenScene, this.fullscreenCamera));
     else this.renderer.render(this.fullscreenScene, this.fullscreenCamera);
