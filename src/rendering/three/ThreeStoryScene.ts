@@ -1061,7 +1061,15 @@ export class ThreeStoryScene implements StorySceneBackend {
   private updateAdaptiveFrameTarget(): void {
     const limit = this.frameRateLimit ?? this.runtime.targetFrameRate;
     const displayRate = 1000 / this.displayFrameMs;
-    this.adaptiveRenderQuality.setTargetFps(limit === 0 ? displayRate : Math.min(limit, displayRate));
+    const targetFps = limit === 0 ? displayRate : Math.min(limit, displayRate);
+    if (this.adaptiveRenderQuality.targetFrameMs === 1000 / Math.max(30, targetFps)) return;
+    this.adaptiveRenderQuality = new AdaptiveRenderQuality({
+      enabled: this.adaptiveRenderQuality.enabled,
+      initialScale: this.adaptiveRenderQuality.scale,
+      minScale: this.adaptiveRenderQuality.minScale,
+      maxScale: this.adaptiveRenderQuality.maxScale,
+      targetFps,
+    });
   }
   private sampleDisplayFrameInterval(elapsedMs: number): void {
     if (elapsedMs <= 0 || elapsedMs > 100) return;
@@ -1174,7 +1182,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     filterStage?: (target: WebGLRenderTarget) => void;
     beforePostProcessing?: (target: WebGLRenderTarget) => void;
   } = { timeSeconds: 0, foreground: null, commandEffects: null, uiEffects: null };
-  private readonly adaptiveRenderQuality: AdaptiveRenderQuality;
+  private adaptiveRenderQuality: AdaptiveRenderQuality;
   private readonly qualityConfig: AdvQualityConfig;
   private readonly cameraTweenVersions: Record<string, number> = {};
   private backgroundShake: Vec2 = { x: 0, y: 0 };
