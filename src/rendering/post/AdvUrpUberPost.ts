@@ -229,8 +229,10 @@ void main() {
   }
 
   vec3 outputColor = linearToSrgb(max(color, vec3(0.0)));
-  vec3 originalColor = linearToSrgb(max(unprocessed, vec3(0.0)));
-  outputColor = mix(originalColor, outputColor, clamp(source.a, 0.0, 1.0));
+  if (source.a < 1.0) {
+    vec3 originalColor = linearToSrgb(max(unprocessed, vec3(0.0)));
+    outputColor = mix(originalColor, outputColor, clamp(source.a, 0.0, 1.0));
+  }
   gl_FragColor = vec4(outputColor, clamp(source.a, 0.0, 1.0));
 }
 `;
@@ -269,6 +271,12 @@ type UberUniforms = Record<string, IUniform<unknown>> & {
   uUseUserLut: IUniform<number>;
   uUseLensDirt: IUniform<number>;
 };
+
+const SPECIALIZED_UNIFORMS = [
+  "uUseDistortion", "uUseChromatic", "uUseBloom", "uUseVignette",
+  "uUseGrain", "uUseGrainTexture", "uUseUserLut", "uUseLensDirt",
+  "uHdrGrading", "uTonemapping",
+] as const;
 
 /** Letterbox-style texture scale and offset for a full-screen lens-dirt map. */
 export const advLensDirtScaleOffset = (
@@ -312,6 +320,7 @@ export const advFilmGrainTextureUrl = (type: number, customTextureReference: unk
   Math.trunc(type) === 10 && typeof customTextureReference === "string" ? customTextureReference || null : null;
 
 export class AdvUrpUberPost {
+  private featureKey = -1;
   private readonly uniforms: UberUniforms = {
     tInput: { value: null },
     tBloom: { value: null },
@@ -505,11 +514,25 @@ export class AdvUrpUberPost {
       this.uniforms.uGrainSeed.value.set(random.next(), random.next());
     }
 
+    this.selectShaderVariant();
     renderFullscreen(this.material, destination, true);
   }
 
   dispose(): void {
     this.material.dispose();
+  }
+
+  private selectShaderVariant(): void {
+    let key = 0;
+    for (const name of SPECIALIZED_UNIFORMS) key = key * 4 + this.uniforms[name].value;
+    if (key === this.featureKey) return;
+    this.featureKey = key;
+    let fragment = ADV_UBER_POST_FRAGMENT;
+    for (const name of SPECIALIZED_UNIFORMS)
+      fragment = fragment.replace(`uniform float ${name};`, `const float ${name} = ${this.uniforms[name].value}.0;`);
+    // Three retains compiled programs for each feature combination until disposal.
+    this.material.fragmentShader = fragment;
+    this.material.needsUpdate = true;
   }
 
   private resolveExternalTexture(reference: unknown, usage: AdvPostTextureUsage): Texture | null {

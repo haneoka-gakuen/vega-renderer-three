@@ -286,17 +286,16 @@ export interface AdvBloomResult {
 
 /** Bloom passes 0-6; ADV profiles select the Gaussian branch. */
 export class AdvUrpBloom {
+  private highQualityFiltering: boolean | null = null;
   private readonly mipDown = Array.from({ length: 16 }, (_, index) => target(`adv-bloom-down-${index}`));
   private readonly mipUp = Array.from({ length: 16 }, (_, index) => target(`adv-bloom-up-${index}`));
   private readonly prefilterUniforms: InputUniforms & {
     uParams: IUniform<Vector4>;
     uTexelSize: IUniform<Vector2>;
-    uHighQuality: IUniform<number>;
   } = {
     tInput: { value: null },
     uParams: { value: new Vector4() },
     uTexelSize: { value: new Vector2(1, 1) },
-    uHighQuality: { value: 0 },
   };
   private readonly horizontalUniforms: InputUniforms & { uTexelSize: IUniform<Vector2> } = {
     tInput: { value: null },
@@ -311,13 +310,11 @@ export class AdvUrpBloom {
     tLow: IUniform<Texture | null>;
     uScatter: IUniform<number>;
     uLowTexelSize: IUniform<Vector2>;
-    uHighQuality: IUniform<number>;
   } = {
     tHigh: { value: null },
     tLow: { value: null },
     uScatter: { value: 0.68 },
     uLowTexelSize: { value: new Vector2(1, 1) },
-    uHighQuality: { value: 0 },
   };
   private readonly kawaseUniforms: InputUniforms & {
     uTexelSize: IUniform<Vector2>;
@@ -361,6 +358,13 @@ export class AdvUrpBloom {
     renderFullscreen: AdvRenderFullscreen,
   ): AdvBloomResult | null {
     if (!settings.active || settings.intensity <= 0) return null;
+    if (this.highQualityFiltering !== settings.highQualityFiltering) {
+      this.highQualityFiltering = settings.highQualityFiltering;
+      const declaration = `const float uHighQuality = ${Number(settings.highQualityFiltering)}.0;`;
+      this.prefilterMaterial.fragmentShader = PREFILTER_FRAGMENT.replace("uniform float uHighQuality;", declaration);
+      this.upsampleMaterial.fragmentShader = UPSAMPLE_FRAGMENT.replace("uniform float uHighQuality;", declaration);
+      this.prefilterMaterial.needsUpdate = this.upsampleMaterial.needsUpdate = true;
+    }
     // URP binds sampler_LinearClamp independently of the point-filtered ADV
     // field target. WebGL texture state carries the sampler instead.
 
@@ -382,7 +386,6 @@ export class AdvUrpBloom {
     this.prefilterUniforms.tInput.value = source;
     this.prefilterUniforms.uParams.value.set(scatter, bloomClamp, threshold, knee);
     this.prefilterUniforms.uTexelSize.value.set(1 / width, 1 / height);
-    this.prefilterUniforms.uHighQuality.value = settings.highQualityFiltering ? 1 : 0;
     renderFullscreen(this.prefilterMaterial, this.mipDown[0], true);
 
     const filter = resolveAdvBloomFilterMode(settings.filter);
@@ -391,7 +394,7 @@ export class AdvUrpBloom {
         ? this.renderDual(mipCount, Math.max(0, Math.min(1, settings.scatter)), renderFullscreen)
         : filter === "kawase"
           ? this.renderKawase(mipCount, scatter, Math.max(0, Math.min(1, settings.scatter)), renderFullscreen)
-          : this.renderGaussian(mipCount, scatter, settings.highQualityFiltering, renderFullscreen);
+          : this.renderGaussian(mipCount, scatter, renderFullscreen);
     const linearTint = [
       srgbToLinear(settings.tint.r ?? settings.tint.x ?? 1),
       srgbToLinear(settings.tint.g ?? settings.tint.y ?? 1),
@@ -425,7 +428,6 @@ export class AdvUrpBloom {
   private renderGaussian(
     mipCount: number,
     scatter: number,
-    highQuality: boolean,
     renderFullscreen: AdvRenderFullscreen,
   ): WebGLRenderTarget {
     for (let index = 1; index < mipCount; index += 1) {
@@ -446,7 +448,6 @@ export class AdvUrpBloom {
       this.upsampleUniforms.tLow.value = low.texture;
       this.upsampleUniforms.uScatter.value = scatter;
       this.upsampleUniforms.uLowTexelSize.value.set(1 / low.width, 1 / low.height);
-      this.upsampleUniforms.uHighQuality.value = highQuality ? 1 : 0;
       renderFullscreen(this.upsampleMaterial, this.mipUp[index], true);
     }
     return mipCount > 1 ? this.mipUp[0] : this.mipDown[0];
