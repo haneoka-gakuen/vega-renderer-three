@@ -113,6 +113,8 @@ export interface AdvPostPipelineOptions {
 }
 
 export interface AdvPostBeginOptions {
+  /** Stable immutable-background state, sampled after the background scene draw. */
+  readonly backgroundCacheKey?: () => number | undefined;
   readonly filterBackground?: (target: WebGLRenderTarget) => void;
   readonly clearColor?: ColorRepresentation;
   readonly clearAlpha?: number;
@@ -457,6 +459,23 @@ export class AdvPostPipeline {
   private readonly characterBlurTarget: WebGLRenderTarget;
   private readonly backgroundBlurTarget: WebGLRenderTarget;
   private stageCaptureTarget: WebGLRenderTarget | null = null;
+  private backgroundCacheTarget: WebGLRenderTarget | null = null;
+  private backgroundCacheKey: number | undefined;
+  private backgroundCacheOwner: AdvPostBeginOptions["backgroundCacheKey"];
+  private backgroundCacheValid = false;
+  private backgroundCacheWidth = 0;
+  private backgroundCacheHeight = 0;
+  private backgroundCacheBlur = NaN;
+  private backgroundCacheRadius = NaN;
+  private readonly backgroundCacheClear = new Color();
+  private readonly backgroundClearInput = new Color();
+  private backgroundCacheAlpha = NaN;
+  private readonly discardBackgroundCache = (): void => {
+    this.backgroundCacheTarget?.dispose();
+    this.backgroundCacheTarget = null;
+    this.backgroundCacheValid = false;
+    this.backgroundCacheKey = undefined;
+  };
   private readonly fullscreenScene = new Scene();
   private readonly fullscreenCamera = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
   private readonly fullscreenGeometry = new PlaneGeometry(2, 2);
@@ -582,6 +601,7 @@ export class AdvPostPipeline {
     this.urpPostProcessor.setColorGradingMode(options.colorGradingMode ?? "ldr");
     this.setEffects(options.effects ?? {});
     this.setSize(options.width ?? 1, options.height ?? 1, options.pixelRatio ?? 1);
+    renderer.domElement.addEventListener("webglcontextlost", this.discardBackgroundCache);
   }
 
   get width(): number {
@@ -720,7 +740,10 @@ export class AdvPostPipeline {
       if (options.captureStage) {
         this.captureStageBackground(options.stageCaptureScene ?? background, camera, options.advBackEffects);
       }
-      this.applyBackgroundEffects();
+      const cacheKey = this.backgroundBlurValue() > 0 && !options.captureStage && !options.advBackEffects && !options.filterBackground
+        ? options.backgroundCacheKey?.()
+        : undefined;
+      this.applyBackgroundEffectsCached(cacheKey, options);
       options.filterBackground?.(this.mainTarget);
       this.activeCharacterTarget = this.mainTarget;
     } catch (error: unknown) {
@@ -930,6 +953,10 @@ export class AdvPostPipeline {
     this.temporaryTarget.dispose();
     this.characterBlurTarget.dispose();
     this.backgroundBlurTarget.dispose();
+    this.renderer.domElement.removeEventListener("webglcontextlost", this.discardBackgroundCache);
+    this.discardBackgroundCache();
+    this.backgroundCacheOwner = undefined;
+    this.backgroundCacheValid = false;
     this.stageCaptureTarget?.dispose();
     this.stageCaptureTarget = null;
     this.characterFrames.clear();
@@ -964,6 +991,49 @@ export class AdvPostPipeline {
         false,
       );
     }
+  }
+
+  private applyBackgroundEffectsCached(key: number | undefined, options: AdvPostBeginOptions): void {
+    const blur = this.backgroundBlurValue();
+    if (key === undefined || blur <= 0) {
+      this.backgroundCacheValid = false;
+      this.backgroundCacheKey = undefined;
+      this.applyBackgroundEffects();
+      return;
+    }
+    const radius = Math.max(0, finite(this.effects.blur.radiusMax, 0.75));
+    const clear = this.backgroundClearInput.set(options.clearColor ?? 0x000000);
+    const alpha = finite(options.clearAlpha, 1);
+    const cache = this.backgroundCacheTarget;
+    const same = key === this.backgroundCacheKey && options.backgroundCacheKey === this.backgroundCacheOwner &&
+      blur === this.backgroundCacheBlur && radius === this.backgroundCacheRadius && this.backgroundCacheClear.equals(clear) &&
+      alpha === this.backgroundCacheAlpha && this.backgroundCacheWidth === this.mainTarget.width &&
+      this.backgroundCacheHeight === this.mainTarget.height;
+    if (same && cache && this.backgroundCacheValid) {
+      this.outputUniforms.tInput.value = cache.texture;
+      this.renderFullscreen(this.outputMaterial, this.mainTarget, true);
+      return;
+    }
+    this.applyBackgroundEffects();
+    if (!same) {
+      this.backgroundCacheKey = key;
+      this.backgroundCacheOwner = options.backgroundCacheKey;
+      this.backgroundCacheBlur = blur;
+      this.backgroundCacheRadius = radius;
+      this.backgroundCacheClear.copy(clear);
+      this.backgroundCacheAlpha = alpha;
+      this.backgroundCacheWidth = this.mainTarget.width;
+      this.backgroundCacheHeight = this.mainTarget.height;
+      this.backgroundCacheValid = false;
+      return;
+    }
+    this.backgroundCacheTarget ??= this.mainTarget.clone();
+    this.backgroundCacheTarget.texture.name = "adv-static-background-blur";
+    this.backgroundCacheTarget.setSize(this.mainTarget.width, this.mainTarget.height);
+    this.outputUniforms.tInput.value = this.mainTarget.texture;
+    this.renderFullscreen(this.outputMaterial, this.backgroundCacheTarget, true);
+    this.bindTarget(this.mainTarget);
+    this.backgroundCacheValid = true;
   }
 
   private blurInPlace(

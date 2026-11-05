@@ -3,6 +3,7 @@ import type { SpatialConfiguration } from "@haneoka/render-shaders/three";
 import type { StoryPhysicalViewport } from "./StoryPhysicalViewport";
 import { videoPresentedTime } from "./AdvVideoClock";
 import { SceneAnimationClock, type SceneAnimationClockSnapshot } from "./SceneAnimationClock";
+import { BackgroundRenderSnapshot } from "./BackgroundRenderSnapshot";
 import { ScreenSpriteRenderer } from "./ScreenSpriteRenderer";
 import {
   AdaptiveRenderQuality,
@@ -1109,6 +1110,11 @@ export class ThreeStoryScene implements StorySceneBackend {
   private snapshotRestoreOwner: AbortController | null = null;
   private readonly targetFrameClock = new UnityTargetFrameClock();
   private backgroundMesh: BackgroundMesh | null = null;
+  private readonly backgroundSnapshot = new BackgroundRenderSnapshot();
+  private readonly backgroundCacheKey = (): number | undefined => {
+    if (this.rendererExtensionEffects.size || this.renderer?.clippingPlanes.length) return undefined;
+    return this.backgroundSnapshot.capture(this.scene, this.camera, this.backgroundBaseMesh, this.backgroundMesh);
+  };
   private backgroundCaptureMesh: BackgroundMesh | null = null;
   private backgroundTextureLease: SharedTextureLease<Texture> | null = null;
   private readonly backgroundGeometry = new PlaneGeometry(1, 1);
@@ -1166,6 +1172,7 @@ export class ThreeStoryScene implements StorySceneBackend {
   private readonly stageNodeKeys = new Set<number>([1, 3, 5, 7, 9]);
   private readonly sceneLayerCache = new Map<Scene, AdvSceneLayer>();
   private readonly postBeginOptions: {
+    backgroundCacheKey: () => number | undefined;
     clearColor: number;
     clearAlpha: number;
     captureStage: boolean;
@@ -1407,6 +1414,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.cameraState.rotationY = initialCameraRotation.y;
     this.cameraState.angle = initialCameraRotation.z;
     this.postBeginOptions = {
+      backgroundCacheKey: this.backgroundCacheKey,
       clearColor: 0x000000,
       clearAlpha: 0,
       captureStage: false,
@@ -1972,6 +1980,7 @@ export class ThreeStoryScene implements StorySceneBackend {
     this.commandEffectStates.clear();
     this.backgroundMesh?.material.dispose();
     this.backgroundMesh = null;
+    this.backgroundSnapshot.clear();
     this.backgroundCaptureMesh?.removeFromParent();
     this.backgroundCaptureMesh?.material.dispose();
     this.backgroundCaptureMesh = null;
@@ -6091,6 +6100,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       depthTest: true,
       depthWrite: false,
       side: DoubleSide,
+      forceSinglePass: true,
       toneMapped: false,
     });
     const next = new Mesh(this.backgroundGeometry, material);
