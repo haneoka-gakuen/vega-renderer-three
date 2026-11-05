@@ -87,32 +87,32 @@ void main() {
   vec2 positiveUv = edgeUv + edgeStep;
   float negativeDelta = sampleLuma(negativeUv) - localAverage;
   float positiveDelta = sampleLuma(positiveUv) - localAverage;
-  bool negativeDone = abs(negativeDelta) >= gradientThreshold;
-  bool positiveDone = abs(positiveDelta) >= gradientThreshold;
-
-  if (!negativeDone) negativeUv -= edgeStep * 1.5;
-  if (!positiveDone) positiveUv += edgeStep * 1.5;
-  if (!negativeDone) negativeDelta = sampleLuma(negativeUv) - localAverage;
-  if (!positiveDone) positiveDelta = sampleLuma(positiveUv) - localAverage;
-  negativeDone = negativeDone || abs(negativeDelta) >= gradientThreshold;
-  positiveDone = positiveDone || abs(positiveDelta) >= gradientThreshold;
-
-  if (!negativeDone) negativeUv -= edgeStep * 2.0;
-  if (!positiveDone) positiveUv += edgeStep * 2.0;
-  if (!negativeDone) negativeDelta = sampleLuma(negativeUv) - localAverage;
-  if (!positiveDone) positiveDelta = sampleLuma(positiveUv) - localAverage;
-  negativeDone = negativeDone || abs(negativeDelta) >= gradientThreshold;
-  positiveDone = positiveDone || abs(positiveDelta) >= gradientThreshold;
-
-  if (!negativeDone) negativeUv -= edgeStep * 4.0;
-  if (!positiveDone) positiveUv += edgeStep * 4.0;
-  if (!negativeDone) negativeDelta = sampleLuma(negativeUv) - localAverage;
-  if (!positiveDone) positiveDelta = sampleLuma(positiveUv) - localAverage;
-  negativeDone = negativeDone || abs(negativeDelta) >= gradientThreshold;
-  positiveDone = positiveDone || abs(positiveDelta) >= gradientThreshold;
-
-  if (!negativeDone) negativeUv -= edgeStep * 12.0;
-  if (!positiveDone) positiveUv += edgeStep * 12.0;
+  if (!(abs(negativeDelta) >= gradientThreshold)) {
+    negativeUv -= edgeStep * 1.5;
+    negativeDelta = sampleLuma(negativeUv) - localAverage;
+    if (!(abs(negativeDelta) >= gradientThreshold)) {
+      negativeUv -= edgeStep * 2.0;
+      negativeDelta = sampleLuma(negativeUv) - localAverage;
+      if (!(abs(negativeDelta) >= gradientThreshold)) {
+        negativeUv -= edgeStep * 4.0;
+        negativeDelta = sampleLuma(negativeUv) - localAverage;
+        if (!(abs(negativeDelta) >= gradientThreshold)) negativeUv -= edgeStep * 12.0;
+      }
+    }
+  }
+  if (!(abs(positiveDelta) >= gradientThreshold)) {
+    positiveUv += edgeStep * 1.5;
+    positiveDelta = sampleLuma(positiveUv) - localAverage;
+    if (!(abs(positiveDelta) >= gradientThreshold)) {
+      positiveUv += edgeStep * 2.0;
+      positiveDelta = sampleLuma(positiveUv) - localAverage;
+      if (!(abs(positiveDelta) >= gradientThreshold)) {
+        positiveUv += edgeStep * 4.0;
+        positiveDelta = sampleLuma(positiveUv) - localAverage;
+        if (!(abs(positiveDelta) >= gradientThreshold)) positiveUv += edgeStep * 12.0;
+      }
+    }
+  }
 
   float negativeDistance = horizontal ? vUv.x - negativeUv.x : vUv.y - negativeUv.y;
   float positiveDistance = horizontal ? positiveUv.x - vUv.x : positiveUv.y - vUv.y;

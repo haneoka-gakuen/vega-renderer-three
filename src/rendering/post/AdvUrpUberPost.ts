@@ -320,6 +320,12 @@ export const advFilmGrainTextureUrl = (type: number, customTextureReference: unk
   Math.trunc(type) === 10 && typeof customTextureReference === "string" ? customTextureReference || null : null;
 
 export class AdvUrpUberPost {
+  private uniformState: Readonly<AdvUrpVolumeState> | null = null;
+  private uniformBloom: AdvBloomResult | null = null;
+  private uniformWidth = 0;
+  private uniformHeight = 0;
+  private uniformHdr = false;
+  private uniformStatic = false;
   private featureKey = -1;
   private readonly uniforms: UberUniforms = {
     tInput: { value: null },
@@ -384,12 +390,22 @@ export class AdvUrpUberPost {
     renderFullscreen: AdvRenderFullscreen,
   ): void {
     this.uniforms.tInput.value = source.texture;
-    this.uniforms.uInputTexelSize.value.set(1 / source.width, 1 / source.height);
     this.uniforms.tLut.value = lut;
+    this.uniforms.tBloom.value = bloom?.texture ?? source.texture;
+    // Resolved volume states are immutable. Reuse only numeric preparation;
+    // changing source pixels still run through every authored post pass.
+    if (this.uniformStatic && this.uniformState === state && this.uniformBloom === bloom &&
+      this.uniformWidth === source.width && this.uniformHeight === source.height && this.uniformHdr === hdrGrading) {
+      this.uniforms.tLensDirt.value = source.texture;
+      this.uniforms.tUserLut.value = lut;
+      this.uniforms.tGrain.value = source.texture;
+      renderFullscreen(this.material, destination, true);
+      return;
+    }
+    this.uniforms.uInputTexelSize.value.set(1 / source.width, 1 / source.height);
     this.uniforms.uPostExposure.value = 2 ** state.colorAdjustments.postExposure;
 
     this.uniforms.uUseBloom.value = bloom ? 1 : 0;
-    this.uniforms.tBloom.value = bloom?.texture ?? source.texture;
     this.uniforms.uBloomTexelSize.value.set(1 / (bloom?.width ?? source.width), 1 / (bloom?.height ?? source.height));
     this.uniforms.uBloomParams.value.set(
       bloom?.intensity ?? 0,
@@ -515,10 +531,18 @@ export class AdvUrpUberPost {
     }
 
     this.selectShaderVariant();
+    this.uniformState = state;
+    this.uniformBloom = bloom;
+    this.uniformWidth = source.width;
+    this.uniformHeight = source.height;
+    this.uniformHdr = hdrGrading;
+    this.uniformStatic = !dirtRequested && !userLutRequested && !grainRequested;
     renderFullscreen(this.material, destination, true);
   }
 
   dispose(): void {
+    this.uniformState = null;
+    this.uniformBloom = null;
     this.material.dispose();
   }
 

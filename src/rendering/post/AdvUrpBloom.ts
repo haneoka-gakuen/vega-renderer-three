@@ -286,6 +286,8 @@ export interface AdvBloomResult {
 
 /** Bloom passes 0-6; ADV profiles select the Gaussian branch. */
 export class AdvUrpBloom {
+  private resultSettings: Readonly<AdvBloomVolume> | null = null;
+  private result: AdvBloomResult | null = null;
   private highQualityFiltering: boolean | null = null;
   private readonly mipDown = Array.from({ length: 16 }, (_, index) => target(`adv-bloom-down-${index}`));
   private readonly mipUp = Array.from({ length: 16 }, (_, index) => target(`adv-bloom-up-${index}`));
@@ -395,6 +397,8 @@ export class AdvUrpBloom {
         : filter === "kawase"
           ? this.renderKawase(mipCount, scatter, Math.max(0, Math.min(1, settings.scatter)), renderFullscreen)
           : this.renderGaussian(mipCount, scatter, renderFullscreen);
+    if (settings === this.resultSettings && this.result?.texture === output.texture &&
+      this.result.width === output.width && this.result.height === output.height) return this.result;
     const linearTint = [
       srgbToLinear(settings.tint.r ?? settings.tint.x ?? 1),
       srgbToLinear(settings.tint.g ?? settings.tint.y ?? 1),
@@ -405,7 +409,8 @@ export class AdvUrpBloom {
       luminance > 0
         ? ([linearTint[0] / luminance, linearTint[1] / luminance, linearTint[2] / luminance] as const)
         : ([1, 1, 1] as const);
-    return {
+    this.resultSettings = settings;
+    return this.result = {
       texture: output.texture,
       width: output.width,
       height: output.height,
@@ -415,6 +420,8 @@ export class AdvUrpBloom {
   }
 
   dispose(): void {
+    this.result = null;
+    this.resultSettings = null;
     for (const item of [...this.mipDown, ...this.mipUp]) item.dispose();
     this.prefilterMaterial.dispose();
     this.horizontalMaterial.dispose();
