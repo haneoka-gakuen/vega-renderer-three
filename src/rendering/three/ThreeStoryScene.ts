@@ -339,7 +339,6 @@ const textureCacheFor = (resources?: StoryResourceResolver): SharedTextureResour
   }
   return cache;
 };
-const DEG_TO_RAD = Math.PI / 180;
 const PSEUDO_LIP_UNIT_TIME = 0.14;
 const PSEUDO_LIP_STOP_DURATION = 0.3;
 const FLOAT_EPSILON = 1e-45;
@@ -378,6 +377,8 @@ export interface ThreeStorySceneOptions {
   readonly colorGradingMode?: AdvColorGradingPipelineMode;
   /** Reference host policy: disabled at0;1 applies authored grain intensity. */
   readonly filmGrainMultiplier?: number;
+  /** Presentation cap; zero uses every browser animation frame. Defaults to the story's authored cap. */
+  readonly frameRateLimit?: number;
 }
 
 export const VEGA_THREE_RENDERER_ID = "vega-three-webgl2" as const;
@@ -1039,9 +1040,39 @@ export class ThreeStoryScene implements StorySceneBackend {
   private renderer: WebGLRenderer | null = null;
   private spatialConfiguration = spatialConfiguration();
   setSpatialUpscaling(value: SpatialConfiguration): void {
-    this.spatialConfiguration = spatialConfiguration(value);
+    const next = spatialConfiguration(value);
+    if (next.factor === this.spatialConfiguration.factor && next.sharpness === this.spatialConfiguration.sharpness) return;
+    this.spatialConfiguration = next;
     this.resize();
     this.heldRenderPending = true;
+  }
+  private frameRateLimit: number | undefined;
+  private displayFrameMs = 1000 / 60;
+  private readonly displayFrameSamples = new Float64Array(32);
+  private displayFrameSampleCount = 0;
+  /** Zero renders on every browser animation frame. */
+  setFrameRateLimit(limit: number): void {
+    if (!Number.isSafeInteger(limit) || limit < 0) throw new RangeError("Invalid story frame rate limit");
+    if (this.frameRateLimit === limit) return;
+    this.frameRateLimit = limit;
+    this.targetFrameClock.reset();
+    this.updateAdaptiveFrameTarget();
+  }
+  private updateAdaptiveFrameTarget(): void {
+    const limit = this.frameRateLimit ?? this.runtime.targetFrameRate;
+    const displayRate = 1000 / this.displayFrameMs;
+    this.adaptiveRenderQuality.setTargetFps(limit === 0 ? displayRate : Math.min(limit, displayRate));
+  }
+  private sampleDisplayFrameInterval(elapsedMs: number): void {
+    if (elapsedMs <= 0 || elapsedMs > 100) return;
+    this.displayFrameSamples[this.displayFrameSampleCount++] = elapsedMs;
+    if (this.displayFrameSampleCount < this.displayFrameSamples.length) return;
+    this.displayFrameSampleCount = 0;
+    this.displayFrameSamples.sort();
+    const interval = this.displayFrameSamples[8];
+    if (Math.abs(interval - this.displayFrameMs) < this.displayFrameMs * 0.1) return;
+    this.displayFrameMs = interval;
+    this.updateAdaptiveFrameTarget();
   }
   private pipeline: AdvPostPipeline | null = null;
   private overlay: StoryDomOverlay | null = null;
@@ -1333,6 +1364,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       targetFps: finite(this.runtime.targetFrameRate, 60),
     });
     this.state = context.state;
+    if (options.frameRateLimit !== undefined) this.setFrameRateLimit(options.frameRateLimit);
     this.resources = context.resources;
     this.commandEffects = new UnityParticleEffectController({
       resources: this.resources,
@@ -2146,7 +2178,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       if (pending.identity === identity) return false;
     }
     if (this.cachedCharacterControllers.has(identity)) return true;
-    let active = this.characterPreloads.get(identity);
+    const active = this.characterPreloads.get(identity);
     if (active) {
       return Boolean(await active.promise);
     }
@@ -2171,7 +2203,6 @@ export class ThreeStoryScene implements StorySceneBackend {
       detachCaller();
       detachLifecycle();
     };
-    let state: CharacterPreloadState;
     const promise = this.createPreloadedCharacter(
       cmd,
       target,
@@ -2187,7 +2218,7 @@ export class ThreeStoryScene implements StorySceneBackend {
       }
       this.trimIdleResidentControllers(identity);
     });
-    state = {
+    const state: CharacterPreloadState = {
       controller,
       detach,
       promise,
@@ -2583,11 +2614,12 @@ export class ThreeStoryScene implements StorySceneBackend {
         if (!held) return;
       }
       if (held) {
+        if (!this.characterRenderPrimes.size && !this.contextRestoreController) this.sampleDisplayFrameInterval(elapsedMs);
         this.targetFrameClock.reset();
         if (this.heldRenderPending || this.characterRenderPrimes.size) this.render(this.authoredSeconds(), wallSeconds);
         return;
       }
-      const targetFrameRate = Math.max(1, finite(this.runtime.targetFrameRate, 45));
+      const targetFrameRate = this.frameRateLimit ?? Math.max(1, finite(this.runtime.targetFrameRate, 45));
       const deltaSeconds = this.targetFrameClock.advance(elapsedMs / 1000, targetFrameRate);
       if (deltaSeconds == null) return;
       if (this.adaptiveRenderQuality.sample(elapsedMs)) this.resize();
@@ -4692,11 +4724,10 @@ export class ThreeStoryScene implements StorySceneBackend {
       return Promise.reject(sceneAbortError(`Character ${item.target} preload was aborted`));
     }
     return new Promise<void>((resolve, reject) => {
-      let state: CharacterRenderPrimeState;
       const aborted = () =>
         this.settleCharacterRenderPrime(state, sceneAbortError(`Character ${item.target} preload was aborted`));
       signal.addEventListener("abort", aborted, { once: true });
-      state = {
+      const state: CharacterRenderPrimeState = {
         item,
         contextGeneration,
         detach: () => signal.removeEventListener("abort", aborted),

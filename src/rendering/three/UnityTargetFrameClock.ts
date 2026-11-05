@@ -23,6 +23,13 @@ export class UnityTargetFrameClock {
 
   advance(elapsedSeconds: number, targetFrameRate: number): number | null {
     const elapsed = Math.max(0, Math.min(MAX_REQUEST_ANIMATION_FRAME_DELTA_SECONDS, finite(elapsedSeconds, 0)));
+    if (elapsed <= 0) return null;
+    if (targetFrameRate === 0) {
+      this.scheduleRemainderSeconds = 0;
+      const updateDelta = this.updateElapsedSeconds + elapsed;
+      this.updateElapsedSeconds = 0;
+      return updateDelta;
+    }
     const interval = 1 / Math.max(1, finite(targetFrameRate, 45));
     this.scheduleRemainderSeconds += elapsed;
     this.updateElapsedSeconds += elapsed;
