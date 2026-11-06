@@ -703,7 +703,7 @@ export class UnityParticleSystemView {
     signal?: AbortSignal,
   ): Promise<UnityParticleSystemView> {
     const material = renderer.material;
-    const url = material?.textureUrl;
+    const url = renderer.enabled && renderer.renderMode !== 5 ? material?.textureUrl : null;
     const textureLease = url ? await loadTexture(url, resources, signal).catch(() => null) : null;
     return new UnityParticleSystemView(
       definition,
@@ -804,6 +804,7 @@ export class UnityParticleSystemView {
     });
     configureBlend(material, renderer.material);
     this.mesh = new Mesh(geometry, material);
+    this.mesh.visible = renderer.enabled && renderer.renderMode !== 5;
     this.mesh.name = `UnityParticleSystem:${definition.id}`;
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = renderer.sortingOrder;
@@ -1392,6 +1393,7 @@ export class UnityParticleEffect {
   private readonly nodes: Map<string, Object3D>;
   private readonly nodesByHash = new Map<number, Object3D>();
   private readonly systems: UnityParticleSystemView[];
+  private readonly rootSystem: UnityParticleSystemView | undefined;
   private readonly sprites: SpriteView[];
   private readonly staticMeshes: StaticMeshView[];
   private readonly animationTextureLeases: SharedResourceLease<Texture>[];
@@ -1435,7 +1437,7 @@ export class UnityParticleEffect {
       asset.particleSystems.map(async (definition, index) => {
         const node = nodes.get(definition.nodeId);
         const renderer = renderers.get(definition.nodeId);
-        if (!node || !renderer || !renderer.enabled || renderer.renderMode === 5) return null;
+        if (!node || !renderer) return null;
         return UnityParticleSystemView.create(
           definition,
           renderer,
@@ -1581,6 +1583,7 @@ export class UnityParticleEffect {
     this.root.add(root);
     this.nodes = nodes;
     this.systems = systems;
+    this.rootSystem = systems.find((system) => system.definition.nodeId === asset.rootNodeId);
     this.usesHierarchyScale = systems.some((system) => system.usesHierarchyScale);
     this.sprites = sprites;
     this.staticMeshes = staticMeshes;
@@ -1633,7 +1636,9 @@ export class UnityParticleEffect {
   }
 
   get complete(): boolean {
-    return this.stopping && this.systems.every((system) => system.complete);
+    // AdvParticleEffect waits on the root ParticleSystem, including when its
+    // Renderer is disabled; child dust must not extend the prefab's lifetime.
+    return this.stopping && (this.rootSystem?.complete ?? this.systems.every((system) => system.complete));
   }
 
   get isPlaying(): boolean {
@@ -1797,7 +1802,9 @@ export class UnityParticleEffectController {
     if (key) {
       this.versions.set(key, (this.versions.get(key) ?? 0) + 1);
       this.pending.delete(key);
-      this.effects.get(key)?.effect.stop(immediate);
+      const effect = this.effects.get(key)?.effect;
+      effect?.stop(immediate);
+      if (effect?.complete) this.remove(key);
       return;
     }
     for (const effectKey of this.versions.keys()) {
@@ -1805,7 +1812,10 @@ export class UnityParticleEffectController {
     }
     this.pending.clear();
     this.creations.clear();
-    for (const active of this.effects.values()) active.effect.stop(immediate);
+    for (const [effectKey, active] of this.effects) {
+      active.effect.stop(immediate);
+      if (active.effect.complete) this.remove(effectKey);
+    }
   }
 
   update(deltaSeconds: number): void {
@@ -1835,7 +1845,6 @@ export class UnityParticleEffectController {
 
   dispose(): void {
     this.stop(undefined, true);
-    for (const key of [...this.effects.keys()]) this.remove(key);
     this.versions.clear();
     this.pending.clear();
     particleTextureCacheFor(this.resources).disposeIdle();
